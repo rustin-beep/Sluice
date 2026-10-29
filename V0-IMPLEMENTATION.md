@@ -49,3 +49,24 @@
 3. **全流程**：`sluice comment …` → 弹窗（布局/倒计时/滚动解锁/理由区）→ Hello → GitHub 可见评论 → 成功消息含 URL。
 4. **拒绝闭环**：预设+附言拒绝 → 消息含理由与 retry 语义 → GitHub 无变更。
 5. **T1.5 双拦**：`probes/inject.ps1` 适配 sluice 窗口（按 PID+矩形定位）后 SendInput 点批准 → 被 LL 钩子丢弃、Hello 不可注入。
+
+---
+
+## V1 push 部分(2026-10-30 凌晨,提前实施并实测闭环)
+
+**方向改写(依 2026-10-29 实测)**:github.com 直连间歇失败(3 次 TLS 探测 1 次 TCP 超时、push dry-run 被 reset)+ Watt hosts-MITM → plan-lite §9 的 push bridge(git 子进程+匿名管道)在本机网络形态下不可行。定稿**纯 REST push**:blobs→trees→commits→update-ref 全程 api.github.com(当晚 100% 稳定),享受 DoH+issuer 双防线;匿名管道组件整体消失。辅路:config.json `proxy` 走非 MITM 代理。
+
+**实测记录(全部真实走 sluice)**:
+- 首推:空仓库 git data API 409("Git Repository is empty")死锁 → Contents API PUT README 播种初始化 → 全历史推送(dev 分支,40 blobs)exit 0
+- FF 增量:SHA 保真修复后推送,服务器 commit sha 与本地逐字节一致(`e6a37816…`),链条永续
+- policy tripwire 实战:push master 被硬拒(exit 4,不弹窗)
+- 拒绝闭环实战 ×3(理由原文进消息与 audit);credential_expired(401,旧 token 撤销后)
+
+**踩坑清单(代码修复均已提交)**:
+1. commit message 尾换行被 TrimEnd 剥掉 → 服务器 sha 与本地分叉 → 后续 FF 断链。修复:规范化为恰好一个尾换行
+2. 空仓库 GET ref 返回 409(非 404);blob POST 亦 409 → 播种解法(见上)
+3. 弹窗固定高度 560 装不下 push 长正文 → 按钮被裁出窗口("无法拒绝"事故)→ `SizeToContent="Height"`
+4. 批准键灰态无解释 → Content 写明"先滚到底部" + "跳到底部"一键解锁
+5. 输入拒绝理由时 60s 倒计时不暂停(用户反馈)→ 焦点/非空文本期间暂停,显示"输入中"
+6. PowerShell 诊断探针被 Watt hosts 污染(连的是本地代理非 GitHub)→ 用 curl --resolve 或 sluice 自身链路做事实源
+7. token 权限两次 403 的根因都是 fine-grained 下拉默认 Read-only(Issues 与 Contents 各一次)
