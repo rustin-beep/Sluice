@@ -1,0 +1,11 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ProbeApp.MainWindow"
+        Title="Sluice Probe"
+        Width="420" Height="300"
+        WindowStartupLocation="Manual"
+        Topmost="True">
+  <Button Name="ClickMe" FontSize="15"
+          Content="点我：真实点击应记 real passed；SendInput 应被丢弃"
+          HorizontalAlignment="Stretch" VerticalAlignment="Stretch"/>
+</Window>

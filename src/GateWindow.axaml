@@ -1,0 +1,69 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Sluice.GateWindow"
+        Title="Agent 请求执行对外动作"
+        Width="560" Height="470"
+        WindowStartupLocation="CenterScreen"
+        CanResize="False">
+
+  <DockPanel Margin="16">
+
+    <Grid DockPanel.Dock="Top">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock Grid.Column="0" Text="Agent 请求执行对外动作" FontWeight="Bold" FontSize="15"/>
+      <TextBlock Grid.Column="1" x:Name="Countdown" Text="60s" FontWeight="Bold" FontSize="15"/>
+    </Grid>
+
+    <Separator DockPanel.Dock="Top" Margin="0,8"/>
+
+    <Grid DockPanel.Dock="Top">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <TextBlock Grid.Row="0" Grid.Column="0" Text="操作" Margin="0,2,16,2" Opacity="0.7"/>
+      <TextBlock Grid.Row="0" Grid.Column="1" x:Name="OpText" Margin="0,2,0,2"/>
+      <TextBlock Grid.Row="1" Grid.Column="0" Text="仓库" Margin="0,2,16,2" Opacity="0.7"/>
+      <TextBlock Grid.Row="1" Grid.Column="1" x:Name="RepoText" Margin="0,2,0,2"/>
+      <TextBlock Grid.Row="2" Grid.Column="0" Text="哈希" Margin="0,2,16,2" Opacity="0.7"/>
+      <TextBlock Grid.Row="2" Grid.Column="1" x:Name="ShaText" Margin="0,2,0,2" FontFamily="Consolas,monospace"/>
+    </Grid>
+
+    <TextBlock DockPanel.Dock="Top" Text="正文（批准你所见；长文需滚动到底才可批准）" Margin="0,8,0,4" Opacity="0.7"/>
+    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="170"
+                  VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="2"/>
+    </ScrollViewer>
+
+    <Separator DockPanel.Dock="Bottom" Margin="0,8"/>
+
+    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12">
+      <Button x:Name="DenyBtn" Content="拒 绝" MinWidth="96" MinHeight="34" Click="OnDeny"/>
+      <Button x:Name="ApproveBtn" Content="批准 → Hello" MinWidth="120" MinHeight="34"
+              Click="OnApprove" IsEnabled="False"/>
+    </StackPanel>
+
+    <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
+      <TextBlock Text="拒绝理由（可选，会反馈给 agent）" Opacity="0.7" Margin="0,0,0,4"/>
+      <StackPanel Orientation="Horizontal" Spacing="8">
+        <ComboBox x:Name="PresetBox" MinWidth="140" SelectedIndex="0">
+          <ComboBoxItem Content="不批准"/>
+          <ComboBoxItem Content="目标不对"/>
+          <ComboBoxItem Content="内容需修改"/>
+          <ComboBoxItem Content="我自己处理"/>
+          <ComboBoxItem Content="任务重新讨论"/>
+        </ComboBox>
+        <TextBox x:Name="FreeText" PlaceholderText="自由附言（可选）" Width="330"/>
+      </StackPanel>
+    </StackPanel>
+
+  </DockPanel>
+</Window>
