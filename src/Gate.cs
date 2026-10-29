@@ -24,7 +24,8 @@ internal sealed class GateApp : Application
 /// <summary>弹批准窗并阻塞至窗口关闭。窗口线程独立于调用线程（console 主线程）。</summary>
 internal static class Gate
 {
-    public sealed record Request(string Op, string Repo, string Target, string Body, string Sha8, byte[] VaultChallenge);
+    public sealed record Request(string Op, string Repo, string Target, string Body, string Sha8,
+        byte[] VaultChallenge, string? Warning = null);
 
     public abstract record Outcome
     {

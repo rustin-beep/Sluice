@@ -2,7 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="Sluice.GateWindow"
         Title="Agent 请求执行对外动作"
-        Width="560" Height="470"
+        Width="560" SizeToContent="Height" MaxHeight="820"
         WindowStartupLocation="CenterScreen"
         CanResize="False">
 
@@ -37,8 +37,17 @@
       <TextBlock Grid.Row="2" Grid.Column="1" x:Name="ShaText" Margin="0,2,0,2" FontFamily="Consolas,monospace"/>
     </Grid>
 
-    <TextBlock DockPanel.Dock="Top" Text="正文（批准你所见；长文需滚动到底才可批准）" Margin="0,8,0,4" Opacity="0.7"/>
-    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="170"
+    <TextBlock DockPanel.Dock="Top" x:Name="WarnText" TextWrapping="Wrap" FontWeight="Bold"
+               Foreground="#D32F2F" IsVisible="False" Margin="0,6,0,0"/>
+
+    <DockPanel DockPanel.Dock="Top" Margin="0,8,0,4">
+      <DockPanel>
+        <Button DockPanel.Dock="Right" x:Name="JumpToEnd" Content="跳到底部 ▼" FontSize="11"
+                Padding="8,2" Click="OnJumpToEnd"/>
+        <TextBlock Text="正文（批准你所见；长文需滚动到底才可批准）" Opacity="0.7"/>
+      </DockPanel>
+    </DockPanel>
+    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="300"
                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="2"/>
     </ScrollViewer>

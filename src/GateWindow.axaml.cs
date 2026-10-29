@@ -19,6 +19,10 @@ public partial class GateWindow : Window
         Closed += (_, _) => OnClosed();
         Opened += (_, _) => OnOpened();
         AddHandler(KeyDownEvent, OnGlobalKey, Avalonia.Interactivity.RoutingStrategies.Tunnel);
+        // 用户正在组织拒绝理由时暂停倒计时（输入中不该被 60s 超时打断）
+        FreeText.GotFocus += (_, _) => EvalTimer();
+        FreeText.LostFocus += (_, _) => EvalTimer();
+        FreeText.TextChanged += (_, _) => EvalTimer();
     }
 
     private void OnOpened()
@@ -28,6 +32,11 @@ public partial class GateWindow : Window
         RepoText.Text = $"{req.Repo}  {req.Target}";
         ShaText.Text = req.Sha8;
         BodyText.Text = req.Body;
+        if (!string.IsNullOrEmpty(req.Warning))
+        {
+            WarnText.Text = "⚠ " + req.Warning;
+            WarnText.IsVisible = true;
+        }
         Title = $"Sluice · 批准请求 · {req.Op}";
 
         DenyBtn.Focus(); // 默认焦点拒绝（§7 误触安全侧）
@@ -37,7 +46,7 @@ public partial class GateWindow : Window
         _timer.Tick += (_, _) =>
         {
             _secondsLeft--;
-            Countdown.Text = $"{_secondsLeft}s";
+            EvalTimer(); // 每秒刷新显示（保持"输入中"状态一致）
             if (_secondsLeft <= 0)
             {
                 Gate.Result ??= new Gate.Outcome.TimedOut();
@@ -45,6 +54,22 @@ public partial class GateWindow : Window
             }
         };
         _timer.Start();
+    }
+
+    /// <summary>焦点在自由文本框或文本非空 → 暂停倒计时；否则运行。理由草稿在，超时不触发（误触安全侧）。</summary>
+    private void EvalTimer()
+    {
+        var pause = FreeText.IsFocused || !string.IsNullOrEmpty(FreeText.Text);
+        if (pause)
+        {
+            _timer?.Stop();
+            Countdown.Text = $"{_secondsLeft}s · 输入中";
+        }
+        else if (!_closing)
+        {
+            _timer?.Start();
+            Countdown.Text = $"{_secondsLeft}s";
+        }
     }
 
     private void OnGlobalKey(object? sender, KeyEventArgs e)
@@ -60,9 +85,9 @@ public partial class GateWindow : Window
     {
         if (sender is ScrollViewer sv)
         {
-            _scrolledToEnd = sv.Extent.Height - sv.Viewport.Height <= 2 ||
-                             sv.Offset.Y >= sv.Extent.Height - sv.Viewport.Height - 2;
-            ApproveBtn.IsEnabled = _scrolledToEnd;
+            var max = sv.Extent.Height - sv.Viewport.Height;
+            _scrolledToEnd = max <= 2 || sv.Offset.Y >= max - 2;
+            UpdateApprove();
         }
     }
 
@@ -70,7 +95,22 @@ public partial class GateWindow : Window
     {
         var max = BodyScroll.Extent.Height - BodyScroll.Viewport.Height;
         _scrolledToEnd = max <= 2; // 内容不溢出：无需滚动
+        UpdateApprove();
+    }
+
+    private void UpdateApprove()
+    {
         ApproveBtn.IsEnabled = _scrolledToEnd;
+        ApproveBtn.Content = _scrolledToEnd ? "批准 → Hello" : "批准（先滚到底部）";
+    }
+
+    private void OnJumpToEnd(object? sender, RoutedEventArgs e)
+    {
+        // 显式动作直达：滚到底 + 强制解锁（不依赖 ScrollChanged 事件）
+        BodyScroll.ScrollToEnd();
+        _scrolledToEnd = true;
+        UpdateApprove();
+        ApproveBtn.Focus();
     }
 
     private void OnDeny(object? sender, RoutedEventArgs e) => Deny();

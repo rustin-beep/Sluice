@@ -6,7 +6,8 @@ internal static class Selftest
     // §8.3 exit code 表（硬编码期望，防表被改坏）
     private static readonly (string Name, int Code, string Retry)[] Expected =
     [
-        ("success",   ExitCodes.Success,          "—"),
+        ("success",      ExitCodes.Success,          "—"),
+        ("pushuptodate", ExitCodes.Success,          "—"),
         ("denied",    ExitCodes.Denied,           "never"),
         ("timeout",   ExitCodes.Timeout,          "wait_user"),
         ("policy",    ExitCodes.PolicyReject,     "change_approach"),

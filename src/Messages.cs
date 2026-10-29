@@ -35,6 +35,15 @@ internal static class Messages
         """,
         ExitCodes.Success, "—", false);
 
+    // ---- push 无需推送（exit 0；远端已是目标提交） ----
+    public static Msg PushUpToDate(string repo, string branch, string sha8) => new(
+        "[Sluice·终态]",
+        $"""
+        已确认：{repo}@{branch} 已指向 {sha8}，本次无需推送；远端没有产生任何变更。
+        无需重试，也无需再用其他命令验证。
+        """,
+        ExitCodes.Success, "—", false);
+
     // ---- denied（exit 2，retry=never） ----
     public static Msg Denied(string op, string target, string preset, string? freeText) => new(
         "[Sluice·终态]",
@@ -182,6 +191,7 @@ internal static class Messages
     public static (string Name, Msg Sample)[] AllSamples() =>
     [
         ("success",   Success("pr_comment", "rustin-beep/Vitro#5", 201, "https://github.com/rustin-beep/Vitro/issues/5#issuecomment-123")),
+        ("pushuptodate", PushUpToDate("rustin-beep/Vitro", "feat/x", "9f3c2a1b")),
         ("denied",    Denied("pr_comment", "rustin-beep/Vitro#5", "内容需修改", "别带密钥")),
         ("timeout",   Timeout("pr_comment", "rustin-beep/Vitro#5")),
         ("policy",    PolicyReject("push → 受保护分支 main / force push / 修改 .github/workflows")),

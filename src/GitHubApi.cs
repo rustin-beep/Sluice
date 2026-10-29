@@ -205,6 +205,21 @@ internal static class GitHubApi
         return root.Message;
     }
 
+    /// <summary>
+    /// REST push 等复合序列用的通用请求：同一条 DoH+issuer 防线；
+    /// 返回原始 (status, body)。序列幂等性由调用方语义保证。
+    /// </summary>
+    internal static async Task<(int Status, string Body)> SendRawAsync(
+        HttpMethod m, string path, string token, string? jsonBody)
+    {
+        using var http = CreateClient();
+        using var req = Req(m, path, token);
+        if (jsonBody is not null)
+            req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+        using var resp = await http.SendAsync(req);
+        return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync());
+    }
+
     private static async Task<ApiResult> ReadCreatedAsync(HttpResponseMessage resp)
     {
         var json = await resp.Content.ReadAsStringAsync();
