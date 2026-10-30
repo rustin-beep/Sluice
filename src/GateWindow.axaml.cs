@@ -146,12 +146,12 @@ public partial class GateWindow : Window
         _timer?.Stop();
         Countdown.Text = $"{_secondsLeft}s";
 
-        // UI-2/3：Hello 的系统凭据 UI 跟随前台窗口定位——sluice 从 agent shell 启动时
-        // 常拿不到前台激活权，Hello 窗会沉底/落左上角。弹 Hello 前确保自己前台+置顶。
-        Topmost = true;
+        // UI-2/3（2026-10-30 实测修订）：Hello 系统凭据 UI **不是 TOPMOST 且 Z 序在调用者
+        // 窗口之下**——本窗在前必遮 Hello（置顶版实测：Hello 恰在批准窗下面）。正解是
+        // 弹 Hello 前隐藏本窗；Activate 先行确保 sluice 是前台（credential UI 定位跟随
+        // 前台进程，防落左上角/沉底）。Hello 完成/取消后按结果恢复。
         Activate();
-        StatusText.Text = "等待 Windows Hello 验证…（如未见提示窗，请注意任务栏闪烁）";
-        StatusText.IsVisible = true;
+        Hide();
 
         // 这一次 Hello 同时是批准事件与 vault 解密因子（§5：单次生物事件 = 解锁 + 授权）
         byte[]? sig;
@@ -163,16 +163,18 @@ public partial class GateWindow : Window
         {
             // 密钥缺失 ≠ 用户取消：签名尚未弹出 Hello 就已不可能，单独归因（重试无用，需 setup）
             Gate.Result = new Gate.Outcome.VaultKeyMissing(ex.Message);
-            CloseWindow();
+            CloseWindow(); // 窗口已隐藏，直接关闭即可
             return;
         }
         if (sig is null)
         {
-            // UI-4：Hello 取消/未通过 ≠ 拒绝整个请求——回到未决态让用户看清内容再决定。
+            // UI-4：Hello 取消/未通过 ≠ 拒绝整个请求——回窗让用户看清内容再决定。
             // 安全无损：取消不产生任何写动作；再次批准仍必须过 Hello（vault 解密同一事件）。
             _closing = false;
-            Topmost = false;
             StatusText.Text = "Windows Hello 已取消或未通过——可重新批准，或直接拒绝";
+            StatusText.IsVisible = true;
+            Show();
+            Activate();
             UpdateApprove();
             DenyBtn.IsEnabled = true;
             _timer?.Start();
@@ -181,7 +183,7 @@ public partial class GateWindow : Window
             return;
         }
         Gate.Result = new Gate.Outcome.Approved(sig);
-        CloseWindow();
+        CloseWindow(); // 批准已成，无需再展示窗口
     }
 
     // ---------- C4：超时前召回（提示音 + 任务栏闪烁——user32 直调，不引 System.Windows.Extensions 包） ----------
