@@ -24,6 +24,27 @@ internal sealed class GateApp : Application
 /// <summary>弹批准窗并阻塞至窗口关闭。窗口线程独立于调用线程（console 主线程）。</summary>
 internal static class Gate
 {
+    /// <summary>
+    /// C4（2026-10-30 实战）：批准窗口超时秒数。config.json "gate_timeout_sec" 可配，
+    /// 默认 60，夹 [30,600]。agent 同用户可改此文件，但改短只会自伤（自动拒是安全侧）、
+    /// 改长不产生任何写动作——纯 UX 旋钮，无安全害处，故不做防篡改。
+    /// </summary>
+    public static int TimeoutSeconds { get; } = ReadTimeout();
+
+    private static int ReadTimeout()
+    {
+        try
+        {
+            var cfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Sluice", "config.json");
+            if (!File.Exists(cfg)) return 60;
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(cfg));
+            return doc.RootElement.TryGetProperty("gate_timeout_sec", out var v)
+                && v.TryGetInt32(out var sec) ? Math.Clamp(sec, 30, 600) : 60;
+        }
+        catch { return 60; }
+    }
+
     public sealed record Request(string Op, string Repo, string Target, string Body, string Sha8,
         byte[] VaultChallenge, string? Warning = null);
 

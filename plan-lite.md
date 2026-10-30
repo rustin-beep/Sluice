@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.3-lite（v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
-| 日期 | 2026-10-28 |
+| 文档版本 | v2.4-lite（v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 日期 | 2026-10-30 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
 | 目标平台 | Windows 10/11 x64（UI 与核心逻辑跨平台，Linux 为填空题，见 §1.5） |
@@ -200,6 +200,10 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | 拒绝理由：预设 + 自由文本 | 预设决定消息的 retry 语义（见 §8），自由文本原样附言 |
 | 预设：不批准 / 目标不对 / 内容需修改 / 我自己处理 / 任务重新讨论 | 每档绑定明确的"下一步"文案，防 agent 猜 |
 | 窗口被关 = 拒绝（timeout 档） | 无"关闭即同意" |
+| **滚动正文 10s 内暂停倒计时**（v2.4，与"输入理由暂停"同构） | 滚到底是批准前置，惩罚阅读时间自相矛盾；LL 钩子挡 injected 鼠标，暂停不可被 agent 利用；10s 上限防误触滚轮无限阻塞 |
+| **批准 → Hello 前窗口置顶 + Activate**（v2.4） | Hello 系统凭据 UI 跟随前台窗口定位——agent shell 启动的 sluice 拿不到前台权时，Hello 窗会沉底/落左上角；等待期间显示状态行 |
+| **Hello 取消/未通过 → 回到未决态**（v2.4，非终态） | 取消 ≠ 拒绝请求：回窗看清内容再决定；安全无损（取消无写动作，再批准仍必须过 Hello）。vault 密钥缺失仍终态（重试无用） |
+| **超时秒数可配**：config.json `gate_timeout_sec`（默认 60，夹 [30,600]）；剩 15s 提示音 + 闪任务栏（v2.4） | agent 同用户可改 config——改短只自伤（自动拒是安全侧）、改长不产生写动作，纯 UX 旋钮；召回给暂离用户一次回来机会 |
 | 冷却：10 分钟内 3 次拒绝 → 全局冷却 10 分钟；冷却期内再试不弹窗、每次顺延 +5 分钟（上限 60） | 只能延长，做不到真阻止——封堵前提下"延长"已够；消息带绝对结束时间 |
 
 不承诺：窗口显示完整性（同用户可移动/遮挡，L3）。信任在 Hello，不在画面。
@@ -376,6 +380,43 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 ```
 （exit 10，retry=after_fix——PR 422 专用，替代旧"用法错误"模板）
 
+**V1.4 增补消息（2026-10-30 8-PR 实战批；selftest 同步穷举对齐）**
+
+```
+[Sluice·终态] pr_merge 被服务端拒绝（HTTP 405：<服务端 message>）。常见原因：PR 不可合并（冲突未解 / required checks 未过 / 已被合并 / draft 状态）。
+本次操作未执行，GitHub 上没有产生任何变更。
+1. 先查可合并状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth，读 "mergeable" 与 "mergeable_state" 字段；
+2. 冲突未解 → 解冲突推送后重试；checks 未过 → 等待或修复；已被合并 → 使用既成结果，不要再合并；
+3. 修正后重跑同一命令。
+```
+（exit 10，retry=after_fix——pr_merge 405/409/422 服务端明确拒专用）
+
+```
+[Sluice] push 未执行：远端 <R>@<B>（头 <sha8>）含本地没有的提交，非 fast-forward。
+本次未产生任何副作用（GitHub 上没有产生任何变更）。
+修正：git fetch 后把本地分支 rebase 到远端头（git rebase origin/<B>；解冲突后 git rebase --continue），
+再重跑同一命令——rebase 后的线性历史可正常推送。
+注意：force push 被策略永久禁止，不要尝试任何形式的覆盖推送。
+```
+（exit 10，retry=after_fix——**v2.4 档位修正**：非 ff 可由 agent 自行 rebase 修复后重推同一分支，属"修正后可重试"而非"策略永禁"；force 本身仍由 --force tripwire 永禁，不变量不动）
+
+```
+[Sluice] push 未执行：推送范围含 merge 提交（多父提交），REST push 只支持线性历史。
+问题提交：<sha8 标题>（前 3 个，共 N 个）
+本次未产生任何副作用（GitHub 上没有产生任何变更）。
+修正：把分支 rebase 成线性历史（git rebase <远端基点>；解冲突后 git rebase --continue，
+冲突解决会作为普通提交重放，无需保留 merge 提交），再重跑同一命令。
+```
+（exit 10，retry=after_fix——v2.4 专属消息：列出问题提交 + rebase 正解；旧文案"请用完整 git 推送"是死胡同指引——seal 封堵后环境无 git 推送凭据，已删除）
+
+```
+[Sluice] 附注：PR 已合并，但 head 分支删除失败（<原因>）。
+请修正后用 sluice branch delete --repo <R> --branch <B> 单独删除。
+```
+（exit 0 附注，retry=after_fix——紧跟 Success 输出；主操作已生效不可回滚，删除失败如实报）
+
+**v2.4 timeout 文案参数化**：`批准窗口 {n} 秒无响应`（n = config `gate_timeout_sec` 实际值）。
+
 ### 8.3 Exit code 表
 
 | code | 含义 | retry |
@@ -393,6 +434,8 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | 10 | 用法错误 | after_fix |
 | 20 | 连接失败（请求未发出，无副作用）；api GET 超时同码（幂等，重试安全） | retry_ok |
 | 21 | **结果未知**（请求已发出：超时/中断/5xx，勿盲重试） | wait_user |
+
+v2.4 注：push 非 ff 从 exit 4（policy_reject）移入 exit 10（after_fix）——rebase 后可重推同一分支，非策略永禁；force 与受保护分支仍 exit 4，不变量不动。
 
 ### 8.4 AGENTS.md 片段（`sluice setup --install-snippet` 追加到工作区 AGENTS.md）
 
@@ -416,7 +459,9 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | `pr_create` | `sluice pr create --repo R --base B --head H --title T --body-file F` | WinHTTP `POST /repos/{r}/pulls` | 仅 sluice 进程 |
 | `pr_review` | `sluice review --repo R --number N --event E [--body-file F]` | WinHTTP `POST /repos/{r}/pulls/{n}/reviews` | 仅 sluice 进程 |
 | `push` | `sluice push [--repo-path D] --remote R --refspec S` | 见下 push bridge | git 子进程内存（存活期） |
-| `api`（读，v2.2；V1 实现现状） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` 查询字符——分页/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；其余非 2xx→10。响应体→stdout、消息→stderr（不污染数据）。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
+| `api`（读，v2.2；V1 实现现状） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` `+` `,` `;` 查询字符——分页 cursor（base64 含 `+`）/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；其余非 2xx→10。响应体→stdout、消息→stderr（不污染数据）。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
+| `pr_merge`（v2.4，PR 工作流闭环最后一米） | `sluice pr merge --repo R --number N [--method merge\|squash\|rebase] [--delete-head]` | PUT `/repos/{r}/pulls/{n}/merge`——**服务端执行，天然尊重分支保护与 required checks**；弹窗尽力展示匿名可读的 PR 元数据（title/head→base/变更统计）；`--delete-head` 合并成功后删 head ref（失败不回滚合并，附注指引 branch delete）。exit：200→0；401/403→9；404/405/409/422→10（PrMergeRejected，查 mergeable）；5xx/超时→21 | 仅 sluice 进程 |
+| `branch_delete`（v2.4，PR 作废后清残留） | `sluice branch delete --repo R --branch B` | DELETE `/repos/{r}/git/refs/heads/{b}`——删 ref 非销毁历史（commits 留在服务端，GC 窗口内可重建）；`main`/`master` tripwire → policy_reject（exit 4）。exit：204→0；401/403→9；404→10；超时→21（幂等但已送达，查证 refs） | 仅 sluice 进程 |
 
 **push bridge**（取代原方案 shim，无常驻、无 PATH 依赖）：
 

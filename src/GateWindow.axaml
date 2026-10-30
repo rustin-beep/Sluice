@@ -47,12 +47,16 @@
         <TextBlock Text="正文（批准你所见；长文需滚动到底才可批准）" Opacity="0.7"/>
       </DockPanel>
     </DockPanel>
-    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="300"
+    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="500"
                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="2"/>
     </ScrollViewer>
 
     <Separator DockPanel.Dock="Bottom" Margin="0,8"/>
+
+    <!-- UI-2/4：等待 Hello / Hello 取消的可见状态（原来只有按钮变灰，用户不知道 Hello 弹没弹、在哪弹） -->
+    <TextBlock DockPanel.Dock="Bottom" x:Name="StatusText" TextWrapping="Wrap" FontWeight="Bold"
+               Foreground="#E65100" IsVisible="False" Margin="0,6,0,0"/>
 
     <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12">
       <Button x:Name="DenyBtn" Content="拒 绝" MinWidth="96" MinHeight="34" Click="OnDeny"/>

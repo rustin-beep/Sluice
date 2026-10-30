@@ -166,12 +166,20 @@ internal static class RestPush
                 return new(PushResult.NeedFetch,
                     $"本地缺少远端对象 {remoteSha[..8]}（未同步过远端分支），无法验证 fast-forward；请先 git fetch 后重推");
             if (!GitIsAncestor(plan.RepoPath, remoteSha, plan.HeadSha))
-                return new(PushResult.NonFF, "远端分支包含本地没有的提交（非 fast-forward）；force push 被策略永久禁止");
+                // Reason = 远端头 sha8（Program 拼进 PushNonFF 专属消息；2026-10-30 实战：
+                // 非 ff 的正解是 rebase 后重推同一分支，agent 可自行修复，改归 after_fix 档）
+                return new(PushResult.NonFF, remoteSha[..8]);
             range = $"{remoteSha}..HEAD";
         }
 
-        if (GitLines(plan.RepoPath, $"rev-list --merges {range}").Count > 0)
-            return new(PushResult.HasMerge, "推送范围含 merge 提交（多父），REST push 暂不支持；请用完整 git（经非 MITM 代理）推送或 rebase 成线性历史");
+        var merges = GitLines(plan.RepoPath, $"rev-list --merges {range}");
+        if (merges.Count > 0)
+        {
+            // 列出问题提交（B3：只报数量不说哪个，用户/agent 无从下手——实战绕三圈的根源之一）
+            var shown = string.Join("；", merges.Take(3)
+                .Select(m => Git(plan.RepoPath, $"log -1 --format=\"%h %s\" {m}").Trim()));
+            return new(PushResult.HasMerge, $"{shown}（共 {merges.Count} 个）");
+        }
         var commits = GitLines(plan.RepoPath, $"rev-list --reverse {range}");
         if (commits.Count > 200) return new(PushResult.Other, Reason: $"提交数 {commits.Count} 超过 200 上限，请分批");
 
@@ -212,9 +220,12 @@ internal static class RestPush
                 ParseRaw(line, (path, mode, sha, st2, submodule) =>
                 {
                     if (submodule) throw new LocalPlanException($"REST push 不支持 submodule：{path}");
-                    // 显式 (JsonNode?) 走非泛型 Add——AOT 禁 JsonArray.Add<T> 的动态 JsonValue 创建
+                    // 显式 (JsonNode?) 走非泛型 Add——AOT 禁 JsonArray.Add<T> 的动态 JsonValue 创建。
+                    // 删除条目（sha:null）也必须带合法 mode+type（GitHub create-tree 422
+                    // "Must supply a valid tree.mode" 实锤 2026-10-30——删除行的 newmode 是
+                    // 000000 不可用，ParseRaw 已折回 oldmode）。
                     entries.Add(st2 == 'D'
-                        ? (JsonNode?)new JsonObject { ["path"] = path, ["sha"] = null }
+                        ? (JsonNode?)new JsonObject { ["path"] = path, ["mode"] = mode, ["type"] = "blob", ["sha"] = null }
                         : new JsonObject { ["path"] = path, ["mode"] = mode, ["type"] = "blob", ["sha"] = sha });
                 });
 
@@ -296,7 +307,10 @@ internal static class RestPush
         if (parts.Length < 5) return;
         var tab = parts[4].IndexOf('\t');
         if (tab < 1) return;
-        fn(parts[4][(tab + 1)..], parts[1], parts[3], parts[4][..tab][^1], parts[1] == "160000");
+        // mode 折回：删除行（D）的 newmode=000000 非法，服务端要求合法 mode——用 oldmode
+        var st2 = parts[4][..tab][^1];
+        var mode = st2 == 'D' ? parts[0] : parts[1];
+        fn(parts[4][(tab + 1)..], mode, parts[3], st2, parts[1] == "160000");
     }
 
     // ---------- 本地 git 封装（全部只读） ----------

@@ -70,11 +70,11 @@ internal static class Messages
         _ => "", // “不批准”：主体文案已完整
     };
 
-    // ---- timeout（exit 3，retry=wait_user） ----
-    public static Msg Timeout(string op, string target) => new(
+    // ---- timeout（exit 3，retry=wait_user；时长自 C4 config 可配，文案跟随实际值） ----
+    public static Msg Timeout(string op, string target, int seconds) => new(
         "[Sluice·终态]",
         $"""
-        用户暂离，批准窗口 60 秒无响应，已自动拒绝。
+        用户暂离，批准窗口 {seconds} 秒无响应，已自动拒绝。
         本次操作未执行，GitHub 上没有产生任何变更。
         1. 不要立即重试（重试只会再次弹窗打扰用户）；
         2. 不要换其他方式完成同一操作；
@@ -245,13 +245,61 @@ internal static class Messages
             ExitCodes.BadRequest, "after_fix", true);
     }
 
+    // ---- pr_merge 被服务端拒绝（exit 10，retry=after_fix；405/409/422 服务端明确拒） ----
+    public static Msg PrMergeRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_merge 被服务端拒绝（{detail}）。常见原因：PR 不可合并（冲突未解 / required checks 未过 / 已被合并 / draft 状态）。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 先查可合并状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth，读 "mergeable" 与 "mergeable_state" 字段；
+        2. 冲突未解 → 解冲突推送后重试；checks 未过 → 等待或修复；已被合并 → 使用既成结果，不要再合并；
+        3. 修正后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr merge 成功但 --delete-head 失败（紧跟 Success 输出的附注；exit 0 不变——主操作已生效） ----
+    public static Msg BranchDeleteFailed(string repo, string branch, string why) => new(
+        "[Sluice]",
+        $"""
+        附注：PR 已合并，但 head 分支删除失败（{why}）。
+        请修正后用 sluice branch delete --repo {repo} --branch {branch} 单独删除。
+        """,
+        ExitCodes.Success, "after_fix", true);
+
+    // ---- push 非 ff（exit 10，retry=after_fix；2026-10-30 实战改档：非 ff 可由 agent 自行
+    //      rebase 修复后重推同一分支，属"修正后可重试"而非"策略永禁"——原 policy_reject 定性不准，
+    //      且指引缺 rebase 正解导致实战绕三圈。force 本身仍由 --force tripwire 永禁（不变量不动）。 ----
+    public static Msg PushNonFF(string repo, string branch, string remoteSha8) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：远端 {repo}@{branch}（头 {remoteSha8}）含本地没有的提交，非 fast-forward。
+        本次未产生任何副作用（GitHub 上没有产生任何变更）。
+        修正：git fetch 后把本地分支 rebase 到远端头（git rebase origin/{branch}；解冲突后 git rebase --continue），
+        再重跑同一命令——rebase 后的线性历史可正常推送。
+        注意：force push 被策略永久禁止，不要尝试任何形式的覆盖推送。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push 含 merge 提交（exit 10，retry=after_fix；列出问题提交 + rebase 正解。
+    //      原「请用完整 git 推送」是死胡同指引——seal 封堵后环境无 git 推送凭据，删除（2026-10-30 实战）。 ----
+    public static Msg PushHasMerge(string merges) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：推送范围含 merge 提交（多父提交），REST push 只支持线性历史。
+        问题提交：{merges}
+        本次未产生任何副作用（GitHub 上没有产生任何变更）。
+        修正：把分支 rebase 成线性历史（git rebase <远端基点>；解冲突后 git rebase --continue，
+        冲突解决会作为普通提交重放，无需保留 merge 提交），再重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- selftest 数据源：渲染全部消息样例 ----
     public static (string Name, Msg Sample)[] AllSamples() =>
     [
         ("success",   Success("pr_comment", "rustin-beep/Vitro#5", 201, "https://github.com/rustin-beep/Vitro/issues/5#issuecomment-123")),
         ("pushuptodate", PushUpToDate("rustin-beep/Vitro", "feat/x", "9f3c2a1b")),
         ("denied",    Denied("pr_comment", "rustin-beep/Vitro#5", "内容需修改", "别带密钥")),
-        ("timeout",   Timeout("pr_comment", "rustin-beep/Vitro#5")),
+        ("timeout",   Timeout("pr_comment", "rustin-beep/Vitro#5", 60)),
         ("policy",    PolicyReject("push → 受保护分支 main / force push / 修改 .github/workflows")),
         ("cooldown",  Cooldown(DateTime.Today.AddMinutes(10))),
         ("consent",   ConsentFailed("pr_comment", "rustin-beep/Vitro#5")),
@@ -268,6 +316,9 @@ internal static class Messages
         ("apihttp",    ApiHttpError("repos/rustin-beep/Sluice/issues/999", 404, 122)),
         ("vaultbroken", VaultBroken("token.bin 存在，但 Hello 密钥 SluiceVault 缺失")),
         ("prrejected", PrRejected("rustin-beep/Sluice", "dev", "HTTP 422：A pull request already exists")),
+        ("prmergerejected", PrMergeRejected("rustin-beep/Sluice#383", "HTTP 405：Pull Request is not mergeable")),
+        ("nonff",  PushNonFF("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2", "b9a84c5b")),
+        ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
     ];
 
     public static void Write(Msg m)

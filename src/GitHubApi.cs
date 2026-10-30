@@ -4,6 +4,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Sluice;
 
@@ -220,6 +221,51 @@ internal static class GitHubApi
         {
             return new ApiResult(OutcomeKind.UnknownOutcome, Reason: "超时");
         }
+    }
+
+    /// <summary>
+    /// 合并 PR（§9 pr_merge，2026-10-30 实战补齐：PR 工作流闭环最后一米）。
+    /// PUT merge 由 GitHub 服务端执行——天然尊重分支保护与 required checks，比任何本地
+    /// 推送形态都安全。非幂等（重复 PUT 已合并的 PR 得 405）：超时归 unknown，勿盲重试。
+    /// </summary>
+    public static async Task<ApiResult> MergePrAsync(string token, string repo, int number, string? method)
+    {
+        using var http = CreateClient();
+        try
+        {
+            using var req = Req(HttpMethod.Put, $"repos/{repo}/pulls/{number}/merge", token);
+            var json = method is null
+                ? "{}"
+                : $$"""{"merge_method":{{JsonEscape(method)}}}""";
+            req.Content = new StringContent(json, Encoding.UTF8, "application/json");
+            using var resp = await http.SendAsync(req);
+            return (int)resp.StatusCode switch
+            {
+                200 => await ReadMergedAsync(resp, repo),
+                401 or 403 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                >= 500 => new ApiResult(OutcomeKind.UnknownOutcome, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}"),
+                _ => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}：{await MessageOfAsync(resp)}"),
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            return new ApiResult(OutcomeKind.NotSent, Reason: Describe(ex));
+        }
+        catch (TaskCanceledException)
+        {
+            return new ApiResult(OutcomeKind.UnknownOutcome, Reason: "超时");
+        }
+    }
+
+    private static async Task<ApiResult> ReadMergedAsync(HttpResponseMessage resp, string repo)
+    {
+        var json = await resp.Content.ReadAsStringAsync();
+        var sha = JsonNode.Parse(json)?["sha"]?.GetValue<string>();
+        return sha is null
+            ? new ApiResult(OutcomeKind.Other, 200, Reason: "merge 响应缺少 sha")
+            : new ApiResult(OutcomeKind.Created, 200, Url: $"https://github.com/{repo}/commit/{sha}");
     }
 
     /// <summary>GitHub 错误响应的 message 字段（无则空串）。JsonDocument 解析——手刮字符串遇转义引号会截断。</summary>

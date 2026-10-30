@@ -26,6 +26,9 @@ internal static class Selftest
         ("apihttp",     ExitCodes.BadRequest,     "after_fix"),  // 其余非 2xx（404/429/…）
         ("vaultbroken", ExitCodes.NotInitialized, "wait_user"),  // Hello 键缺失 ≠ 用户取消
         ("prrejected",  ExitCodes.BadRequest,     "after_fix"),  // PR 422：查已有 PR，勿原样重跑
+        ("prmergerejected", ExitCodes.BadRequest, "after_fix"),  // PR merge 405/409/422：查 mergeable 再重试
+        ("nonff",       ExitCodes.BadRequest,     "after_fix"),  // 2026-10-30 实战改档：rebase 后可重推同分支
+        ("hasmerge",    ExitCodes.BadRequest,     "after_fix"),  // rebase 成线性后重跑（列问题提交）
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -60,12 +63,13 @@ internal static class Selftest
             if (name == "unknown" && !sample.Text.Contains("结果未知"))
             { fail++; Console.WriteLine("!! unknown 缺\"结果未知\""); }
             if (name is "denied" or "timeout" or "policy" or "cooldown" or "consent" or "seal" or "internal1"
+                    or "prmergerejected"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
             { fail++; Console.WriteLine("!! internal(后) 缺\"可能已完成\""); }
-            if (name == "badreq" && !sample.Text.Contains("本次未产生任何副作用"))
-            { fail++; Console.WriteLine("!! bad_request 缺\"未产生副作用\"句"); }
+            if (name is "badreq" or "nonff" or "hasmerge" && !sample.Text.Contains("本次未产生任何副作用"))
+            { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
             if (name == "httpfail" && !sample.Text.Contains("无任何副作用"))
             { fail++; Console.WriteLine("!! http_failed 缺\"无任何副作用\"句"); }
 

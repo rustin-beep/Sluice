@@ -11,7 +11,33 @@
     <InvariantGlobalization>false</InvariantGlobalization>
     <!-- 探针定稿：NativeAOT（启动 ~100ms，exe 19MB）；AOT 隐含 trimming -->
     <PublishAot>true</PublishAot>
+    <Version>0.2.0</Version>
   </PropertyGroup>
+
+  <!-- B2（2026-10-30 实战）：构建时间戳 + git sha 内嵌为 AssemblyMetadata，
+       version 命令 / 未知命令 / 未知参数消息自报家门——新旧 exe 混用一眼可辨，
+       旧构建缺新动词时不再裸报"无法识别的参数"。git 不可用时容错为 "-"。 -->
+  <Target Name="EmbedBuildInfo" BeforeTargets="PrepareForBuild">
+    <PropertyGroup>
+      <BuildTimestampUtc>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm"))UTC</BuildTimestampUtc>
+    </PropertyGroup>
+    <Exec Command="git rev-parse --short=8 HEAD" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="GitSha8" />
+    </Exec>
+    <PropertyGroup>
+      <GitSha8 Condition="'$(GitSha8)' == ''">-</GitSha8>
+    </PropertyGroup>
+    <ItemGroup>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>SluiceBuildTimestamp</_Parameter1>
+        <_Parameter2>$(BuildTimestampUtc)</_Parameter2>
+      </AssemblyAttribute>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>SluiceGitSha</_Parameter1>
+        <_Parameter2>$(GitSha8)</_Parameter2>
+      </AssemblyAttribute>
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.4" />
