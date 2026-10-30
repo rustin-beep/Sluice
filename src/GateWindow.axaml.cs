@@ -133,7 +133,18 @@ public partial class GateWindow : Window
         _timer?.Stop();
 
         // 这一次 Hello 同时是批准事件与 vault 解密因子（§5：单次生物事件 = 解锁 + 授权）
-        var sig = await new HelloConsent().SignAsync(Gate.Req!.VaultChallenge);
+        byte[]? sig;
+        try
+        {
+            sig = await new HelloConsent().SignAsync(Gate.Req!.VaultChallenge);
+        }
+        catch (VaultKeyMissingException ex)
+        {
+            // 密钥缺失 ≠ 用户取消：签名尚未弹出 Hello 就已不可能，单独归因（重试无用，需 setup）
+            Gate.Result = new Gate.Outcome.VaultKeyMissing(ex.Message);
+            CloseWindow();
+            return;
+        }
         Gate.Result = sig is null
             ? new Gate.Outcome.ConsentFailed()
             : new Gate.Outcome.Approved(sig);

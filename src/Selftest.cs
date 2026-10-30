@@ -21,6 +21,11 @@ internal static class Selftest
         ("unknown",   ExitCodes.Unknown,          "wait_user"),
         ("internal1", ExitCodes.Internal,         "wait_user"),
         ("internal2", ExitCodes.Internal,         "wait_user"),
+        ("apitimeout",  ExitCodes.HttpFailed,     "retry_ok"),   // api GET 超时：幂等无副作用 → 20 家族（21 是非幂等 POST 专属档）
+        ("apiauth",     ExitCodes.BadRequest,     "after_fix"),  // 匿名 401/403：加 --auth 重跑
+        ("apihttp",     ExitCodes.BadRequest,     "after_fix"),  // 其余非 2xx（404/429/…）
+        ("vaultbroken", ExitCodes.NotInitialized, "wait_user"),  // Hello 键缺失 ≠ 用户取消
+        ("prrejected",  ExitCodes.BadRequest,     "after_fix"),  // PR 422：查已有 PR，勿原样重跑
     ];
 
     private static readonly HashSet<string> ValidRetry =

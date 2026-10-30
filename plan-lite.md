@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.2-lite（v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 文档版本 | v2.3-lite（v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
 | 日期 | 2026-10-28 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
@@ -310,7 +310,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 修正参数后重新运行同一命令即可；本次未产生任何副作用。
 ```
 
-**http_failed**（exit 20，retry=retry_ok；**仅限请求未发出**：TCP/TLS 连接失败、DNS 解析失败）
+**http_failed**（exit 20，retry=retry_ok；**仅限请求未发出**：TCP/TLS 连接失败、DNS 解析失败。api 读通道的 GET 超时同码：请求可能已送达，但 GET 幂等无副作用、重试安全——exit 21 是非幂等 POST 专属档，读通道不得借用）
 
 ```
 [Sluice] GitHub 连接失败（请求未发出，无任何副作用）：could not resolve host / TLS 握手失败。
@@ -338,6 +338,44 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 ```
 进程直接崩溃（连消息都没来得及打）：agent 只会看到非零退出且无 `[Sluice]` 输出——此情形写入 AGENTS.md 规则 5：视为结果未知，先查证。
 
+**V1 增补消息（2026-10-30 四提交评审后入表；selftest 同步穷举对齐）**
+
+```
+[Sluice] api GET <path> → 请求超时（可能已送达；GET 无副作用，重试不会造成重复效果）。
+本次未产生任何副作用；可间隔 30 秒后重试同一命令，连续 3 次失败则报告用户。
+```
+（exit 20，retry=retry_ok——api GET 超时专用）
+
+```
+[Sluice] api GET <path> → HTTP 401/403：资源需要认证（私有或受限），匿名读不可用。
+本次未产生任何副作用（响应体已输出到 stdout）。
+修正：加 --auth 参数重新运行同一命令（将弹出 Windows Hello 验证身份后带 token 重读）。
+```
+（exit 10，retry=after_fix——匿名 401/403 专用；带 token 的 401/403 走通用 credential_expired）
+
+```
+[Sluice] api GET <path> → HTTP <st>（<n> B，响应体已输出到 stdout）。
+本次未产生任何副作用。404 = 资源不存在或路径有误；429 = 触发限流，稍等再试；
+其余请读响应体的 message 字段。修正路径或参数后重试。
+```
+（exit 10，retry=after_fix——其余非 2xx 通用）
+
+```
+[Sluice·终态] vault 状态损坏：<token.bin 存在，但 Hello 密钥缺失/不可用>。
+本次操作未执行，无任何变更；重试同一命令不会好转。
+请让用户重新运行 sluice setup 重建 vault 与 Hello 密钥的配对；在此之前 sluice 的写操作不可用。
+```
+（exit 8，retry=wait_user——Hello 密钥缺失 ≠ 用户取消，不占 consent_failed 档）
+
+```
+[Sluice·终态] pr_create 被服务端拒绝（HTTP 422：<服务端 message>）。最常见原因：该 head→base 的 PR 已存在，或两分支间没有提交差异。
+本次操作未执行，GitHub 上没有产生任何变更。
+1. 不要原样重跑同一命令（同样的参数仍会被拒绝）；
+2. 先查已有 PR：sluice api "repos/<owner/repo>/pulls?head=<owner>:<head>" --auth；
+3. 已存在 → 使用已存在的那个 PR；确需新 PR → 更换 head 分支或先产生新提交后再提交。
+```
+（exit 10，retry=after_fix——PR 422 专用，替代旧"用法错误"模板）
+
 ### 8.3 Exit code 表
 
 | code | 含义 | retry |
@@ -353,7 +391,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | 8 | 未初始化 | wait_user |
 | 9 | 凭据失效 | wait_user |
 | 10 | 用法错误 | after_fix |
-| 20 | 连接失败（请求未发出，无副作用） | retry_ok |
+| 20 | 连接失败（请求未发出，无副作用）；api GET 超时同码（幂等，重试安全） | retry_ok |
 | 21 | **结果未知**（请求已发出：超时/中断/5xx，勿盲重试） | wait_user |
 
 ### 8.4 AGENTS.md 片段（`sluice setup --install-snippet` 追加到工作区 AGENTS.md）
@@ -378,7 +416,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | `pr_create` | `sluice pr create --repo R --base B --head H --title T --body-file F` | WinHTTP `POST /repos/{r}/pulls` | 仅 sluice 进程 |
 | `pr_review` | `sluice review --repo R --number N --event E [--body-file F]` | WinHTTP `POST /repos/{r}/pulls/{n}/reviews` | 仅 sluice 进程 |
 | `push` | `sluice push [--repo-path D] --remote R --refspec S` | 见下 push bridge | git 子进程内存（存活期） |
-| `api`（读，v2.2） | `sluice api get <api-path>` / `sluice api graphql` | WinHTTP GET/查询类，**无需批准**，但每次调用（路径 + 状态码 + 字节量）写入 audit 读日志 | token 不出 sluice 进程 |
+| `api`（读，v2.2；V1 实现现状） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` 查询字符——分页/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；其余非 2xx→10。响应体→stdout、消息→stderr（不污染数据）。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
 
 **push bridge**（取代原方案 shim，无常驻、无 PATH 依赖）：
 
@@ -401,7 +439,7 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 
 **`sluice notice`（消息型 credential helper，v2.2 新增）**：setup --install 写入全局 gitconfig。git（push/fetch 私有库）索要凭据时，它**不给凭据**，只向 stderr 打印 §8 终态文案后退出非零——agent 第一次直推 git，看到的是"写操作请走 sluice push；不要尝试 gh auth login；环境无可用凭据"，而不是裸的 `could not read Username`。选它而非 pre-push hook 的理由：私有库 push 在 ls-refs 阶段就要凭据，凭据提示发生在 pre-push 触发**之前**，hook 可能根本不执行；credential helper 恰好是 git 索要凭据的那一刻，拦截点精确。它不持凭据、不占 PATH、不伪装任何程序——只是把误导性错误换成可行动消息（~20 行），与被砍掉的凭据 shim 有本质区别。gh 无对应通道（其"请 gh auth login"提示无法替换），由 AGENTS.md 片段 + 哨兵（§6）兜底。注意：`git -c credential.helper=` 显式覆盖可绕过 notice——那是 T2 形状的行为，T1 不会做。
 
-**`sluice api`（只读模式，v2.2 新增）**：只允许 GET/查询类调用，无需批准、无需 Hello，但每次调用写入 audit 读日志。收益：(a) agent 在 GitHub 上的读操作有 ground truth，"我读过 X"可核对，防幻觉；(b) 私有库 API 读的唯一通道，且 token 不出 sluice 进程；(c) unknown（exit 21）的查证命令落在它身上。诚实定位：这是**指令约定的可见性通道，不是墙**——agent 直连 GET 无法也无需阻止（读无破坏力），绕过它只是回到无日志状态，不是安全失败。
+**`sluice api`（只读模式，v2.2 新增）**：只允许 GET/查询类调用，无需批准；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。每次调用写入 audit 读日志。收益：(a) agent 在 GitHub 上的读操作有 ground truth，"我读过 X"可核对，防幻觉；(b) 私有库 API 读的唯一通道，且 token 不出 sluice 进程；(c) unknown（exit 21）的查证命令落在它身上。诚实定位：这是**指令约定的可见性通道，不是墙**——agent 直连 GET 无法也无需阻止（读无破坏力），绕过它只是回到无日志状态，不是安全失败。
 
 ## 9.5 人类自己的工作流（v2.2 新增；seal 之后人怎么干活）
 

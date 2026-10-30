@@ -187,6 +187,64 @@ internal static class Messages
               """,
         ExitCodes.Internal, "wait_user", true);
 
+    // ---- api 读通道（§9）：GET 专用三态；stdout 是响应体数据，消息一律走 stderr 不污染 ----
+
+    // GET 超时：请求可能已送达，但 GET 幂等、无副作用——归 http_failed(20/retry_ok) 家族。
+    // §8.2 规定 exit 21 是"非幂等 POST 的专属档"，读通道不得借用。
+    public static Msg ApiTimeout(string path) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → 请求超时（可能已送达；GET 无副作用，重试不会造成重复效果）。
+        本次未产生任何副作用；可间隔 30 秒后重试同一命令，连续 3 次失败则报告用户。
+        """,
+        ExitCodes.HttpFailed, "retry_ok", true);
+
+    // 匿名读 401/403：资源需要认证——agent 可自行修正（加 --auth 重跑，届时弹 Hello）
+    public static Msg ApiAuthRequired(string path, int st) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → HTTP {st}：资源需要认证（私有或受限），匿名读不可用。
+        本次未产生任何副作用（响应体已输出到 stdout）。
+        修正：加 --auth 参数重新运行同一命令（将弹出 Windows Hello 验证身份后带 token 重读）。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // 其余非 2xx（404/429/…）：HTTP 层面已应答，事实在响应体
+    public static Msg ApiHttpError(string path, int st, int bytes) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → HTTP {st}（{bytes} B，响应体已输出到 stdout）。
+        本次未产生任何副作用。404 = 资源不存在或路径有误；429 = 触发限流，稍等再试；
+        其余请读响应体的 message 字段。修正路径或参数后重试。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- vault 与 Hello 密钥不配套（exit 8，retry=wait_user；区别于 consent_failed 的"用户取消"） ----
+    public static Msg VaultBroken(string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        vault 状态损坏：{detail}。
+        本次操作未执行，无任何变更；重试同一命令不会好转。
+        请让用户重新运行 sluice setup 重建 vault 与 Hello 密钥的配对；在此之前 sluice 的写操作不可用。
+        """,
+        ExitCodes.NotInitialized, "wait_user", true);
+
+    // ---- pr_create 被服务端 422 拒绝（exit 10，retry=after_fix；原样重跑必再被拒） ----
+    public static Msg PrRejected(string repo, string head, string detail)
+    {
+        var owner = repo.Contains('/') ? repo[..repo.IndexOf('/')] : "owner";
+        return new Msg(
+            "[Sluice·终态]",
+            $"""
+            pr_create 被服务端拒绝（{detail}）。最常见原因：该 head→base 的 PR 已存在，或两分支间没有提交差异。
+            本次操作未执行，GitHub 上没有产生任何变更。
+            1. 不要原样重跑同一命令（同样的参数仍会被拒绝）；
+            2. 先查已有 PR：sluice api "repos/{repo}/pulls?head={owner}:{head}" --auth；
+            3. 已存在 → 使用已存在的那个 PR；确需新 PR → 更换 head 分支或先产生新提交后再提交。
+            """,
+            ExitCodes.BadRequest, "after_fix", true);
+    }
+
     // ---- selftest 数据源：渲染全部消息样例 ----
     public static (string Name, Msg Sample)[] AllSamples() =>
     [
@@ -205,6 +263,11 @@ internal static class Messages
         ("unknown",   Unknown("超时/连接中断/HTTP 5xx")),
         ("internal1", Internal(afterExecutionStarted: false)),
         ("internal2", Internal(afterExecutionStarted: true)),
+        ("apitimeout", ApiTimeout("repos/rustin-beep/Sluice/pulls")),
+        ("apiauth",    ApiAuthRequired("repos/rustin-beep/Sluice/issues", 403)),
+        ("apihttp",    ApiHttpError("repos/rustin-beep/Sluice/issues/999", 404, 122)),
+        ("vaultbroken", VaultBroken("token.bin 存在，但 Hello 密钥 SluiceVault 缺失")),
+        ("prrejected", PrRejected("rustin-beep/Sluice", "dev", "HTTP 422：A pull request already exists")),
     ];
 
     public static void Write(Msg m)

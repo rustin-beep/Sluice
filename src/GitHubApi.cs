@@ -222,15 +222,13 @@ internal static class GitHubApi
         }
     }
 
-    /// <summary>GitHub 错误响应的 message 字段（无则空串）。</summary>
+    /// <summary>GitHub 错误响应的 message 字段（无则空串）。JsonDocument 解析——手刮字符串遇转义引号会截断。</summary>
     private static async Task<string> MessageOfAsync(HttpResponseMessage resp)
     {
         try
         {
-            var json = await resp.Content.ReadAsStringAsync();
-            const string key = "\"message\":\"";
-            var i = json.IndexOf(key, StringComparison.Ordinal);
-            return i >= 0 ? json[(i + key.Length)..json.IndexOf('"', i + key.Length)] : "";
+            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            return doc.RootElement.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
         }
         catch { return ""; }
     }
@@ -279,6 +277,9 @@ internal static class GitHubApi
         return root.Message;
     }
 
+    /// <summary>push 序列复用客户端：一次 push 最多约 90 个请求（blob×N+tree+commit×M+update-ref），逐请求新建 TLS 连接是纯性能债（40 blob 实测 ≈90 次握手）。</summary>
+    private static readonly HttpClient SharedClient = CreateClient();
+
     /// <summary>
     /// REST push 等复合序列用的通用请求：同一条 DoH+issuer 防线；
     /// 返回原始 (status, body)。序列幂等性由调用方语义保证。
@@ -286,11 +287,10 @@ internal static class GitHubApi
     internal static async Task<(int Status, string Body)> SendRawAsync(
         HttpMethod m, string path, string token, string? jsonBody)
     {
-        using var http = CreateClient();
         using var req = Req(m, path, token);
         if (jsonBody is not null)
             req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-        using var resp = await http.SendAsync(req);
+        using var resp = await SharedClient.SendAsync(req);
         return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync());
     }
 

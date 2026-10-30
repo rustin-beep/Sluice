@@ -33,6 +33,7 @@ internal static class Gate
         public sealed record TimedOut() : Outcome();
         public sealed record ConsentFailed() : Outcome();
         public sealed record Approved(byte[] Signature) : Outcome();
+        public sealed record VaultKeyMissing(string Detail) : Outcome();
         public sealed record Crashed(string Error) : Outcome();
     }
 

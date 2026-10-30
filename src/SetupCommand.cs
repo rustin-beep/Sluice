@@ -64,6 +64,22 @@ internal static class SetupCommand
         if (!File.Exists(Path.Combine(dir, "config.json")))
             File.WriteAllText(Path.Combine(dir, "config.json"), "{}" + Environment.NewLine);
 
+        // token 已入 vault，明文副本使命结束：seal 无法枚举任意路径上的 token 文件，
+        // 留着 = 封堵前提之外的侧门（P2，2026-10-30 评审）。删除失败必须醒目提示人工处理。
+        if (tokenFile is not null)
+        {
+            try
+            {
+                File.Delete(tokenFile);
+                Console.WriteLine($"已删除 --token-file 文件（明文 PAT 不应与 vault 并存）：{tokenFile}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠ 无法删除 --token-file 文件（{ex.Message}）——seal 不扫描该路径，");
+                Console.WriteLine($"  请立即手动删除含明文 PAT 的文件：{tokenFile}");
+            }
+        }
+
         Console.WriteLine($"已保存 vault：{Path.Combine(dir, "token.bin")}");
         Console.WriteLine();
         Console.WriteLine("最后一步（承重墙）：运行 sluice seal --fix 封堵环境里的直连凭据，");
@@ -120,7 +136,8 @@ internal static class SetupCommand
         {
             Console.WriteLine("运行 sluice seal --fix 自动处理（凭据管理器 / gh hosts.yml / .git-credentials / SSH 屏蔽块）。");
             Console.WriteLine("在处理完成前，sluice 的一切写操作将以 seal_violation 拒绝服务。");
-            return 0;
+            // 脏环境即非零：脚本可判脏（exit 7 = seal_violation，与写路径同码）
+            return ExitCodes.SealViolation;
         }
 
         Console.WriteLine("执行 --fix …");
@@ -130,13 +147,13 @@ internal static class SetupCommand
 
         var after = SealCheck.Run();
         if (after.Count == 0)
-            Console.WriteLine("✓ 复查通过：环境已封堵。");
-        else
         {
-            Console.WriteLine($"复查仍有 {after.Count} 处（需人工处理）：");
-            foreach (var item in after)
-                Console.WriteLine($"  ✗ {item}");
+            Console.WriteLine("✓ 复查通过：环境已封堵。");
+            return 0;
         }
-        return 0;
+        Console.WriteLine($"复查仍有 {after.Count} 处（需人工处理）：");
+        foreach (var item in after)
+            Console.WriteLine($"  ✗ {item}");
+        return ExitCodes.SealViolation;
     }
 }

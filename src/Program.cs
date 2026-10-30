@@ -69,7 +69,7 @@ internal static class Program
 
     private static int BadVerb(string verb)
     {
-        Messages.Write(Messages.BadRequest($"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / selftest"));
+        Messages.Write(Messages.BadRequest($"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / api / selftest"));
         return ExitCodes.BadRequest;
     }
 
@@ -86,20 +86,20 @@ internal static class Program
             switch (args[i])
             {
                 case "--repo":
-                    if (i + 1 >= args.Length) return ErrMissing("--repo");
+                    if (i + 1 >= args.Length) return ErrMissing("push", "--repo");
                     repo = args[++i];
                     break;
                 case "--base":
                     // 新建分支的增量基点（ref 或 sha，如 origin/master）——存量仓库新分支必给，否则全历史重放
-                    if (i + 1 >= args.Length) return ErrMissing("--base");
+                    if (i + 1 >= args.Length) return ErrMissing("push", "--base");
                     @base = args[++i];
                     break;
                 case "--branch":
-                    if (i + 1 >= args.Length) return ErrMissing("--branch");
+                    if (i + 1 >= args.Length) return ErrMissing("push", "--branch");
                     branch = args[++i];
                     break;
                 case "--repo-path":
-                    if (i + 1 >= args.Length) return ErrMissing("--repo-path");
+                    if (i + 1 >= args.Length) return ErrMissing("push", "--repo-path");
                     repoPath = args[++i];
                     break;
                 case "--force":
@@ -185,6 +185,10 @@ internal static class Program
                 Audit.Append("push", repo, branch, plan.HeadSha[..8], "consent_failed", consent: "hello_failed");
                 Messages.Write(Messages.ConsentFailed("push", $"{repo}@{branch}"));
                 return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("push", repo, branch, plan.HeadSha[..8], "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
             case Gate.Outcome.Crashed c:
                 Audit.Append("push", repo, branch, plan.HeadSha[..8], "internal_gate_crash", result: c.Error);
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
@@ -240,6 +244,7 @@ internal static class Program
             RestPush.PushResult.HasMerge => PushFail(plan, "has_merge", Messages.BadRequest(r.Reason ?? "含 merge 提交"), ExitCodes.BadRequest, r.Reason),
             RestPush.PushResult.Submodule => PushFail(plan, "submodule", Messages.BadRequest(r.Reason ?? "含 submodule"), ExitCodes.BadRequest, r.Reason),
             RestPush.PushResult.Unclear => PushFail(plan, "unknown", Messages.Unknown(r.Reason ?? "结果不明"), ExitCodes.Unknown, r.Reason),
+            RestPush.PushResult.HeadMoved => PushFail(plan, "head_moved", Messages.BadRequest(r.Reason ?? "批准期间 HEAD 已变化"), ExitCodes.BadRequest, r.Reason),
             _ => PushFail(plan, "other", Messages.Internal(afterExecutionStarted: true), ExitCodes.Internal, r.Reason),
         };
     }
@@ -268,8 +273,9 @@ internal static class Program
         return ExitCodes.Success;
     }
 
-    private static int ErrMissing(string opt)    {
-        Messages.Write(Messages.BadRequest($"pr_comment 参数 {opt} 缺少值"));
+    private static int ErrMissing(string verb, string opt)
+    {
+        Messages.Write(Messages.BadRequest($"{verb} 参数 {opt} 缺少值"));
         return ExitCodes.BadRequest;
     }
 
@@ -293,7 +299,7 @@ internal static class Program
             {
                 case "--repo":
                     repo = Next();
-                    if (repo is null) return ErrMissing("--repo");
+                    if (repo is null) return ErrMissing("pr_comment", "--repo");
                     break;
                 case "--number":
                     var v = Next();
@@ -302,7 +308,7 @@ internal static class Program
                     break;
                 case "--body-file":
                     bodyFile = Next();
-                    if (bodyFile is null) return ErrMissing("--body-file");
+                    if (bodyFile is null) return ErrMissing("pr_comment", "--body-file");
                     break;
                 default:
                     Messages.Write(Messages.BadRequest($"无法识别的参数：{args[i]}"));
@@ -376,6 +382,11 @@ internal static class Program
                 Messages.Write(Messages.ConsentFailed("pr_comment", target));
                 return ExitCodes.ConsentFailed;
 
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("pr_comment", repo, $"#{number}", sha, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
+
             case Gate.Outcome.Crashed c:
                 Audit.Append("pr_comment", repo, $"#{number}", sha, "internal_gate_crash", result: c.Error);
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
@@ -439,11 +450,12 @@ internal static class Program
                 "api 缺少 <api-path>（示例：sluice api repos/owner/repo/pulls/9；私有资源加 --auth 过 Windows Hello）"));
             return ExitCodes.BadRequest;
         }
-        // GET-only + 路径白名单（拒 scheme/主机/.. 逃逸——这不是开放代理，只收 api.github.com 的相对路径）
+        // GET-only + 路径白名单（拒 scheme/主机/.. 逃逸——这不是开放代理，只收 api.github.com 的相对路径）。
+        // ?&: 支持分页/过滤（?page=2、?head=owner:branch——`://` 已单拒，裸 `:` 无 scheme 危害）
         if (path.StartsWith('/') || path.Contains("..") || path.Contains("://")
-            || !System.Text.RegularExpressions.Regex.IsMatch(path, @"^[A-Za-z0-9._/@{}=%\-]+$"))
+            || !System.Text.RegularExpressions.Regex.IsMatch(path, @"^[A-Za-z0-9._/@{}=%\-:?&]+$"))
         {
-            Messages.Write(Messages.BadRequest($"<api-path> 须为 api.github.com 的相对路径（无 scheme、无 ..），收到：{path}"));
+            Messages.Write(Messages.BadRequest($"<api-path> 须为 api.github.com 的相对路径（无 scheme、无 ..，可含 ?query），收到：{path}"));
             return ExitCodes.BadRequest;
         }
 
@@ -456,7 +468,17 @@ internal static class Program
                 return ExitCodes.NotInitialized;
             }
             // 读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然
-            var sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+            byte[]? sig;
+            try
+            {
+                sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+            }
+            catch (VaultKeyMissingException ex)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "vault_broken");
+                Messages.Write(Messages.VaultBroken(ex.Message));
+                return ExitCodes.NotInitialized;
+            }
             if (sig is null)
             {
                 Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
@@ -481,10 +503,10 @@ internal static class Program
         }
         if (st == 0)
         {
-            // 超时（请求可能已送达，但 GET 无副作用——按 retry_ok 语义明示可重试）
-            Audit.Append("api_read", "api.github.com", path, null, "unknown", result: "timeout");
-            Console.Error.WriteLine($"[Sluice] api GET {path} → 超时（GET 无副作用，可重试同一命令）");
-            return ExitCodes.Unknown;
+            // GET 超时：请求可能已送达但幂等无副作用——20/retry_ok（§8.2：21 是非幂等 POST 专属档）
+            Audit.Append("api_read", "api.github.com", path, null, "timeout", result: "retry_safe_get");
+            Messages.Write(Messages.ApiTimeout(path));
+            return ExitCodes.HttpFailed;
         }
 
         Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B{(token is not null ? " auth" : " anon")}");
@@ -494,12 +516,17 @@ internal static class Program
             case >= 200 and < 300:
                 return ExitCodes.Success;
             case 401 or 403:
-                Console.Error.WriteLine(token is null
-                    ? $"[Sluice] api GET {path} → HTTP {st}：资源需要认证（私有或受限）——加 --auth 过 Windows Hello 重试"
-                    : $"[Sluice] api GET {path} → HTTP {st}：token 无效或资源不在授权列表");
+                // 匿名：资源需要认证，加 --auth 是 agent 可自行完成的修正（after_fix）；
+                // 带 token：凭据真的失效/越权，才归 credential_expired（wait_user，交还用户）
+                if (token is null)
+                {
+                    Messages.Write(Messages.ApiAuthRequired(path, st));
+                    return ExitCodes.BadRequest;
+                }
+                Messages.Write(Messages.CredentialExpired($"HTTP {st}（api GET {path}）"));
                 return ExitCodes.CredentialExpired;
             default:
-                Console.Error.WriteLine($"[Sluice] api GET {path} → HTTP {st}（{body.Length} B，响应体已输出到 stdout）");
+                Messages.Write(Messages.ApiHttpError(path, st, body.Length));
                 return ExitCodes.BadRequest;
         }
     }
@@ -516,23 +543,23 @@ internal static class Program
             {
                 case "--repo":
                     repo = Next();
-                    if (repo is null) return ErrMissing("--repo");
+                    if (repo is null) return ErrMissing("pr_create", "--repo");
                     break;
                 case "--base":
                     @base = Next();
-                    if (@base is null) return ErrMissing("--base");
+                    if (@base is null) return ErrMissing("pr_create", "--base");
                     break;
                 case "--head":
                     head = Next();
-                    if (head is null) return ErrMissing("--head");
+                    if (head is null) return ErrMissing("pr_create", "--head");
                     break;
                 case "--title":
                     title = Next();
-                    if (title is null) return ErrMissing("--title");
+                    if (title is null) return ErrMissing("pr_create", "--title");
                     break;
                 case "--body-file":
                     bodyFile = Next();
-                    if (bodyFile is null) return ErrMissing("--body-file");
+                    if (bodyFile is null) return ErrMissing("pr_create", "--body-file");
                     break;
                 default:
                     Messages.Write(Messages.BadRequest($"无法识别的参数：{args[i]}"));
@@ -612,6 +639,10 @@ internal static class Program
                 Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "consent_failed", consent: "hello_failed");
                 Messages.Write(Messages.ConsentFailed("pr_create", target));
                 return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
             case Gate.Outcome.Crashed c:
                 Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_gate_crash", result: c.Error);
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
@@ -661,7 +692,13 @@ internal static class Program
             default:
                 Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal", consent: "hello",
                     result: r.Reason ?? $"http_{r.Status}");
-                // 422 等服务端明确拒绝（PR 已存在/分支无差异）——事实明确未创建，按 bad_request 语义回执
+                // 422（PR 已存在/分支无差异）：服务端明确拒绝，原样重跑必再 422——专用消息指引查已有 PR；
+                // 其余非 2xx（如 400 真·用法错）仍走通用 bad_request 模板
+                if (r.Status == 422)
+                {
+                    Messages.Write(Messages.PrRejected(repo, head, r.Reason ?? "HTTP 422"));
+                    return ExitCodes.BadRequest;
+                }
                 Messages.Write(Messages.BadRequest($"pr_create 被服务端拒绝：{r.Reason}"));
                 return ExitCodes.BadRequest;
         }

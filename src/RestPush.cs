@@ -16,7 +16,7 @@ internal static class RestPush
     public sealed record Plan(string Repo, string Branch, string RepoPath, string HeadSha, string WindowText,
         bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null);
 
-    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other }
+    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved }
 
     public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null);
 
@@ -78,7 +78,7 @@ internal static class RestPush
     {
         var set = new HashSet<string>();
         foreach (var c in commits)
-            foreach (var line in GitLines(repoPath, $"diff-tree -r --no-renames --raw {FirstParentOrEmpty(repoPath, c)} {c}"))
+            foreach (var line in GitLines(repoPath, $"-c core.quotePath=false diff-tree -r --no-renames --raw {FirstParentOrEmpty(repoPath, c)} {c}"))
                 ParseRaw(line, (_, _, sha, st, submodule) =>
                 {
                     if (st is 'D' or 'U') return;
@@ -104,6 +104,13 @@ internal static class RestPush
 
     public static async Task<Result> ExecuteAsync(string token, Plan plan)
     {
+        // 批准你所见（T5 残余闭合）：窗口文本来自 PlanLocal 快照；若弹窗期间 HEAD 被其它
+        // 进程推进，实际推送内容将超出用户所见范围——fail-closed 拒推，重跑即重新走全流程。
+        var headNow = Git(plan.RepoPath, "rev-parse HEAD").Trim();
+        if (headNow != plan.HeadSha)
+            return new Result(PushResult.HeadMoved,
+                $"批准期间本地 HEAD 已前进（{plan.HeadSha[..8]} → {headNow[..8]}），弹窗展示的提交范围已过期。本次未推送，请重新运行 sluice push（将以新 HEAD 重新弹窗）");
+
         // 远端现状（读 API，免批准路径与 §9 api 同类）
         var (st, body) = await GitHubApi.SendRawAsync(HttpMethod.Get,
             $"repos/{plan.Repo}/git/ref/heads/{plan.Branch}", token, null);
@@ -144,7 +151,8 @@ internal static class RestPush
         if (isNew)
         {
             // 新建分支：默认全历史；--base 给了增量基点则只推 base..HEAD（存量仓库新分支唯一可行形态）
-            if (plan.Base is { Length: 40 } b)
+            // 长度 40 或 64：SHA-1 与 SHA-256 仓库的对象名（sha-256 漏判会静默退化成全历史重放）
+            if (plan.Base is { Length: 40 or 64 } b)
             {
                 if (!GitIsAncestor(plan.RepoPath, b, plan.HeadSha))
                     return new(PushResult.Other, "--base 基点不是 HEAD 祖先（非增量），拒绝执行");
@@ -200,7 +208,7 @@ internal static class RestPush
         {
             var parent = FirstParentOrEmpty(plan.RepoPath, c);
             var entries = new JsonArray();
-            foreach (var line in GitLines(plan.RepoPath, $"diff-tree -r --no-renames --raw {parent} {c}"))
+            foreach (var line in GitLines(plan.RepoPath, $"-c core.quotePath=false diff-tree -r --no-renames --raw {parent} {c}"))
                 ParseRaw(line, (path, mode, sha, st2, submodule) =>
                 {
                     if (submodule) throw new LocalPlanException($"REST push 不支持 submodule：{path}");
@@ -274,7 +282,13 @@ internal static class RestPush
 
     private static string Trunc(string s) => s.Length > 200 ? s[..200] : s;
 
-    /// <summary>解析 `:oldmode newmode oldsha newsha STATUS\tpath`（--no-renames，无 R/C 形态）。</summary>
+    /// <summary>
+    /// 解析 `:oldmode newmode oldsha newsha STATUS\tpath`（--no-renames，无 R/C 形态）。
+    /// 路径保真依赖调用方带 `-c core.quotePath=false`：默认 C 引号转义会把非 ASCII 路径
+    /// 连引号一起发往服务端，tree sha 与本地分叉（P1，2026-10-30 探针定案）。
+    /// 残留：`"` 与 `\` 开头的路径在 quotePath=false 下仍被转义，只有 `-z` 才彻底——
+    /// NTFS 建不出这类名字，仅 Linux 作者的提交可带入，完整修复（-z 重写）列 V1 红队前。
+    /// </summary>
     private static void ParseRaw(string line, Action<string, string, string, char, bool> fn)
     {
         if (line.Length < 2 || line[0] != ':') return;
@@ -301,7 +315,7 @@ internal static class RestPush
         var outp = p.StandardOutput.ReadToEnd();
         if (!p.WaitForExit(15_000)) throw new LocalPlanException($"git 超时：{args}");
         if (p.ExitCode != 0)
-            throw new LocalPlanException($"git {args.Split(' ')[0]} 失败：{p.StandardError.ReadToEnd().Trim()}");
+            throw new LocalPlanException($"git 失败（{Trunc(args)}）：{p.StandardError.ReadToEnd().Trim()}");
         return outp;
     }
 

@@ -12,6 +12,12 @@ internal interface IConsent
     Task<byte[]?> SignAsync(byte[] challenge);
 }
 
+/// <summary>
+/// vault 文件在而 Hello 密钥缺失/不可用（系统重置 Hello 数据、更换账户等）。
+/// 与"用户取消"（null 返回）分开归因：这不是用户意愿，重试无用，需重跑 setup。
+/// </summary>
+public sealed class VaultKeyMissingException(string msg) : Exception(msg);
+
 internal sealed class HelloConsent : IConsent
 {
     private const string KeyName = "SluiceVault";
@@ -20,7 +26,9 @@ internal sealed class HelloConsent : IConsent
     {
         var open = await Windows.Security.Credentials.KeyCredentialManager.OpenAsync(KeyName);
         if (open.Status != Windows.Security.Credentials.KeyCredentialStatus.Success)
-            return null; // vault 建过则键必在；不在 = 状态损坏，按未通过处理
+            throw new VaultKeyMissingException(
+                $"Hello 密钥 {KeyName} 不可用（{open.Status}）——vault 若在而密钥缺失，"
+                + "多为系统重置 Windows Hello 数据所致，需重跑 setup 重建配对");
         var buf = CryptographicBuffer.CreateFromByteArray(challenge);
         var r = await open.Credential.RequestSignAsync(buf);
         if (r.Status != Windows.Security.Credentials.KeyCredentialStatus.Success)
