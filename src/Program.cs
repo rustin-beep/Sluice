@@ -72,7 +72,9 @@ internal static class Program
               sluice comment --repo O/R --number N --body-file F   在 issue/PR 下发表评论（经批准 + Hello）
               sluice push --repo O/R --branch B [--repo-path D] [--base REF]
                                                         推送本地 HEAD 到远端分支（REST，经批准 + Hello；
-                                                        新建远端分支时 --base 给增量基点，如 origin/master。
+                                                        --base：新建分支给增量基点（如 origin/master）；
+                                                        已有分支给新基点 = 重放式更新（原地替换旧头，
+                                                        PR 原地 rebase 更新，弹窗明示丢弃清单）。
                                                         多请求序列，调用方超时应给 ≥300s）
               sluice pr create --repo O/R --base B --head H --title T --body-file F
                                                         创建 PR（经批准 + Hello）
@@ -130,7 +132,8 @@ internal static class Program
                     repo = args[++i];
                     break;
                 case "--base":
-                    // 新建分支的增量基点（ref 或 sha，如 origin/master）——存量仓库新分支必给，否则全历史重放
+                    // 增量基点（ref 或 sha，如 origin/master）：新建远端分支 = 增量推送（存量仓库新分支必给）；
+                    // 已有远端分支 = 重放式更新（原地替换旧头，PR 不换分支，弹窗明示替换与丢弃清单，§9.6）
                     if (i + 1 >= args.Length) return ErrMissing("push", "--base");
                     @base = args[++i];
                     break;
@@ -143,7 +146,8 @@ internal static class Program
                     repoPath = args[++i];
                     break;
                 case "--force":
-                    // policy tripwire：force 永不批准，弹窗都不出现（§9）
+                    // policy tripwire：裸 force 永不批准，弹窗都不出现（§9）。
+                    // 覆盖式更新的唯一合法形态 = --base 重放通道（§9.6）：force 不是参数，是"声明新基点"的结论
                     Messages.Write(Messages.PolicyReject("push --force / force push"));
                     return ExitCodes.PolicyReject;
                 default:
@@ -202,10 +206,14 @@ internal static class Program
             return ExitCodes.Internal;
         }
 
+        // 重放式更新：弹窗 target 行明示替换（§9.6 闸门③）——旧头→新头一眼可辨，与常规推送区分
+        var gateTarget = plan.ReplacingSha is string oldHead
+            ? $"{branch} {oldHead[..8]}→{plan.HeadSha[..8]}（重放式更新）"
+            : $"{branch} @ {plan.HeadSha[..8]}";
         Gate.Outcome outcome;
         using (InputFilter.Install())
         {
-            outcome = Gate.Run(new Gate.Request("push", repo, $"{branch} @ {plan.HeadSha[..8]}",
+            outcome = Gate.Run(new Gate.Request("push", repo, gateTarget,
                 plan.WindowText, plan.HeadSha[..8], TokenStore.PeekChallenge(),
                 plan.TouchesWorkflows ? "本次推送修改 .github/workflows/** —— 批准即部署 CI 变更，请特别确认" : null));
         }
@@ -213,23 +221,23 @@ internal static class Program
         switch (outcome)
         {
             case Gate.Outcome.Denied d:
-                Audit.Append("push", repo, branch, plan.HeadSha[..8], "denied", d.Preset, d.FreeText, consent: "none");
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "denied", d.Preset, d.FreeText, consent: "none");
                 Messages.Write(Messages.Denied("push", $"{repo}@{branch}", d.Preset, d.FreeText));
                 return ExitCodes.Denied;
             case Gate.Outcome.TimedOut:
-                Audit.Append("push", repo, branch, plan.HeadSha[..8], "timeout");
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "timeout");
                 Messages.Write(Messages.Timeout("push", $"{repo}@{branch}", Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("push", repo, branch, plan.HeadSha[..8], "consent_failed", consent: "hello_failed");
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "consent_failed", consent: "hello_failed");
                 Messages.Write(Messages.ConsentFailed("push", $"{repo}@{branch}"));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
-                Audit.Append("push", repo, branch, plan.HeadSha[..8], "vault_broken");
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "vault_broken");
                 Messages.Write(Messages.VaultBroken(vk.Detail));
                 return ExitCodes.NotInitialized;
             case Gate.Outcome.Crashed c:
-                Audit.Append("push", repo, branch, plan.HeadSha[..8], "internal_gate_crash", result: c.Error);
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "internal_gate_crash", result: c.Error);
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
                 return ExitCodes.Internal;
             case Gate.Outcome.Approved a:
@@ -246,7 +254,7 @@ internal static class Program
         try { token = TokenStore.Load(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "internal_vault_decrypt_failed", consent: "hello");
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -260,19 +268,19 @@ internal static class Program
         try { r = RestPush.ExecuteAsync(token, plan).GetAwaiter().GetResult(); }
         catch (HttpRequestException ex)
         {
-            Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "http_failed", consent: "hello", result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
-            Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "unknown", consent: "hello", result: "timeout");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "unknown", consent: "hello", result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
         catch (RestPush.LocalPlanException ex)
         {
-            Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "bad_request", consent: "hello");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "bad_request", consent: "hello");
             Messages.Write(Messages.BadRequest(ex.Message));
             return ExitCodes.BadRequest;
         }
@@ -285,7 +293,8 @@ internal static class Program
             RestPush.PushResult.Unauthorized => PushFail(plan, "credential_expired", Messages.CredentialExpired("HTTP 401/403"), ExitCodes.CredentialExpired, r.Reason),
             RestPush.PushResult.NeedFetch => PushFail(plan, "need_fetch", Messages.BadRequest(r.Reason ?? "需先同步远端"), ExitCodes.BadRequest, r.Reason),
             // 非 ff 改档 after_fix（2026-10-30 实战）：rebase 后可重推同一分支，agent 可自行修复——
-            // 原 policy_reject（"策略永禁"）定性不准，且缺 rebase 正解。force 本身仍永禁（tripwire 不动）。
+            // 原 policy_reject（"策略永禁"）定性不准，且缺 rebase 正解。裸 force 仍永禁（tripwire 不动）；
+            // rebase 到新基点的原地更新走 --base 重放通道（§9.6，消息末行已指向）。
             RestPush.PushResult.NonFF => PushFail(plan, "non_ff",
                 Messages.PushNonFF(plan.Repo, plan.Branch, r.Reason ?? "?"), ExitCodes.BadRequest, r.Reason),
             RestPush.PushResult.HasMerge => PushFail(plan, "has_merge",
@@ -293,13 +302,17 @@ internal static class Program
             RestPush.PushResult.Submodule => PushFail(plan, "submodule", Messages.BadRequest(r.Reason ?? "含 submodule"), ExitCodes.BadRequest, r.Reason),
             RestPush.PushResult.Unclear => PushFail(plan, "unknown", Messages.Unknown(r.Reason ?? "结果不明"), ExitCodes.Unknown, r.Reason),
             RestPush.PushResult.HeadMoved => PushFail(plan, "head_moved", Messages.BadRequest(r.Reason ?? "批准期间 HEAD 已变化"), ExitCodes.BadRequest, r.Reason),
+            // 重放式更新保真复核（§9.6 闸门④）：批准→执行间远端头被推进/分支被删即中止，
+            // 与 HeadMoved / PrMergeChanged 同族——静默 force 会孤儿化窗口外的新提交
+            RestPush.PushResult.RemoteMoved => PushFail(plan, "remote_moved",
+                Messages.PushRemoteMoved(plan.Repo, plan.Branch, r.Reason ?? "远端头已变化"), ExitCodes.BadRequest, r.Reason),
             _ => PushFail(plan, "other", Messages.Internal(afterExecutionStarted: true), ExitCodes.Internal, r.Reason),
         };
     }
 
     private static int PushFail(RestPush.Plan plan, string decision, Msg msg, int exit, string? reason = null)
     {
-        Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], decision, consent: "hello",
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], decision, consent: "hello",
             result: reason is null ? "not_executed" : $"not_executed:{reason}");
         Messages.Write(msg);
         return exit;
@@ -307,8 +320,10 @@ internal static class Program
 
     private static int Done(RestPush.Result r, RestPush.Plan plan)
     {
-        Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "approved", consent: "hello",
-            result: $"executed:{r.NewSha}");
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "approved", consent: "hello",
+            result: plan.ReplacingSha is string old
+                ? $"executed:{r.NewSha}（重放替换 {old[..8]}）"
+                : $"executed:{r.NewSha}");
         Messages.Write(Messages.Success("push", $"{plan.Repo}@{plan.Branch}", 200,
             $"https://github.com/{plan.Repo}/commit/{r.NewSha}"));
         return ExitCodes.Success;
@@ -316,10 +331,14 @@ internal static class Program
 
     private static int UpToDate(RestPush.Plan plan)
     {
-        Audit.Append("push", plan.Repo, plan.Branch, plan.HeadSha[..8], "up_to_date", consent: "hello");
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "up_to_date", consent: "hello");
         Messages.Write(Messages.PushUpToDate(plan.Repo, plan.Branch, plan.HeadSha[..8]));
         return ExitCodes.Success;
     }
+
+    /// <summary>审计 target（§9.6）：重放记 branch@旧头sha8→新头sha8——替换前后可追溯；常规记分支名。</summary>
+    private static string AuditTarget(RestPush.Plan plan) =>
+        plan.ReplacingSha is string old ? $"{plan.Branch}@{old[..8]}→{plan.HeadSha[..8]}" : plan.Branch;
 
     private static int ErrMissing(string verb, string opt)
     {

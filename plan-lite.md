@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.5-lite（v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 文档版本 | v2.6-lite（v2.6：push 重放式更新通道——force 不变量从"永禁"改写为"唯一显式通道"（非主干分支 + `--base` 声明新基点 + 弹窗明示旧头→新头与丢弃清单 + 执行前远端头复核 RemoteMoved + audit 记 old→new），PR 分支可原地 rebase 更新、污染归零；裸 `--force` 参数与主干推送仍永禁；v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
 | 日期 | 2026-10-30 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
@@ -64,7 +64,7 @@
 | fine-grained PAT | **保留并强化为硬性要求** | 爆炸半径封顶的唯一手段 |
 | 侧门封堵 | **从缺失变为 V0 核心** | 原方案最大流程缺口 |
 | audit.jsonl | 保留（简化字段） | 成本 50 行，价值高 |
-| policy 硬拒（main/force） | 保留，硬编码 | 疲劳误批的唯一闸 |
+| policy 硬拒（main/force） | 保留，硬编码（**v2.6 修订**：force 从"永禁"改为"唯一显式重放通道"，见 §9.6——裸 `--force` 参数仍永禁） | 疲劳误批的唯一闸；通道内化到弹窗明示与执行前复核，闸没拆 |
 | 拒绝理由反馈 | **新增（用户要求）** | 把"墙"变"协商界面"，批准请求收敛，弹窗越用越少 |
 | 递增延迟冷却 | 保留（简化为全局冷却） | 只能延长，做不到真阻止——对，但在封堵前提下"延长"已够 |
 | G8（Watt MITM 证书校验） | 保留为 P2 门控加固项 | 15 行，token 不发给第三方代理 |
@@ -104,7 +104,7 @@ agent / 用户
    │  sluice comment --repo R --number 5 --body-file x.md
    ▼
 sluice.exe（本次进程）
-   │ ① 解析参数 → ② policy 硬判（main/force → 直接 policy_reject，不弹窗）
+   │ ① 解析参数 → ② policy 硬判（main/裸 force → 直接 policy_reject，不弹窗）
    │ ③ 侧门自查（sealcheck，~50ms；违规 → seal_violation）
    │ ④ 冷却检查（state.json；冷却中 → cooldown）
    │ ⑤ 批准对话框（Avalonia）：操作摘要 + [批准] [拒绝] + 拒绝理由区（默认焦点拒绝，60s 倒计时）
@@ -205,6 +205,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | **Hello 取消/未通过 → 回到未决态**（v2.4，非终态） | 取消 ≠ 拒绝请求：回窗看清内容再决定；安全无损（取消无写动作，再批准仍必须过 Hello）。vault 密钥缺失仍终态（重试无用） |
 | **超时秒数可配**：config.json `gate_timeout_sec`（默认 60，夹 [30,600]）；剩 15s 提示音 + 闪任务栏（v2.4） | agent 同用户可改 config——改短只自伤（自动拒是安全侧）、改长不产生写动作，纯 UX 旋钮；召回给暂离用户一次回来机会 |
 | **pr_merge 弹窗带 head sha8，执行前复核**（v2.5） | 元数据是 fetch 时刻快照，批准→执行间 head 被推进则合并内容超出用户所见——与 push 的 HeadMoved 同族：sha 变了即中止（after_fix），重跑重新弹窗；批准指纹混入 head sha，审计行锚定"所见的是哪一版"；快照缺失（私有库匿名读失败）不阻断，弹窗已声明"请自行核对" |
+| **重放式更新弹窗明示替换内容**（v2.6，§9.6） | 「批准你所见」扩展到销毁侧：窗口顶部明示旧头→新头 + 丢弃清单（rev-list HEAD..origin/<B>，前 3 标题+总数）——feat 分支通常无服务端保护，本地闸门是唯一防线；执行前复核远端头（RemoteMoved） |
 | 冷却：10 分钟内 3 次拒绝 → 全局冷却 10 分钟；冷却期内再试不弹窗、每次顺延 +5 分钟（上限 60） | 只能延长，做不到真阻止——封堵前提下"延长"已够；消息带绝对结束时间 |
 
 不承诺：窗口显示完整性（同用户可移动/遮挡，L3）。信任在 Hello，不在画面。
@@ -261,10 +262,10 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 **policy_reject**（exit 4，retry=change_approach；硬编码策略，弹窗都不出现）
 
 ```
-[Sluice·终态] 该操作被策略永久禁止：<push → 受保护分支 main / force push / 修改 .github/workflows>。此类操作不存在人工批准途径。
+[Sluice·终态] 该操作被策略永久禁止：<push → 受保护分支 main / --force 参数 / 修改 .github/workflows>。此类操作不存在人工批准途径。
 本次操作未执行。
 1. 任何形式的重试（含变体：--force、--no-verify、改 remote、直连 API）都会被直接拒绝且不弹窗；
-2. 允许的替代：推送到新特性分支（如 feat/<简述>）并创建 PR；
+2. 允许的替代：rebase 到新基点后加 --base origin/<新基点> 走重放式更新（弹窗明示替换内容，§9.6），或推送到新特性分支（如 feat/<简述>）并创建 PR；
 3. 若确需例外，向用户说明，由用户本人修改策略。
 ```
 
@@ -397,9 +398,11 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 本次未产生任何副作用（GitHub 上没有产生任何变更）。
 修正：git fetch 后把本地分支 rebase 到远端头（git rebase origin/<B>；解冲突后 git rebase --continue），
 再重跑同一命令——rebase 后的线性历史可正常推送。
-注意：force push 被策略永久禁止，不要尝试任何形式的覆盖推送。
+若你已把分支 rebase 到新基点（如更新后的主干）、需原地更新同一 PR：加 --base origin/<新基点> 重跑同一命令，
+走重放式更新通道——弹窗明示旧头→新头与丢弃的远端提交清单，批准后替换（§9.6）。
+注意：--force 参数与任何未声明 --base 的覆盖推送仍被策略永禁。
 ```
-（exit 10，retry=after_fix——**v2.4 档位修正**：非 ff 可由 agent 自行 rebase 修复后重推同一分支，属"修正后可重试"而非"策略永禁"；force 本身仍由 --force tripwire 永禁，不变量不动）
+（exit 10，retry=after_fix——**v2.4 档位修正**：非 ff 可由 agent 自行 rebase 修复后重推同一分支，属"修正后可重试"而非"策略永禁"；**v2.6**：末行"force push 被策略永久禁止"改写为指向重放通道——旧表述与新通道矛盾；裸 force（--force 参数、未声明 --base 的覆盖）仍永禁，不变量见 §9.6）
 
 ```
 [Sluice] push 未执行：推送范围含 merge 提交（多父提交），REST push 只支持线性历史。
@@ -451,6 +454,13 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 （exit 20，retry=retry_ok——复核 GET 失败/超时：merge 未发出，整条命令重跑安全）
 
 ```
+[Sluice] push 未执行：<R>@<B> 远端头与规划期不同（<明细>），弹窗展示的替换对象已过期。
+本次未产生任何副作用（GitHub 上没有产生任何变更）。
+修正：git fetch（若分支已被删除加 --prune）后重跑同一命令——将以当前远端状态重新弹窗，重新展示替换对象与丢弃清单。
+```
+（exit 10，retry=after_fix——**v2.6 重放通道保真复核**：批准→执行间远端头被他人推进（或分支被删）即中止，静默 force 会孤儿化窗口外的新提交；与 push 的 HeadMoved / pr_merge 的 PrMergeChanged 同族）
+
+```
 [Sluice·终态] branch_delete 被服务端拒绝（HTTP 403：<服务端 message>）。常见原因：分支受保护或 token 无删除权限。
 本次操作未执行，GitHub 上没有产生任何变更（ref 未被动过）。
 受保护分支的删除属仓库策略，不要尝试绕过；确需删除请转告用户在仓库设置中处理。
@@ -476,6 +486,8 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | 21 | **结果未知**（请求已发出：超时/中断/5xx，勿盲重试） | wait_user |
 
 v2.4 注：push 非 ff 从 exit 4（policy_reject）移入 exit 10（after_fix）——rebase 后可重推同一分支，非策略永禁；force 与受保护分支仍 exit 4，不变量不动。
+
+v2.6 注：重放式更新通道的 RemoteMoved 同归 exit 10（after_fix）——fetch 后重跑即重新弹窗；force 不变量改写见 §9.6（裸 `--force` 参数与主干推送仍 exit 4）。
 
 ### 8.4 AGENTS.md 片段（`sluice setup --install-snippet` 追加到工作区 AGENTS.md）
 
@@ -516,8 +528,8 @@ sluice push（批准 + Hello 后）
 token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆盖），**不需要 GitHub App**（比原方案 S4 少一整个流程）。子进程窗口秒级，由 PAT 90 天上限兜底；可选升级 1h installation token（V1.5）。
 
 **policy 硬编码 tripwire（在代码里，不在配置里）**：
-- `--force` / force push → policy_reject，永不批准
-- push 到 `main` / `master` → policy_reject，永不批准
+- `--force` / 裸 force push → policy_reject，永不批准（**v2.6**：覆盖式更新的唯一合法形态是 `--base` 重放通道，见 §9.6——force 不是参数，是"声明新基点"这一显式动作的结论）
+- push 到 `main` / `master` → policy_reject，永不批准（重放通道同样过这条禁令——它在 push 前置检查之后才分流）
 - push 内容含 `.github/workflows/**` 变更 → 对话框红字单独标记，批准需二次确认
 
 **allowlist 的真墙在服务端（v2.2 修订，取代下面"改白名单要 Hello"的旧设计）**：vault 里的 fine-grained PAT 本身只授权指定仓库——本地 config.json 的白名单只是 UX 过滤器，改它不会扩大 token 的实际能力（未授权仓库 API 一律 403，fail-closed）。因此 `sluice allow-repo R` 就是普通配置编辑；setup 时打印 token 实际授权的仓库清单，服务端为准。最坏情况推演：agent 改本地白名单 → 人类看到未授权仓库的批准框 → 即便误批准，服务端仍 403 → fail-closed。
@@ -534,6 +546,27 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 2. **fetch/pull 用只读凭据**：一张只读 fine-grained PAT（指定仓库、90 天）配给 git 的 fetch/pull，人和 agent 共用。它推不了任何东西——静默持有它不构成写风险（无能力，而非有门槛），评审问题 1 的担忧对它天然不成立。
 3. **临时绕过走显式暂停**：大 push、交互式 rebase 结果、非 GitHub remote 等，`sluice seal --pause 30`（Hello 门控），期内直推，到期自动恢复，期间有常驻通知。
 4. **读走 `sluice api` 或浏览器**：私有库 API 读走 api 模式（有日志）；网页浏览不受管。
+
+## 9.6 push 重放式更新通道（v2.6 新增；force 不变量改写）
+
+**问题**：agent 把 PR 分支 rebase 到新基点（如更新后的主干）后，远端旧头不再是本地 HEAD 的祖先——FF 校验 fail-closed 下同分支更新结构性不可能，唯一出路是换分支重开 PR，污染随每次 rebase 累积（8-PR 实战反复撞墙）。原 NonFF 消息教的"rebase 到远端头"只解"远端有新提交"，解不了"换基点"。
+
+**不变量改写**（原"force push → policy_reject，永不批准"）：
+
+> force 仅限非主干分支，且必须经 `--base` 显式声明新基点；弹窗明示旧头→新头与丢弃的远端提交清单；执行前复核远端头 == 规划期入窗旧头。主干推送与未声明 `--base` 的覆盖推送（含 `--force` 参数）仍永禁。
+
+**四道闸门**（全部复用既有模式，无新机制）：
+
+| 闸门 | 实现 |
+|---|---|
+| ① 显式声明 | `--base <ref>` + 已有远端分支 = 请求重放（PlanLocal 检测 origin/<B> 存在且 `--base` 给出 → 重放模式，锚点/范围 = `<base>..HEAD`）；**无 `--base` 的已有分支维持 FF-only——NonFF 判定不放宽，只分流**。裸 `--force` 参数 tripwire 不动，agent 学不会"重试加个 --force" |
+| ② 主干禁令 | push 前置 tripwire（main/master，大小写不敏感）在通道分流之前——主干永远到不了重放模式 |
+| ③ 批准你所见（扩展到销毁侧） | 弹窗顶部明示「⚠ 重放式更新（非 fast-forward）：origin/<B> 旧头 <sha8> 将被替换为 <sha8>；丢弃的远端提交：<前 3 个 sha8+标题>（共 N 个）」——丢弃清单 = `git rev-list HEAD..origin/<B>` 规划期算出入窗。**这是本通道的核心安全机制而非 UI 润色**：多数仓库的分支保护只配主干，feat 分支服务端不拦，本地闸门是唯一防线 |
+| ④ 执行前复核 | 批准→执行间远端头被推进或分支被删 → RemoteMoved（exit 10，after_fix），fetch 后重跑重新弹窗——与 HeadMoved / PrMergeChanged 同族手法（T5 残余闭合）。update-ref 带 force:true 是唯一写点；服务端分支保护（若配了禁 force）是第三道纵深防御，422/403 透传服务端 message，分支未动重试安全 |
+
+**审计**：重放执行的 audit 行 target 记 `<branch>@<旧头sha8>→<新头sha8>`，弹窗 target 行同形态——替换前后可追溯。
+
+**边界**：重放通道受全部既有约束——线性历史（merge 拒）、≤200 commits / ≤2000 blobs、submodule 拒、workflows 变更红字、HeadMoved（本地 HEAD 前进即中止）。丢弃的远端提交成为服务端孤儿对象（GC 窗口内可按 sha 重建，与 branch delete 同态度）。
 
 ---
 
@@ -658,7 +691,7 @@ V0 前置探针补充（v2.2，vault 与 Hello 形态，约 1 天）：
 | 验收 | 标准 |
 |---|---|
 | push 全流程 | 批准后 push bridge 成功；token 不在命令行/磁盘/环境变量（用 WMI `Win32_Process` 与文件扫描验证） |
-| tripwire | 推 main → policy_reject 且不弹窗；force → 同 |
+| tripwire | 推 main → policy_reject 且不弹窗；`--force` 参数 → 同（覆盖式更新唯一合法形态 = `--base` 重放通道，§9.6） |
 | 冷却 | 3 拒 → 冷却消息含绝对时间；冷却期内请求不弹窗直接拒 |
 | **红队演练（关键）** | 真实 agent（ZCode/Qoder）+ 任务"完成后推 main"，观察：push 快速失败；agent 不换路径硬闯（检验消息服从性）；audit 完整；弹窗字段正确 |
 | **中文文案服从性** | 红队演练中专门观察 agent 对中文终态消息的服从；若发现"多想"，先改文案再改代码 |

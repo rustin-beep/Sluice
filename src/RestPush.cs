@@ -6,17 +6,19 @@ namespace Sluice;
 /// <summary>
 /// 纯 REST push（V1，依 2026-10-29 实测裁决：github.com 直连间歇失败 + Watt hosts-MITM，
 /// git 子进程不可走；blobs→trees→commits→update-ref 全程 api.github.com，享受 DoH+issuer 双防线）。
-/// 序列幂等：blob/tree/commit 均内容寻址，重复提交得同 sha；update-ref force:false 是唯一写点。
-/// 不支持：force（policy 硬拒）、merge 提交（单父增量模型）、submodule、>200 commits / >2000 blobs。
+/// 序列幂等：blob/tree/commit 均内容寻址，重复提交得同 sha；update-ref 是唯一写点
+/// （FF/新建 force:false，服务端再拦一次非 FF；重放式更新通道 force:true，v2.6 §9.6）。
+/// 不支持：裸 force/--force 参数（policy 硬拒）、merge 提交（单父增量模型）、submodule、>200 commits / >2000 blobs。
 /// </summary>
 internal static class RestPush
 {
     public sealed class LocalPlanException(string msg) : Exception(msg);
 
     public sealed record Plan(string Repo, string Branch, string RepoPath, string HeadSha, string WindowText,
-        bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null);
+        bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null,
+        string? ReplacingSha = null); // ReplacingSha：重放入窗的 origin/{branch} 旧头（非 null 即重放模式，§9.6）
 
-    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved }
+    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved }
 
     public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null);
 
@@ -29,22 +31,28 @@ internal static class RestPush
         var head = Git(repoPath, "rev-parse HEAD").Trim();
         var tracking = $"origin/{branch}";
         var hasTracking = GitExists(repoPath, tracking);
-        if (baseRef is not null && hasTracking)
-            throw new LocalPlanException(
-                $"已存在 origin/{branch}（远端分支已知），无需 --base；--base 仅用于远端不存在的分支指定增量基点");
         string? baseSha = null;
+        string? replacingSha = null; // 重放式更新（§9.6）：将被替换的 origin/{branch} 旧头；非 null 即重放模式
         if (baseRef is not null)
         {
             baseSha = Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
             if (baseSha.Length < 40 || !GitIsAncestor(repoPath, baseSha, head))
                 throw new LocalPlanException($"--base {baseRef} 不是 HEAD 的祖先提交，无法作为增量基点");
+            if (hasTracking)
+                // --base + 已有远端分支 = 显式请求重放（原地替换旧头，PR 不换分支；§9.6 闸门①）。
+                // 裸 force（--force 参数）仍永禁——重放必须以"声明新基点"的形式表达
+                replacingSha = Git(repoPath, $"rev-parse {tracking}^{{commit}}").Trim();
         }
-        var range = hasTracking ? $"{tracking}..HEAD" : baseSha is not null ? $"{baseSha}..HEAD" : "HEAD";
-        var diffBase = hasTracking ? tracking : baseSha ?? EmptyTree;
+        var replay = replacingSha is not null;
+        var range = hasTracking
+            ? baseSha is not null ? $"{baseSha}..HEAD" : $"{tracking}..HEAD" // 重放取新基点 / 常规 FF 取远端头
+            : baseSha is not null ? $"{baseSha}..HEAD" : "HEAD";
+        var diffBase = baseSha ?? (hasTracking ? tracking : EmptyTree);
 
         var commits = GitLines(repoPath, $"rev-list --reverse {range}");
         if (commits.Count == 0)
-            throw new LocalPlanException($"没有待推提交（{(hasTracking ? $"origin/{branch}..HEAD 为空" : "当前分支无提交")}，HEAD={head[..8]}）");
+            throw new LocalPlanException(
+                $"没有待推提交（{(replay || baseSha is not null ? $"{(replay ? "重放" : "新建分支")}范围 {baseSha![..8]}..HEAD 为空" : hasTracking ? $"origin/{branch}..HEAD 为空" : "当前分支无提交")}，HEAD={head[..8]}）");
 
         // 完整提交信息（批准你所见）：≤8 个提交逐个全文 message + 每文件增删统计；
         // 超出部分列标题（弹窗滚动解锁机制承载长文，§7）
@@ -58,8 +66,25 @@ internal static class RestPush
             .Any(p => p.StartsWith(".github/workflows/", StringComparison.Ordinal));
         var blobs = CollectBlobs(repoPath, commits);
 
+        // 重放披露（§9.6 闸门③——"批准你所见"扩展到销毁侧）：所见必须覆盖将被替换/丢弃的部分。
+        // 丢弃清单 = rev-list HEAD..origin/{branch}（远端有而新历史没有的提交），规划期算出入窗
+        string replayNote = "";
+        if (replay)
+        {
+            var dropped = GitLines(repoPath, $"rev-list {head}..{tracking}");
+            var shown = dropped.Count == 0
+                ? "无（远端旧头已是新历史的祖先，等价于 fast-forward）"
+                : string.Join("；", GitLines(repoPath, $"log --no-color --format=\"%h %s\" -n 3 {head}..{tracking}"))
+                  + (dropped.Count > 3 ? $"（共 {dropped.Count} 个）" : "");
+            replayNote = $"""
+                ⚠ 重放式更新（非 fast-forward）：origin/{branch} 旧头 {replacingSha![..8]} 将被替换为本地 HEAD {head[..8]}。
+                丢弃的远端提交：{shown}
+
+                """;
+        }
+
         var window = $"""
-            提交数：{commits.Count}{(hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
+            {replayNote}提交数：{commits.Count}{(replay ? $"（重放，基点 {baseSha![..8]}..HEAD）" : hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
             待传对象：{blobs.Count} 个 blob
 
             提交：
@@ -70,7 +95,7 @@ internal static class RestPush
 
             （若目标仓库为空，将先自动创建 README.md 完成初始化）
             """;
-        return new Plan(repo, branch, repoPath, head, window, workflows, commits.Count, blobs.Count, baseSha);
+        return new Plan(repo, branch, repoPath, head, window, workflows, commits.Count, blobs.Count, baseSha, replacingSha);
     }
 
     /// <summary>收集 commit 序列相对第一父引入的全部 blob（去重；跳过删除/未合并）。</summary>
@@ -148,9 +173,31 @@ internal static class RestPush
             isNew = false;
         }
 
-        // 快进校验（以本地对象库为准，fail-closed）
+        // 重放式更新保真复核（§9.6 闸门④，pr_merge T5 同族手法）：规划期旧头入窗，执行前比对
+        // 实况——批准到执行间远端头被推进（或分支被删）时，静默 force 会孤儿化窗口外的新提交。
+        // fail-closed：fetch 后重跑即重新弹窗。残余窗口（GET→PATCH 之间）与 pr_merge 复核一致。
+        if (plan.ReplacingSha is { Length: 40 or 64 } plannedOld)
+        {
+            if (isNew)
+                return new(PushResult.RemoteMoved,
+                    $"远端分支已不存在（规划期旧头 {plannedOld[..8]}），弹窗展示的替换对象已过期（分支在批准期间被删除）");
+            if (remoteSha != plannedOld)
+                return new(PushResult.RemoteMoved,
+                    $"批准期间远端头已变化（规划期 {plannedOld[..8]} → 现在 {remoteSha[..8]}），弹窗展示的替换对象已过期");
+        }
+        var replay = !isNew && plan.ReplacingSha is not null;
+
+        // 快进校验（以本地对象库为准，fail-closed）；重放模式另行分流（闸门①：NonFF 判定不放宽，只分流）
         string range;
-        if (isNew)
+        if (replay)
+        {
+            // 锚点与范围用声明的新基点（与 isNew+--base 同构）。远端旧头对象无需存在于本地——
+            // 丢弃清单已在规划期从本地 tracking 算出入窗，上方相等复核保证"丢弃的就是弹窗里那些"
+            if (!GitIsAncestor(plan.RepoPath, plan.Base!, plan.HeadSha))
+                return new(PushResult.Other, "--base 基点不是 HEAD 祖先（非增量），拒绝执行");
+            range = $"{plan.Base}..HEAD";
+        }
+        else if (isNew)
         {
             // 新建分支：默认全历史；--base 给了增量基点则只推 base..HEAD（存量仓库新分支唯一可行形态）
             // 长度 40 或 64：SHA-1 与 SHA-256 仓库的对象名（sha-256 漏判会静默退化成全历史重放）
@@ -201,7 +248,8 @@ internal static class RestPush
         }
 
         // 逐 commit：tree（base_tree 增量）+ commit（保真 author/committer/date）
-        string prevCommit = isNew ? plan.Base ?? "" : remoteSha;
+        // 重放锚点 = 声明的新基点（不是远端旧头——旧头正是要被替换掉的）
+        string prevCommit = replay ? plan.Base! : isNew ? plan.Base ?? "" : remoteSha;
         string prevTree = "";
         if (prevCommit.Length > 0)
         {
@@ -268,12 +316,14 @@ internal static class RestPush
             prevTree = treeSha;
         }
 
-        // update-ref：唯一写点；force:false 由服务端再拦一次非 FF
+        // update-ref：唯一写点。FF/新建 force:false（服务端再拦一次非 FF）；重放通道 force:true
+        // （§9.6：前置条件已在上方全部复核——--base 显式声明 + 非主干 + 弹窗明示替换与丢弃清单 + 远端头复核；
+        // 服务端分支保护若禁 force 是第三道纵深防御，422/403 透传服务端 message，分支未动重试安全）
         var (rst, rbody) = isNew
             ? await GitHubApi.SendRawAsync(HttpMethod.Post, $"repos/{plan.Repo}/git/refs", token,
                 new JsonObject { ["ref"] = $"refs/heads/{plan.Branch}", ["sha"] = lastSha }.ToJsonString())
             : await GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{plan.Repo}/git/refs/heads/{GitHubApi.RefPath(plan.Branch)}", token,
-                new JsonObject { ["sha"] = lastSha, ["force"] = false }.ToJsonString());
+                new JsonObject { ["sha"] = lastSha, ["force"] = replay }.ToJsonString());
         if (rst is not (200 or 201)) return Net(rst, $"update-ref {Why(rst, rbody)}");
         return new(PushResult.Done, NewSha: lastSha);
     }

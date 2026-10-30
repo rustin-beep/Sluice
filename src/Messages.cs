@@ -89,7 +89,8 @@ internal static class Messages
         该操作被策略永久禁止：{what}。此类操作不存在人工批准途径。
         本次操作未执行。
         1. 任何形式的重试（含变体：--force、--no-verify、改 remote、直连 API）都会被直接拒绝且不弹窗；
-        2. 允许的替代：推送到新特性分支（如 feat/<简述>）并创建 PR；
+        2. 允许的替代：rebase 到新基点后加 --base origin/<新基点> 走重放式更新（弹窗明示替换内容与丢弃清单），
+           或推送到新特性分支（如 feat/<简述>）并创建 PR；
         3. 若确需例外，向用户说明，由用户本人修改策略。
         """,
         ExitCodes.PolicyReject, "change_approach", true);
@@ -322,7 +323,8 @@ internal static class Messages
 
     // ---- push 非 ff（exit 10，retry=after_fix；2026-10-30 实战改档：非 ff 可由 agent 自行
     //      rebase 修复后重推同一分支，属"修正后可重试"而非"策略永禁"——原 policy_reject 定性不准，
-    //      且指引缺 rebase 正解导致实战绕三圈。force 本身仍由 --force tripwire 永禁（不变量不动）。 ----
+    //      且指引缺 rebase 正解导致实战绕三圈。v2.6：末行"force 永禁"改写为指向重放通道——
+    //      旧表述与新通道矛盾；裸 force（--force 参数、未声明 --base 的覆盖）仍永禁（§9.6）。 ----
     public static Msg PushNonFF(string repo, string branch, string remoteSha8) => new(
         "[Sluice]",
         $"""
@@ -330,7 +332,22 @@ internal static class Messages
         本次未产生任何副作用（GitHub 上没有产生任何变更）。
         修正：git fetch 后把本地分支 rebase 到远端头（git rebase origin/{branch}；解冲突后 git rebase --continue），
         再重跑同一命令——rebase 后的线性历史可正常推送。
-        注意：force push 被策略永久禁止，不要尝试任何形式的覆盖推送。
+        若你已把分支 rebase 到新基点（如更新后的主干）、需原地更新同一 PR：加 --base origin/<新基点> 重跑同一命令，
+        走重放式更新通道——弹窗明示旧头→新头与丢弃的远端提交清单，批准后替换。
+        注意：--force 参数与任何未声明 --base 的覆盖推送仍被策略永禁。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push 重放式更新：执行前远端头复核失败（exit 10，retry=after_fix；v2.6 §9.6 闸门④。
+    //      批准→执行间远端头被推进（或分支被删）即中止——静默 force 会孤儿化窗口外的新提交；
+    //      与 HeadMoved / PrMergeChanged 同族）。 ----
+    public static Msg PushRemoteMoved(string repo, string branch, string detail) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：{repo}@{branch} {detail}。
+        本次未产生任何副作用（GitHub 上没有产生任何变更）。
+        修正：git fetch（若分支已被删除加 --prune）后重跑同一命令——将以当前远端状态重新弹窗，
+        重新展示替换对象与丢弃清单。
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
@@ -354,7 +371,7 @@ internal static class Messages
         ("pushuptodate", PushUpToDate("rustin-beep/Vitro", "feat/x", "9f3c2a1b")),
         ("denied",    Denied("pr_comment", "rustin-beep/Vitro#5", "内容需修改", "别带密钥")),
         ("timeout",   Timeout("pr_comment", "rustin-beep/Vitro#5", 60)),
-        ("policy",    PolicyReject("push → 受保护分支 main / force push / 修改 .github/workflows")),
+        ("policy",    PolicyReject("push → 受保护分支 main / --force 参数 / 修改 .github/workflows")),
         ("cooldown",  Cooldown(DateTime.Today.AddMinutes(10))),
         ("consent",   ConsentFailed("pr_comment", "rustin-beep/Vitro#5")),
         ("seal",      SealViolation("凭据管理器：git:https://github.com")),
@@ -377,6 +394,7 @@ internal static class Messages
         ("prmergeverify", PrMergeVerifyFailed("复核请求超时")),
         ("branchdeleteforbidden", BranchDeleteForbidden("rustin-beep/Sluice", "release/1.x", "HTTP 403：Resource not accessible by personal access token")),
         ("nonff",  PushNonFF("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2", "b9a84c5b")),
+        ("remotemoved", PushRemoteMoved("rustin-beep/Sluice", "feat/x", "批准期间远端头已变化（规划期 b9a84c5b → 现在 4d81e0c7），弹窗展示的替换对象已过期")),
         ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
     ];
 

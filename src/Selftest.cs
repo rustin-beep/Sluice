@@ -33,6 +33,7 @@ internal static class Selftest
         ("prmergeverify", ExitCodes.HttpFailed,   "retry_ok"),   // v2.5 复核 GET 失败：merge 未发出，重试安全
         ("branchdeleteforbidden", ExitCodes.BadRequest, "after_fix"), // v2.5 拆分：403=保护/权限
         ("nonff",       ExitCodes.BadRequest,     "after_fix"),  // 2026-10-30 实战改档：rebase 后可重推同分支
+        ("remotemoved", ExitCodes.BadRequest,     "after_fix"),  // v2.6 重放通道保真复核：fetch 后重跑重新弹窗
         ("hasmerge",    ExitCodes.BadRequest,     "after_fix"),  // rebase 成线性后重跑（列问题提交）
     ];
 
@@ -73,7 +74,7 @@ internal static class Selftest
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
             { fail++; Console.WriteLine("!! internal(后) 缺\"可能已完成\""); }
-            if (name is "badreq" or "nonff" or "hasmerge" or "prmergechanged" or "prmergeverify"
+            if (name is "badreq" or "nonff" or "remotemoved" or "hasmerge" or "prmergechanged" or "prmergeverify"
                     && !sample.Text.Contains("本次未产生任何副作用"))
             { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
             if (name == "httpfail" && !sample.Text.Contains("无任何副作用"))
