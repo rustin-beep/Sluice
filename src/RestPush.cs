@@ -81,8 +81,10 @@ internal static class RestPush
             foreach (var line in GitLines(repoPath, $"-c core.quotePath=false diff-tree -r --no-renames --raw {FirstParentOrEmpty(repoPath, c)} {c}"))
                 ParseRaw(line, (_, _, sha, st, submodule) =>
                 {
+                    // submodule 判定先于 D/U 早退（2026-10-30 评审）：删除 submodule 的行也必须
+                    // 在规划期暴露——否则批准后执行期才炸，违背"批准你所见"的 fail-closed 语义
+                    if (submodule) throw new LocalPlanException($"REST push 不支持 submodule（在提交 {c[..8]} 引入或删除）");
                     if (st is 'D' or 'U') return;
-                    if (submodule) throw new LocalPlanException($"REST push 不支持 submodule（在提交 {c[..8]} 引入）");
                     set.Add(sha);
                 });
         return set;
@@ -113,7 +115,7 @@ internal static class RestPush
 
         // 远端现状（读 API，免批准路径与 §9 api 同类）
         var (st, body) = await GitHubApi.SendRawAsync(HttpMethod.Get,
-            $"repos/{plan.Repo}/git/ref/heads/{plan.Branch}", token, null);
+            $"repos/{plan.Repo}/git/ref/heads/{GitHubApi.RefPath(plan.Branch)}", token, null);
         if (st is 401 or 403) return new(PushResult.Unauthorized);
         if (st == 409)
         {
@@ -130,7 +132,7 @@ internal static class RestPush
                 $"repos/{plan.Repo}/contents/README.md", token, seed.ToJsonString());
             if (sst is not (200 or 201)) return Net(sst, $"空仓库初始化(README) {Why(sst, sbody)}");
             (st, body) = await GitHubApi.SendRawAsync(HttpMethod.Get,
-                $"repos/{plan.Repo}/git/ref/heads/{plan.Branch}", token, null);
+                $"repos/{plan.Repo}/git/ref/heads/{GitHubApi.RefPath(plan.Branch)}", token, null);
             if (st is 401 or 403) return new(PushResult.Unauthorized);
         }
         if (st == 409) { /* 播种后仍空(竞态)按 404 处理 */ st = 404; body = ""; }
@@ -270,7 +272,7 @@ internal static class RestPush
         var (rst, rbody) = isNew
             ? await GitHubApi.SendRawAsync(HttpMethod.Post, $"repos/{plan.Repo}/git/refs", token,
                 new JsonObject { ["ref"] = $"refs/heads/{plan.Branch}", ["sha"] = lastSha }.ToJsonString())
-            : await GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{plan.Repo}/git/refs/heads/{plan.Branch}", token,
+            : await GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{plan.Repo}/git/refs/heads/{GitHubApi.RefPath(plan.Branch)}", token,
                 new JsonObject { ["sha"] = lastSha, ["force"] = false }.ToJsonString());
         if (rst is not (200 or 201)) return Net(rst, $"update-ref {Why(rst, rbody)}");
         return new(PushResult.Done, NewSha: lastSha);
@@ -310,7 +312,11 @@ internal static class RestPush
         // mode 折回：删除行（D）的 newmode=000000 非法，服务端要求合法 mode——用 oldmode
         var st2 = parts[4][..tab][^1];
         var mode = st2 == 'D' ? parts[0] : parts[1];
-        fn(parts[4][(tab + 1)..], mode, parts[3], st2, parts[1] == "160000");
+        // submodule 判定看两侧 mode（2026-10-30 评审修复）：删除行 ":160000 000000 … D" 的
+        // newmode=000000，只看 parts[1] 会漏判——折回 oldmode=160000 生成
+        // {"mode":"160000","type":"blob","sha":null} 非法条目，create-tree 照样 422
+        var submodule = parts[0] == "160000" || parts[1] == "160000";
+        fn(parts[4][(tab + 1)..], mode, parts[3], st2, submodule);
     }
 
     // ---------- 本地 git 封装（全部只读） ----------

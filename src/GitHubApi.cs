@@ -242,7 +242,9 @@ internal static class GitHubApi
             return (int)resp.StatusCode switch
             {
                 200 => await ReadMergedAsync(resp, repo),
-                401 or 403 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                // 403 拆出（2026-10-30 评审）：合并 403 多为分支保护/无合并权限（after_fix 家族），
+                // 归凭据过期(9)会把 agent 引向重新 setup 的死路——落 Other 由 Program 按 PrMergeForbidden 定档
+                401 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
                 >= 500 => new ApiResult(OutcomeKind.UnknownOutcome, (int)resp.StatusCode,
                     $"HTTP {(int)resp.StatusCode}"),
                 _ => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
@@ -269,15 +271,25 @@ internal static class GitHubApi
     }
 
     /// <summary>GitHub 错误响应的 message 字段（无则空串）。JsonDocument 解析——手刮字符串遇转义引号会截断。</summary>
-    private static async Task<string> MessageOfAsync(HttpResponseMessage resp)
+    private static async Task<string> MessageOfAsync(HttpResponseMessage resp) =>
+        MessageOfBody(await resp.Content.ReadAsStringAsync());
+
+    /// <summary>GitHub 错误响应 body 的 message 字段（SendRawAsync 路径用；解析失败/缺失给空串）。</summary>
+    internal static string MessageOfBody(string body)
     {
         try
         {
-            using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+            using var doc = JsonDocument.Parse(body);
             return doc.RootElement.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
         }
         catch { return ""; }
     }
+
+    /// <summary>分支名 → refs URL 路径段（逐段 percent-encode）。分支名是自由字符（git 引用语法
+    /// 允许 # ? 空格等），裸拼 URL 时 # 截成 fragment、? 截成 query（2026-10-30 评审）。
+    /// POST refs 的 ref 名走 JSON body，不经过此函数——body 里要的是字面分支名。</summary>
+    internal static string RefPath(string branch) =>
+        string.Join("/", branch.Split('/').Select(Uri.EscapeDataString));
 
     /// <summary>
     /// api 读通道（§9 v2.2）：GET-only。token=null 走匿名（公开数据零摩擦）；

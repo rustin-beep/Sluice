@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.4-lite（v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 文档版本 | v2.5-lite（v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
 | 日期 | 2026-10-30 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
@@ -204,6 +204,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | **批准 → Hello 前隐藏批准窗 + Activate**（v2.4，实测修订） | Hello 系统凭据 UI **非 TOPMOST 且 Z 序在调用者窗口之下**——批准窗在前必遮 Hello（置顶版实测：Hello 恰在批准窗下面）；隐藏批准窗让 Hello 无遮挡，Activate 先行保证 sluice 前台（credential UI 定位跟随前台，防左上角/沉底）；取消后窗口带状态行恢复 |
 | **Hello 取消/未通过 → 回到未决态**（v2.4，非终态） | 取消 ≠ 拒绝请求：回窗看清内容再决定；安全无损（取消无写动作，再批准仍必须过 Hello）。vault 密钥缺失仍终态（重试无用） |
 | **超时秒数可配**：config.json `gate_timeout_sec`（默认 60，夹 [30,600]）；剩 15s 提示音 + 闪任务栏（v2.4） | agent 同用户可改 config——改短只自伤（自动拒是安全侧）、改长不产生写动作，纯 UX 旋钮；召回给暂离用户一次回来机会 |
+| **pr_merge 弹窗带 head sha8，执行前复核**（v2.5） | 元数据是 fetch 时刻快照，批准→执行间 head 被推进则合并内容超出用户所见——与 push 的 HeadMoved 同族：sha 变了即中止（after_fix），重跑重新弹窗；批准指纹混入 head sha，审计行锚定"所见的是哪一版"；快照缺失（私有库匿名读失败）不阻断，弹窗已声明"请自行核对" |
 | 冷却：10 分钟内 3 次拒绝 → 全局冷却 10 分钟；冷却期内再试不弹窗、每次顺延 +5 分钟（上限 60） | 只能延长，做不到真阻止——封堵前提下"延长"已够；消息带绝对结束时间 |
 
 不承诺：窗口显示完整性（同用户可移动/遮挡，L3）。信任在 Hello，不在画面。
@@ -417,6 +418,45 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 
 **v2.4 timeout 文案参数化**：`批准窗口 {n} 秒无响应`（n = config `gate_timeout_sec` 实际值）。
 
+**V1.5 增补消息（2026-10-30 评审处置批；selftest 同步穷举对齐）**
+
+```
+[Sluice·终态] pr_merge 被服务端拒绝（HTTP 403：<服务端 message>）。常见原因：目标分支受保护（required checks 未过 / 禁用该合并方式）或 token 无合并权限。
+本次操作未执行，GitHub 上没有产生任何变更。
+1. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth，读 "mergeable_state" 字段；
+2. 分支保护与权限属仓库策略，不要尝试绕过；确需例外请转告用户处理；
+3. 若服务端 message 指向 token 权限（如 Resource not accessible），同样转告用户重新 setup——不要自行获取或更换凭据。
+```
+（exit 10，retry=after_fix——v2.5 语义拆分：合并 403 ≠ 凭据过期，原归 9 会把 agent 引向重新 setup 的死路）
+
+```
+[Sluice·终态] pr_merge 被服务端拒绝：<R>#<N> 不存在（HTTP 404）。编号有误、PR 已被删除，或已在别处合并后关闭。
+本次操作未执行，GitHub 上没有产生任何变更。
+修正：核对编号后重跑；列出当前 PR：sluice api "repos/<owner/repo>/pulls"；若 PR 已在别处合并则使用既成结果，不要再发起合并。
+```
+（exit 10，retry=after_fix——v2.5：404 混入"不可合并"文案误导，拆出）
+
+```
+[Sluice] pr_merge 未执行：批准期间 PR head 已变化（<旧 sha8> → <新 sha8>），弹窗展示的内容已过期。
+本次未产生任何副作用（GitHub 上没有产生任何变更）。
+修正：重新运行同一命令——将以当前内容重新弹窗征求意见。
+```
+（exit 10，retry=after_fix——v2.5 保真复核：批准→执行间 head 被推进即中止，与 push 的 HeadMoved 同族；利用需连过批准+Hello 两道门，属加固非堵漏）
+
+```
+[Sluice] pr_merge 未执行：合并前内容复核未完成（<原因>）。
+本次未产生任何副作用（复核用 GET 无副作用，合并请求未发出）。
+可间隔 30 秒后重试同一命令（将重新弹窗并重新复核）；连续 3 次失败则报告用户。
+```
+（exit 20，retry=retry_ok——复核 GET 失败/超时：merge 未发出，整条命令重跑安全）
+
+```
+[Sluice·终态] branch_delete 被服务端拒绝（HTTP 403：<服务端 message>）。常见原因：分支受保护或 token 无删除权限。
+本次操作未执行，GitHub 上没有产生任何变更（ref 未被动过）。
+受保护分支的删除属仓库策略，不要尝试绕过；确需删除请转告用户在仓库设置中处理。
+```
+（exit 10，retry=after_fix——v2.5 语义拆分：401 仍 9（凭据），403 归服务端策略拒）
+
 ### 8.3 Exit code 表
 
 | code | 含义 | retry |
@@ -460,8 +500,8 @@ v2.4 注：push 非 ff 从 exit 4（policy_reject）移入 exit 10（after_fix�
 | `pr_review` | `sluice review --repo R --number N --event E [--body-file F]` | WinHTTP `POST /repos/{r}/pulls/{n}/reviews` | 仅 sluice 进程 |
 | `push` | `sluice push [--repo-path D] --remote R --refspec S` | 见下 push bridge | git 子进程内存（存活期） |
 | `api`（读，v2.2；V1 实现现状） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` `+` `,` `;` 查询字符——分页 cursor（base64 含 `+`）/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；其余非 2xx→10。响应体→stdout、消息→stderr（不污染数据）。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
-| `pr_merge`（v2.4，PR 工作流闭环最后一米） | `sluice pr merge --repo R --number N [--method merge\|squash\|rebase] [--delete-head]` | PUT `/repos/{r}/pulls/{n}/merge`——**服务端执行，天然尊重分支保护与 required checks**；弹窗尽力展示匿名可读的 PR 元数据（title/head→base/变更统计）；`--delete-head` 合并成功后删 head ref（失败不回滚合并，附注指引 branch delete）。exit：200→0；401/403→9；404/405/409/422→10（PrMergeRejected，查 mergeable）；5xx/超时→21 | 仅 sluice 进程 |
-| `branch_delete`（v2.4，PR 作废后清残留） | `sluice branch delete --repo R --branch B` | DELETE `/repos/{r}/git/refs/heads/{b}`——删 ref 非销毁历史（commits 留在服务端，GC 窗口内可重建）；`main`/`master` tripwire → policy_reject（exit 4）。exit：204→0；401/403→9；404→10；超时→21（幂等但已送达，查证 refs） | 仅 sluice 进程 |
+| `pr_merge`（v2.4，PR 工作流闭环最后一米；v2.5 评审加固） | `sluice pr merge --repo R --number N [--method merge\|squash\|rebase] [--delete-head]` | PUT `/repos/{r}/pulls/{n}/merge`——**服务端执行，天然尊重分支保护与 required checks**；弹窗尽力展示匿名可读的 PR 元数据（title/head→base/变更统计 + head sha8）；**v2.5**：批准指纹混入 head sha、执行前带 token 复核 head sha，变了即中止（PrMergeChanged，与 push 的 HeadMoved 同族）；匿名元数据读入读审计（与 api 通道同纪律）；`--delete-head` 合并成功后删 head ref（**成败均落审计**；失败不回滚合并，附注指引 branch delete）。exit：200→0；401→9；403→10（PrMergeForbidden：保护/权限）；404→10（PrMergeNotFound）；405/409/422→10（PrMergeRejected，查 mergeable）；复核通道失败→20（retry_ok）；5xx/超时→21 | 仅 sluice 进程 |
+| `branch_delete`（v2.4，PR 作废后清残留；v2.5 评审加固） | `sluice branch delete --repo R --branch B` | DELETE `/repos/{r}/git/refs/heads/{b}`——**v2.5：b 逐段 percent-encode**（`#`/`?`/空格等合法分支名不再截断 URL，push 的 ref 路径同款）——删 ref 非销毁历史（commits 留在服务端，GC 窗口内可重建）；`main`/`master` tripwire（**v2.5 大小写不敏感**）→ policy_reject（exit 4）。exit：204→0；401→9；403→10（BranchDeleteForbidden：保护/权限，透传服务端 message）；404→10；超时→21（幂等但已送达，查证 refs） | 仅 sluice 进程 |
 
 **push bridge**（取代原方案 shim，无常驻、无 PATH 依赖）：
 
@@ -655,6 +695,7 @@ AGENTS.md 片段安装器、`sluice doctor`、installation token（1h）替换 p
 | L7 | agent 对中文终态消息的服从性未验证 | V0/V1 红队必测；不服从先改文案；备选双语 |
 | L8 | token 在托管堆多副本、永不可清零 | N1 已让步，无增量风险；与"明文窗口=进程生命期"同一笔账 |
 | L9 | Linux Wayland 禁止抢焦点，批准框可能不前置 | 移植期用通知/任务栏 urgent 提示补位；Windows 不受影响 |
+| L10 | d08658a 隐藏批准窗后、Hello 弹出前的窗口期，若 Hello 异常迟滞则屏幕无 sluice 可见锚点（旧版有置顶窗+状态行；v2.5 评审留观） | 实测路径正常、概率低；留观。若真实发生，考虑隐藏期 FlashWindow 闪任务栏补锚点 |
 
 ---
 

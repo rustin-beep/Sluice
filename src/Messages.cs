@@ -257,6 +257,60 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- pr_merge 403（exit 10，retry=after_fix；2026-10-30 评审拆分：保护/权限拒绝 ≠ 凭据过期，
+    //      原归 9 会把 agent 引向重新 setup 的死路） ----
+    public static Msg PrMergeForbidden(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_merge 被服务端拒绝（{detail}）。常见原因：目标分支受保护（required checks 未过 / 禁用该合并方式）或 token 无合并权限。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth，读 "mergeable_state" 字段；
+        2. 分支保护与权限属仓库策略，不要尝试绕过；确需例外请转告用户处理；
+        3. 若服务端 message 指向 token 权限（如 Resource not accessible），同样转告用户重新 setup——不要自行获取或更换凭据。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr_merge 404（exit 10，retry=after_fix；2026-10-30 评审：404 混入"不可合并"文案误导） ----
+    public static Msg PrMergeNotFound(string target) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_merge 被服务端拒绝：{target} 不存在（HTTP 404）。编号有误、PR 已被删除，或已在别处合并后关闭。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对编号后重跑；列出当前 PR：sluice api "repos/<owner/repo>/pulls"；若 PR 已在别处合并则使用既成结果，不要再发起合并。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr_merge head 保真复核命中（exit 10，retry=after_fix；2026-10-30 评审 TOCTOU 加固：
+    //      批准→执行间 head 被推进即中止，与 push 的 HeadMoved 同族） ----
+    public static Msg PrMergeChanged(string target, string was8, string now8) => new(
+        "[Sluice]",
+        $"""
+        pr_merge 未执行：批准期间 PR head 已变化（{was8} → {now8}），弹窗展示的内容已过期。
+        本次未产生任何副作用（GitHub 上没有产生任何变更）。
+        修正：重新运行同一命令——将以当前内容重新弹窗征求意见。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr_merge 合并前复核通道失败（exit 20，retry=retry_ok；复核 GET 无副作用、merge 未发出） ----
+    public static Msg PrMergeVerifyFailed(string reason) => new(
+        "[Sluice]",
+        $"""
+        pr_merge 未执行：合并前内容复核未完成（{reason}）。
+        本次未产生任何副作用（复核用 GET 无副作用，合并请求未发出）。
+        可间隔 30 秒后重试同一命令（将重新弹窗并重新复核）；连续 3 次失败则报告用户。
+        """,
+        ExitCodes.HttpFailed, "retry_ok", true);
+
+    // ---- branch_delete 403（exit 10，retry=after_fix；2026-10-30 评审拆分：保护分支/无删除权限 ≠ 凭据过期） ----
+    public static Msg BranchDeleteForbidden(string repo, string branch, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        branch_delete 被服务端拒绝（{detail}）。常见原因：分支受保护或 token 无删除权限。
+        本次操作未执行，GitHub 上没有产生任何变更（ref 未被动过）。
+        受保护分支的删除属仓库策略，不要尝试绕过；确需删除请转告用户在仓库设置中处理。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- pr merge 成功但 --delete-head 失败（紧跟 Success 输出的附注；exit 0 不变——主操作已生效） ----
     public static Msg BranchDeleteFailed(string repo, string branch, string why) => new(
         "[Sluice]",
@@ -317,6 +371,11 @@ internal static class Messages
         ("vaultbroken", VaultBroken("token.bin 存在，但 Hello 密钥 SluiceVault 缺失")),
         ("prrejected", PrRejected("rustin-beep/Sluice", "dev", "HTTP 422：A pull request already exists")),
         ("prmergerejected", PrMergeRejected("rustin-beep/Sluice#383", "HTTP 405：Pull Request is not mergeable")),
+        ("prmergeforbidden", PrMergeForbidden("rustin-beep/Sluice#383", "HTTP 403：Merge commit is blocked by required status checks")),
+        ("prmergenotfound", PrMergeNotFound("rustin-beep/Sluice#404")),
+        ("prmergechanged", PrMergeChanged("rustin-beep/Sluice#383", "9f3c2a1b", "4d81e0c7")),
+        ("prmergeverify", PrMergeVerifyFailed("复核请求超时")),
+        ("branchdeleteforbidden", BranchDeleteForbidden("rustin-beep/Sluice", "release/1.x", "HTTP 403：Resource not accessible by personal access token")),
         ("nonff",  PushNonFF("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2", "b9a84c5b")),
         ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
     ];

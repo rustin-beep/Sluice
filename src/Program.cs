@@ -92,7 +92,9 @@ internal static class Program
 
     private static int Version()
     {
-        Console.WriteLine($"{BuildStamp} · plan-lite v2.4");
+        // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
+        var v = typeof(Program).Assembly.GetName().Version;
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.5");
         return 0;
     }
 
@@ -160,7 +162,7 @@ internal static class Program
             Messages.Write(Messages.BadRequest($"--repo 应为 owner/name 形式，收到：{repo}"));
             return ExitCodes.BadRequest;
         }
-        if (branch is "main" or "master")
+        if (IsTrunkBranch(branch))
         {
             // policy tripwire：受保护分支永不批准（§9）
             Messages.Write(Messages.PolicyReject($"push → 受保护分支 {branch}"));
@@ -323,6 +325,19 @@ internal static class Program
     {
         Messages.Write(Messages.BadRequest($"{verb} 参数 {opt} 缺少值"));
         return ExitCodes.BadRequest;
+    }
+
+    /// <summary>主干 tripwire（§9）。GitHub refs 大小写敏感（Main 与 main 是两个分支），
+    /// 但保护意图按"主干"语义——变体同禁（2026-10-30 评审：原 ordinal 比较漏网 Main/MASTER）。</summary>
+    private static bool IsTrunkBranch(string? b) =>
+        b is not null && (b.Equals("main", StringComparison.OrdinalIgnoreCase)
+                       || b.Equals("master", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>HTTP 状态 + 服务端 message（权限/保护类错误直接显示服务端原话）。</summary>
+    private static string HttpDetail(int st, string body)
+    {
+        var m = GitHubApi.MessageOfBody(body);
+        return m is { Length: > 0 } ? $"HTTP {st}：{m}" : $"HTTP {st}";
     }
 
     private static int ErrBad(string detail)
@@ -796,19 +811,26 @@ internal static class Program
         }
 
         // 尽力而为的匿名元数据读（公开库可用；私有库/网络失败不阻塞——弹窗退化为参数展示）。
-        // 读无破坏力、无凭据参与，走 api 读通道同款匿名 GET。
-        string? prTitle = null, prHead = null, prBase = null;
+        // 读无破坏力、无凭据参与，走 api 读通道同款匿名 GET——同通道纪律：读也落审计（2026-10-30 评审）。
+        string? prTitle = null, prHead = null, prBase = null, prHeadSha = null;
         int changed = -1, additions = -1, deletions = -1;
         try
         {
             var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/pulls/{number}")
                 .GetAwaiter().GetResult();
+            if (notSent)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "http_failed", result: "not_sent");
+            else if (st == 0)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "timeout", result: "retry_safe_get");
+            else
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
             if (st == 200)
             {
                 var pr = System.Text.Json.Nodes.JsonNode.Parse(body);
                 prTitle = pr?["title"]?.GetValue<string>();
                 prHead = pr?["head"]?["ref"]?.GetValue<string>();
                 prBase = pr?["base"]?["ref"]?.GetValue<string>();
+                prHeadSha = pr?["head"]?["sha"]?.GetValue<string>(); // 保真锚点：批准所见 = 合并所执行
                 changed = pr?["changed_files"]?.GetValue<int>() ?? -1;
                 additions = pr?["additions"]?.GetValue<int>() ?? -1;
                 deletions = pr?["deletions"]?.GetValue<int>() ?? -1;
@@ -817,16 +839,18 @@ internal static class Program
         catch { /* 元数据读失败不阻塞批准流 */ }
         if (deleteHead && prHead is null)
             return ErrBad("--delete-head 需要知道 head 分支名，但 PR 元数据匿名读取失败（私有库？网络？）——请合并后改用 sluice branch delete");
-        if (prHead is "main" or "master")
+        if (IsTrunkBranch(prHead))
             return ErrBad("head 分支是 main/master，--delete-head 拒绝执行（受保护分支）");
 
         var target = $"{repo}#{number}";
+        // 批准指纹混入 head sha（2026-10-30 评审）：编号不变内容可变——指纹锚定"所见内容"，
+        // 审计行才能回答"用户批准的是哪一版"
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
-            $"{repo}#{number}:{method ?? "default"}")))[..8].ToLowerInvariant();
+            $"{repo}#{number}:{method ?? "default"}:{prHeadSha ?? "?}"}")))[..8].ToLowerInvariant();
         var window = $"""
             PR：{target}
             标题：{prTitle ?? "（元数据不可读：私有库或网络原因，合并前请自行核对）"}
-            方向：{prBase ?? "?"} ← {prHead ?? "?"}
+            方向：{prBase ?? "?"} ← {prHead ?? "?"}{(prHeadSha is { Length: >= 8 } h ? $"（head {h[..8]}）" : "")}
             变更：{(changed >= 0 ? $"{changed} 文件（+{additions}/-{deletions}）" : "（统计不可读）")}
             合并方式：{method ?? "仓库默认"}
             服务端将执行分支保护与 required checks 校验；批准即合并。
@@ -863,7 +887,7 @@ internal static class Program
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
                 return ExitCodes.Internal;
             case Gate.Outcome.Approved a:
-                return ExecutePrMerge(a, repo, number, method, deleteHead, prHead, sha, target);
+                return ExecutePrMerge(a, repo, number, method, deleteHead, prHead, prHeadSha, sha, target);
             default:
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
                 return ExitCodes.Internal;
@@ -871,7 +895,7 @@ internal static class Program
     }
 
     private static int ExecutePrMerge(Gate.Outcome.Approved a, string repo, int number, string? method,
-        bool deleteHead, string? headBranch, string sha, string target)
+        bool deleteHead, string? headBranch, string? headShaSnapshot, string sha, string target)
     {
         string token;
         try { token = TokenStore.Load(a.Signature); }
@@ -882,6 +906,43 @@ internal static class Program
             return ExitCodes.Internal;
         }
 
+        // 内容保真复核（2026-10-30 评审）：弹窗元数据是 fetch 时刻快照，批准→执行之间 head 若被
+        // 推进（新 push 到 PR 分支），合并的将是用户没见过的内容——与 push 的 HeadMoved 同族，
+        // 变了即中止（after_fix，重跑重新弹窗）。复核用带 token GET（私有库同样可查）；
+        // 快照缺失（匿名读失败）时无可比对，不阻断——弹窗已声明"请自行核对"。
+        if (headShaSnapshot is { } snap)
+        {
+            var (vst, vbody, vNotSent, vWhy) = GitHubApi.ApiGetAsync(token, $"repos/{repo}/pulls/{number}")
+                .GetAwaiter().GetResult();
+            if (vNotSent || vst == 0)
+            {
+                // 复核 GET 无副作用且 merge 未发出——整条命令可安全重跑（retry_ok）
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: "hello",
+                    result: vNotSent ? "not_sent" : "timeout_retry_safe_get");
+                Messages.Write(Messages.PrMergeVerifyFailed(vNotSent ? vWhy ?? "连接失败" : "复核请求超时"));
+                return ExitCodes.HttpFailed;
+            }
+            if (vst == 200)
+            {
+                var now = System.Text.Json.Nodes.JsonNode.Parse(vbody)?["head"]?["sha"]?.GetValue<string>();
+                if (now is null)
+                {
+                    // 200 却无 head.sha：结构漂移按 sluice 侧错误诚实归类，不 fail-open
+                    Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_verify_failed", consent: "hello");
+                    Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                    return ExitCodes.Internal;
+                }
+                if (now != snap)
+                {
+                    Audit.Append("pr_merge", repo, $"#{number}", sha, "head_moved", consent: "hello",
+                        result: $"expected:{snap[..8]} actual:{now[..8]}");
+                    Messages.Write(Messages.PrMergeChanged(target, snap[..8], now[..8]));
+                    return ExitCodes.BadRequest;
+                }
+            }
+            // 其余非 200：无变化实证则不在此拦截——真实状态由随后的 merge 调用如实分类
+        }
+
         var r = GitHubApi.MergePrAsync(token, repo, number, method).GetAwaiter().GetResult();
         switch (r.Kind)
         {
@@ -889,23 +950,36 @@ internal static class Program
                 Audit.Append("pr_merge", repo, $"#{number}", sha, "approved", consent: "hello",
                     result: $"executed:{r.Url}");
                 Messages.Write(Messages.Success("pr_merge", target, 200, r.Url!));
-                // --delete-head：合并已生效（不可回滚）；删除失败不吞——如实附注并指引单独删除
+                // --delete-head：合并已生效（不可回滚）；删除失败不吞——如实附注并指引单独删除。
+                // 删除同样是用户批准过的动作（弹窗脚注明示）：成败都落审计（2026-10-30 评审补环）
                 if (deleteHead && headBranch is not null)
                 {
                     try
                     {
                         var (dst, dbody) = GitHubApi.SendRawAsync(HttpMethod.Delete,
-                            $"repos/{repo}/git/refs/heads/{headBranch}", token, null).GetAwaiter().GetResult();
+                            $"repos/{repo}/git/refs/heads/{GitHubApi.RefPath(headBranch)}", token, null).GetAwaiter().GetResult();
+                        Audit.Append("pr_merge", repo, headBranch, sha,
+                            dst == 204 ? "delete_head_executed" : "delete_head_failed",
+                            consent: "hello", result: dst == 204 ? "executed" : $"http_{dst}");
                         if (dst != 204)
-                            Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, $"HTTP {dst}"));
+                            Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, HttpDetail(dst, dbody)));
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        Audit.Append("pr_merge", repo, headBranch, sha, "delete_head_failed",
+                            consent: "hello", result: "timeout");
+                        Messages.Write(Messages.BranchDeleteFailed(repo, headBranch,
+                            "删除请求超时（可能已送达）——查证 refs 后按需重删"));
                     }
                     catch (Exception ex)
                     {
+                        Audit.Append("pr_merge", repo, headBranch, sha, "delete_head_failed",
+                            consent: "hello", result: "not_sent");
                         Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, ex.Message));
                     }
                 }
                 return ExitCodes.Success;
-            case GitHubApi.OutcomeKind.Unauthorized:
+            case GitHubApi.OutcomeKind.Unauthorized: // v2.5 起 401 专属（403 已在服务端拆出）
                 Audit.Append("pr_merge", repo, $"#{number}", sha, "credential_expired", consent: "hello",
                     result: $"http_{r.Status}");
                 Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
@@ -920,10 +994,18 @@ internal static class Program
                 Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
                 return ExitCodes.Unknown;
             default:
-                // 404（PR 不存在）/ 405（不可合并）/ 409（冲突）/ 422（校验拒）：服务端明确拒绝
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "pr_merge_rejected", consent: "hello",
-                    result: r.Reason ?? $"http_{r.Status}");
-                Messages.Write(Messages.PrMergeRejected(target, r.Reason ?? $"HTTP {r.Status}"));
+                // 405（不可合并）/ 409（冲突）/ 422（校验拒）：服务端明确拒绝；403 与 404 各配专属
+                // 文案（2026-10-30 评审：403 归"不可合并"是误导——它是保护/权限；404 是"不存在"，
+                // 与 mergeability 无关）
+                Audit.Append("pr_merge", repo, $"#{number}", sha,
+                    r.Status == 403 ? "forbidden" : r.Status == 404 ? "not_found" : "pr_merge_rejected",
+                    consent: "hello", result: r.Reason ?? $"http_{r.Status}");
+                Messages.Write(r.Status switch
+                {
+                    403 => Messages.PrMergeForbidden(target, r.Reason ?? $"HTTP {r.Status}"),
+                    404 => Messages.PrMergeNotFound(target),
+                    _ => Messages.PrMergeRejected(target, r.Reason ?? $"HTTP {r.Status}"),
+                });
                 return ExitCodes.BadRequest;
         }
     }
@@ -953,7 +1035,7 @@ internal static class Program
             return ErrBad("branch_delete 缺少 --repo / --branch（示例：sluice branch delete --repo owner/repo --branch feat/x-r2）");
         if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
             return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
-        if (branch is "main" or "master")
+        if (IsTrunkBranch(branch))
         {
             // policy tripwire：与 push 受保护分支禁令同族，永不批准
             Messages.Write(Messages.PolicyReject($"删除受保护分支 {branch}"));
@@ -1031,7 +1113,7 @@ internal static class Program
         try
         {
             var (st, body) = GitHubApi.SendRawAsync(HttpMethod.Delete,
-                $"repos/{repo}/git/refs/heads/{branch}", token, null).GetAwaiter().GetResult();
+                $"repos/{repo}/git/refs/heads/{GitHubApi.RefPath(branch)}", token, null).GetAwaiter().GetResult();
             switch (st)
             {
                 case 204:
@@ -1040,11 +1122,18 @@ internal static class Program
                     Messages.Write(Messages.Success("branch_delete", target, 204,
                         $"https://github.com/{repo}/branches"));
                     return ExitCodes.Success;
-                case 401 or 403:
+                // 403 拆分（2026-10-30 评审）：403 多为分支保护/无删除权限（服务端策略拒），
+                // 归凭据过期(9)会把 agent 引向重新 setup 的死路；仅 401 是凭据问题
+                case 401:
                     Audit.Append("branch_delete", repo, branch, sha, "credential_expired", consent: "hello",
-                        result: $"http_{st}");
-                    Messages.Write(Messages.CredentialExpired($"HTTP {st}"));
+                        result: "http_401");
+                    Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
+                case 403:
+                    Audit.Append("branch_delete", repo, branch, sha, "forbidden", consent: "hello",
+                        result: HttpDetail(st, body));
+                    Messages.Write(Messages.BranchDeleteForbidden(repo, branch, HttpDetail(st, body)));
+                    return ExitCodes.BadRequest;
                 case 404:
                     Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: "hello",
                         result: $"http_404");
@@ -1053,7 +1142,7 @@ internal static class Program
                 default:
                     Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: "hello",
                         result: $"http_{st}");
-                    Messages.Write(Messages.BadRequest($"branch_delete 被服务端拒绝：HTTP {st}。本次未产生任何副作用"));
+                    Messages.Write(Messages.BadRequest($"branch_delete 被服务端拒绝：{HttpDetail(st, body)}。本次未产生任何副作用"));
                     return ExitCodes.BadRequest;
             }
         }
