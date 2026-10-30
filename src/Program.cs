@@ -33,6 +33,8 @@ internal static class Program
         ["selftest"] => Selftest.Run(),
         ["comment", .. var rest] => RunComment(rest),
         ["push", .. var rest] => RunPush(rest),
+        ["pr", "create", .. var rest] => RunPrCreate(rest),
+        ["api", .. var rest] => RunApi(rest),
         [var verb, ..] => BadVerb(verb),
     };
 
@@ -45,7 +47,13 @@ internal static class Program
               sluice setup [--token-file F]             配置凭据（粘贴 fine-grained PAT + Windows Hello 建 vault）
               sluice seal [--fix]                       侧门自查 / 封堵（凭据管理器、gh、git-credentials、SSH、环境变量）
               sluice comment --repo O/R --number N --body-file F   在 issue/PR 下发表评论（经批准 + Hello）
-              sluice push --repo O/R --branch B [--repo-path D]    推送本地 HEAD 到远端分支（REST，经批准 + Hello）
+              sluice push --repo O/R --branch B [--repo-path D] [--base REF]
+                                                        推送本地 HEAD 到远端分支（REST，经批准 + Hello；
+                                                        新建远端分支时 --base 给增量基点，如 origin/master）
+              sluice pr create --repo O/R --base B --head H --title T --body-file F
+                                                        创建 PR（经批准 + Hello）
+              sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 过 Hello 带 token；
+                                                        路径如 repos/owner/repo/pulls/9，每次调用入读审计）
               sluice selftest                           消息表与 exit code 自检
 
             退出码见 `sluice selftest` 输出；消息规范见 plan-lite.md §8。
@@ -61,7 +69,7 @@ internal static class Program
 
     private static int BadVerb(string verb)
     {
-        Messages.Write(Messages.BadRequest($"未知命令 \"{verb}\"；可用动词：setup / seal / comment / selftest"));
+        Messages.Write(Messages.BadRequest($"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / selftest"));
         return ExitCodes.BadRequest;
     }
 
@@ -71,7 +79,7 @@ internal static class Program
 
     private static int RunPush(string[] args)
     {
-        string? repo = null, branch = null;
+        string? repo = null, branch = null, @base = null;
         var repoPath = ".";
         for (int i = 0; i < args.Length; i++)
         {
@@ -80,6 +88,11 @@ internal static class Program
                 case "--repo":
                     if (i + 1 >= args.Length) return ErrMissing("--repo");
                     repo = args[++i];
+                    break;
+                case "--base":
+                    // 新建分支的增量基点（ref 或 sha，如 origin/master）——存量仓库新分支必给，否则全历史重放
+                    if (i + 1 >= args.Length) return ErrMissing("--base");
+                    @base = args[++i];
                     break;
                 case "--branch":
                     if (i + 1 >= args.Length) return ErrMissing("--branch");
@@ -137,7 +150,7 @@ internal static class Program
         RestPush.Plan plan;
         try
         {
-            plan = RestPush.PlanLocal(repo, branch, Path.GetFullPath(repoPath));
+            plan = RestPush.PlanLocal(repo, branch, Path.GetFullPath(repoPath), @base);
         }
         catch (RestPush.LocalPlanException ex)
         {
@@ -397,6 +410,261 @@ internal static class Program
             GitHubApi.OutcomeKind.UnknownOutcome => UnknownOutcome(result, repo, number, sha),
             _ => InternalPost(result, repo, number, sha),
         };
+    }
+
+    // ---------- sluice api（§9 v2.2 读通道：GET-only，默认匿名，读审计落行） ----------
+
+    private static int RunApi(string[] args)
+    {
+        string? path = null;
+        var auth = false;
+        foreach (var a in args)
+        {
+            if (a == "--auth") { auth = true; continue; }
+            if (a.StartsWith("--"))
+            {
+                Messages.Write(Messages.BadRequest($"无法识别的参数：{a}"));
+                return ExitCodes.BadRequest;
+            }
+            if (path is not null)
+            {
+                Messages.Write(Messages.BadRequest("api 只接受一个 <api-path>（GET 单路径，示例：sluice api repos/owner/repo/pulls/9）"));
+                return ExitCodes.BadRequest;
+            }
+            path = a;
+        }
+        if (path is null)
+        {
+            Messages.Write(Messages.BadRequest(
+                "api 缺少 <api-path>（示例：sluice api repos/owner/repo/pulls/9；私有资源加 --auth 过 Windows Hello）"));
+            return ExitCodes.BadRequest;
+        }
+        // GET-only + 路径白名单（拒 scheme/主机/.. 逃逸——这不是开放代理，只收 api.github.com 的相对路径）
+        if (path.StartsWith('/') || path.Contains("..") || path.Contains("://")
+            || !System.Text.RegularExpressions.Regex.IsMatch(path, @"^[A-Za-z0-9._/@{}=%\-]+$"))
+        {
+            Messages.Write(Messages.BadRequest($"<api-path> 须为 api.github.com 的相对路径（无 scheme、无 ..），收到：{path}"));
+            return ExitCodes.BadRequest;
+        }
+
+        string? token = null;
+        if (auth)
+        {
+            if (!TokenStore.Exists)
+            {
+                Messages.Write(Messages.NotInitialized());
+                return ExitCodes.NotInitialized;
+            }
+            // 读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然
+            var sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+            if (sig is null)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed("api", path));
+                return ExitCodes.ConsentFailed;
+            }
+            try { token = TokenStore.Load(sig); }
+            catch (Exception)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: "hello");
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            }
+        }
+
+        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
+        if (notSent)
+        {
+            Audit.Append("api_read", "api.github.com", path, null, "http_failed", result: "not_sent");
+            Messages.Write(Messages.HttpFailed(reason ?? "连接失败"));
+            return ExitCodes.HttpFailed;
+        }
+        if (st == 0)
+        {
+            // 超时（请求可能已送达，但 GET 无副作用——按 retry_ok 语义明示可重试）
+            Audit.Append("api_read", "api.github.com", path, null, "unknown", result: "timeout");
+            Console.Error.WriteLine($"[Sluice] api GET {path} → 超时（GET 无副作用，可重试同一命令）");
+            return ExitCodes.Unknown;
+        }
+
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B{(token is not null ? " auth" : " anon")}");
+        Console.Out.Write(body);
+        switch (st)
+        {
+            case >= 200 and < 300:
+                return ExitCodes.Success;
+            case 401 or 403:
+                Console.Error.WriteLine(token is null
+                    ? $"[Sluice] api GET {path} → HTTP {st}：资源需要认证（私有或受限）——加 --auth 过 Windows Hello 重试"
+                    : $"[Sluice] api GET {path} → HTTP {st}：token 无效或资源不在授权列表");
+                return ExitCodes.CredentialExpired;
+            default:
+                Console.Error.WriteLine($"[Sluice] api GET {path} → HTTP {st}（{body.Length} B，响应体已输出到 stdout）");
+                return ExitCodes.BadRequest;
+        }
+    }
+
+    // ---------- sluice pr create（V1 · §9 pr_create，同闸门路径） ----------
+
+    private static int RunPrCreate(string[] args)
+    {
+        string? repo = null, @base = null, head = null, title = null, bodyFile = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? Next() => i + 1 < args.Length ? args[++i] : null;
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = Next();
+                    if (repo is null) return ErrMissing("--repo");
+                    break;
+                case "--base":
+                    @base = Next();
+                    if (@base is null) return ErrMissing("--base");
+                    break;
+                case "--head":
+                    head = Next();
+                    if (head is null) return ErrMissing("--head");
+                    break;
+                case "--title":
+                    title = Next();
+                    if (title is null) return ErrMissing("--title");
+                    break;
+                case "--body-file":
+                    bodyFile = Next();
+                    if (bodyFile is null) return ErrMissing("--body-file");
+                    break;
+                default:
+                    Messages.Write(Messages.BadRequest($"无法识别的参数：{args[i]}"));
+                    return ExitCodes.BadRequest;
+            }
+        }
+
+        if (repo is null || @base is null || head is null || title is null || bodyFile is null)
+        {
+            Messages.Write(Messages.BadRequest(
+                "pr_create 缺少 --repo / --base / --head / --title / --body-file（示例：sluice pr create --repo owner/repo --base master --head feat/x --title \"标题\" --body-file body.md）"));
+            return ExitCodes.BadRequest;
+        }
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
+        {
+            Messages.Write(Messages.BadRequest($"--repo 应为 owner/name 形式，收到：{repo}"));
+            return ExitCodes.BadRequest;
+        }
+        if (title.Trim().Length == 0)
+        {
+            Messages.Write(Messages.BadRequest("--title 不能为空"));
+            return ExitCodes.BadRequest;
+        }
+        if (!File.Exists(bodyFile))
+        {
+            Messages.Write(Messages.BadRequest($"--body-file 不存在：{bodyFile}"));
+            return ExitCodes.BadRequest;
+        }
+
+        if (!TokenStore.Exists)
+        {
+            Messages.Write(Messages.NotInitialized());
+            return ExitCodes.NotInitialized;
+        }
+        var violations = SealCheck.Run();
+        if (violations.Count > 0)
+        {
+            Audit.Append("pr_create", repo, $"{@base}←{head}", null, "seal_violation");
+            Messages.Write(Messages.SealViolation(string.Join("；", violations)));
+            return ExitCodes.SealViolation;
+        }
+
+        string body;
+        try { body = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
+        catch (Exception ex)
+        {
+            Messages.Write(Messages.BadRequest($"无法读取 --body-file：{ex.Message}"));
+            return ExitCodes.BadRequest;
+        }
+        var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(title + "\n\n" + body)))[..8].ToLowerInvariant();
+        var target = $"{repo} {@base} ← {head}";
+        var window = $"""
+            标题：{title}
+            方向：{@base} ← {head}
+            正文（{body.Length} 字符）：
+            {body}
+            """;
+
+        Gate.Outcome outcome;
+        using (InputFilter.Install())
+        {
+            outcome = Gate.Run(new Gate.Request("pr_create", repo, $"{@base} ← {head}", window, sha,
+                TokenStore.PeekChallenge()));
+        }
+
+        switch (outcome)
+        {
+            case Gate.Outcome.Denied d:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "denied", d.Preset, d.FreeText, consent: "none");
+                Messages.Write(Messages.Denied("pr_create", target, d.Preset, d.FreeText));
+                return ExitCodes.Denied;
+            case Gate.Outcome.TimedOut:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "timeout");
+                Messages.Write(Messages.Timeout("pr_create", target));
+                return ExitCodes.Timeout;
+            case Gate.Outcome.ConsentFailed:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed("pr_create", target));
+                return ExitCodes.ConsentFailed;
+            case Gate.Outcome.Crashed c:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_gate_crash", result: c.Error);
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            case Gate.Outcome.Approved a:
+                return ExecutePr(a, repo, @base, head, title, body, sha, target);
+            default:
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+        }
+    }
+
+    private static int ExecutePr(Gate.Outcome.Approved a, string repo, string @base, string head,
+        string title, string body, string sha, string target)
+    {
+        string token;
+        try { token = TokenStore.Load(a.Signature); }
+        catch (Exception)
+        {
+            Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            return ExitCodes.Internal;
+        }
+
+        var r = GitHubApi.CreatePrAsync(token, repo, @base, head, title, body).GetAwaiter().GetResult();
+        switch (r.Kind)
+        {
+            case GitHubApi.OutcomeKind.Created:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "approved", consent: "hello",
+                    result: $"executed:{r.Url}");
+                Messages.Write(Messages.Success("pr_create", target, 201, r.Url!));
+                return ExitCodes.Success;
+            case GitHubApi.OutcomeKind.Unauthorized:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "credential_expired", consent: "hello",
+                    result: $"http_{r.Status}");
+                Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
+                return ExitCodes.CredentialExpired;
+            case GitHubApi.OutcomeKind.NotSent:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "http_failed", consent: "hello", result: "not_sent");
+                Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
+                return ExitCodes.HttpFailed;
+            case GitHubApi.OutcomeKind.UnknownOutcome:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "unknown", consent: "hello",
+                    result: $"unknown:{r.Reason}");
+                Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
+                return ExitCodes.Unknown;
+            default:
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal", consent: "hello",
+                    result: r.Reason ?? $"http_{r.Status}");
+                // 422 等服务端明确拒绝（PR 已存在/分支无差异）——事实明确未创建，按 bad_request 语义回执
+                Messages.Write(Messages.BadRequest($"pr_create 被服务端拒绝：{r.Reason}"));
+                return ExitCodes.BadRequest;
+        }
     }
 
     private static int Created(GitHubApi.ApiResult r, string repo, int number, string sha)

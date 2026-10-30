@@ -190,6 +190,80 @@ internal static class GitHubApi
         }
     }
 
+    /// <summary>创建 PR（§9 pr_create）。422（已存在同头 PR / 分支无差异）带服务端 message 走 Other。</summary>
+    public static async Task<ApiResult> CreatePrAsync(
+        string token, string repo, string @base, string head, string title, string body)
+    {
+        using var http = CreateClient();
+        try
+        {
+            using var req = Req(HttpMethod.Post, $"repos/{repo}/pulls", token);
+            req.Content = new StringContent(
+                $$"""{"title":{{JsonEscape(title)}},"body":{{JsonEscape(body)}},"base":{{JsonEscape(@base)}},"head":{{JsonEscape(head)}}}""",
+                Encoding.UTF8, "application/json");
+            using var resp = await http.SendAsync(req);
+            return (int)resp.StatusCode switch
+            {
+                201 => await ReadCreatedAsync(resp),
+                401 or 403 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                >= 500 => new ApiResult(OutcomeKind.UnknownOutcome, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}"),
+                _ => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}：{await MessageOfAsync(resp)}"),
+            };
+        }
+        catch (HttpRequestException ex)
+        {
+            return new ApiResult(OutcomeKind.NotSent, Reason: Describe(ex));
+        }
+        catch (TaskCanceledException)
+        {
+            return new ApiResult(OutcomeKind.UnknownOutcome, Reason: "超时");
+        }
+    }
+
+    /// <summary>GitHub 错误响应的 message 字段（无则空串）。</summary>
+    private static async Task<string> MessageOfAsync(HttpResponseMessage resp)
+    {
+        try
+        {
+            var json = await resp.Content.ReadAsStringAsync();
+            const string key = "\"message\":\"";
+            var i = json.IndexOf(key, StringComparison.Ordinal);
+            return i >= 0 ? json[(i + key.Length)..json.IndexOf('"', i + key.Length)] : "";
+        }
+        catch { return ""; }
+    }
+
+    /// <summary>
+    /// api 读通道（§9 v2.2）：GET-only。token=null 走匿名（公开数据零摩擦）；
+    /// 认证读由调用方先过 Hello 解 vault。NotSent=true 表示请求未发出（无副作用）。
+    /// </summary>
+    public static async Task<(int Status, string Body, bool NotSent, string? Reason)> ApiGetAsync(
+        string? token, string path)
+    {
+        using var http = CreateClient();
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, BaseUrl + path);
+            req.Headers.Add("Accept", "application/vnd.github+json");
+            req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+            req.Headers.Add("User-Agent", "sluice/0.1");
+            if (token is not null)
+                req.Headers.Add("Authorization", "Bearer " + token);
+            using var resp = await http.SendAsync(req);
+            return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false, null);
+        }
+        catch (HttpRequestException ex)
+        {
+            return (0, "", true, Describe(ex));
+        }
+        catch (TaskCanceledException)
+        {
+            return (0, "", false, "超时"); // 请求可能已送达，但 GET 无副作用，可安全重试
+        }
+    }
+
     /// <summary>根因中文化；issuer 校验拒绝时打印实际 issuer（区分官方新 CA 与本地 MITM）。</summary>
     internal static string Describe(Exception ex)
     {

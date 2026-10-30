@@ -14,7 +14,7 @@ internal static class RestPush
     public sealed class LocalPlanException(string msg) : Exception(msg);
 
     public sealed record Plan(string Repo, string Branch, string RepoPath, string HeadSha, string WindowText,
-        bool TouchesWorkflows, int CommitCount, int BlobCount);
+        bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null);
 
     public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other }
 
@@ -24,37 +24,53 @@ internal static class RestPush
 
     // ---------- 本地规划（只读 git，无网络；弹窗展示用，执行时以远端为准重算） ----------
 
-    public static Plan PlanLocal(string repo, string branch, string repoPath)
+    public static Plan PlanLocal(string repo, string branch, string repoPath, string? baseRef = null)
     {
         var head = Git(repoPath, "rev-parse HEAD").Trim();
         var tracking = $"origin/{branch}";
         var hasTracking = GitExists(repoPath, tracking);
-        var range = hasTracking ? $"{tracking}..HEAD" : "HEAD";
-        var diffBase = hasTracking ? tracking : EmptyTree;
+        if (baseRef is not null && hasTracking)
+            throw new LocalPlanException(
+                $"已存在 origin/{branch}（远端分支已知），无需 --base；--base 仅用于远端不存在的分支指定增量基点");
+        string? baseSha = null;
+        if (baseRef is not null)
+        {
+            baseSha = Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
+            if (baseSha.Length < 40 || !GitIsAncestor(repoPath, baseSha, head))
+                throw new LocalPlanException($"--base {baseRef} 不是 HEAD 的祖先提交，无法作为增量基点");
+        }
+        var range = hasTracking ? $"{tracking}..HEAD" : baseSha is not null ? $"{baseSha}..HEAD" : "HEAD";
+        var diffBase = hasTracking ? tracking : baseSha ?? EmptyTree;
 
         var commits = GitLines(repoPath, $"rev-list --reverse {range}");
         if (commits.Count == 0)
             throw new LocalPlanException($"没有待推提交（{(hasTracking ? $"origin/{branch}..HEAD 为空" : "当前分支无提交")}，HEAD={head[..8]}）");
 
-        var log = Git(repoPath, $"log --format=\"%h %s\" -n 12 {range}");
+        // 完整提交信息（批准你所见）：≤8 个提交逐个全文 message + 每文件增删统计；
+        // 超出部分列标题（弹窗滚动解锁机制承载长文，§7）
+        var fullCount = Math.Min(commits.Count, 8);
+        var log = Git(repoPath, $"log --no-color --format=medium --stat -n {fullCount} {range}");
+        if (commits.Count > fullCount)
+            log += $"\n\n…其余 {commits.Count - fullCount} 个提交（仅标题）：\n"
+                + Git(repoPath, $"log --no-color --format=\"%h %s\" --skip {fullCount} {range}");
         var stat = Git(repoPath, $"diff --stat --no-renames {diffBase} HEAD").Trim();
         var workflows = GitLines(repoPath, $"diff --name-only --no-renames {diffBase} HEAD")
             .Any(p => p.StartsWith(".github/workflows/", StringComparison.Ordinal));
         var blobs = CollectBlobs(repoPath, commits);
 
         var window = $"""
-            提交数：{commits.Count}{(hasTracking ? $"（origin/{branch}..HEAD）" : "（全历史，新建分支）")}
+            提交数：{commits.Count}{(hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
             待传对象：{blobs.Count} 个 blob
 
             提交：
-            {log.Trim()}{(commits.Count > 12 ? "\n…" : "")}
+            {log.Trim()}
 
             变更统计：
             {stat}
 
             （若目标仓库为空，将先自动创建 README.md 完成初始化）
             """;
-        return new Plan(repo, branch, repoPath, head, window, workflows, commits.Count, blobs.Count);
+        return new Plan(repo, branch, repoPath, head, window, workflows, commits.Count, blobs.Count, baseSha);
     }
 
     /// <summary>收集 commit 序列相对第一父引入的全部 blob（去重；跳过删除/未合并）。</summary>
@@ -125,7 +141,17 @@ internal static class RestPush
 
         // 快进校验（以本地对象库为准，fail-closed）
         string range;
-        if (isNew) range = "HEAD";
+        if (isNew)
+        {
+            // 新建分支：默认全历史；--base 给了增量基点则只推 base..HEAD（存量仓库新分支唯一可行形态）
+            if (plan.Base is { Length: 40 } b)
+            {
+                if (!GitIsAncestor(plan.RepoPath, b, plan.HeadSha))
+                    return new(PushResult.Other, "--base 基点不是 HEAD 祖先（非增量），拒绝执行");
+                range = $"{b}..HEAD";
+            }
+            else range = "HEAD";
+        }
         else
         {
             if (!GitExists(plan.RepoPath, remoteSha))
@@ -157,10 +183,17 @@ internal static class RestPush
         }
 
         // 逐 commit：tree（base_tree 增量）+ commit（保真 author/committer/date）
-        string prevCommit = isNew ? "" : remoteSha;
-        string prevTree = isNew ? ""
-            : JsonNode.Parse((await GitHubApi.SendRawAsync(HttpMethod.Get,
-                  $"repos/{plan.Repo}/git/commits/{remoteSha}", token, null)).Body)?["tree"]?["sha"]?.GetValue<string>() ?? "";
+        string prevCommit = isNew ? plan.Base ?? "" : remoteSha;
+        string prevTree = "";
+        if (prevCommit.Length > 0)
+        {
+            // 基点/远端 HEAD 的 tree 必须取自服务端（增量 base_tree 的锚）——取不到即 fail-closed
+            var (gst, gbody) = await GitHubApi.SendRawAsync(HttpMethod.Get,
+                $"repos/{plan.Repo}/git/commits/{prevCommit}", token, null);
+            if (gst != 200)
+                return new(PushResult.Other, Reason: $"基点提交 {prevCommit[..8]} 远端不存在（{Why(gst, gbody)}）——增量基点必须是远端已有对象");
+            prevTree = JsonNode.Parse(gbody)?["tree"]?["sha"]?.GetValue<string>() ?? "";
+        }
         var lastSha = prevCommit;
 
         foreach (var c in commits)
