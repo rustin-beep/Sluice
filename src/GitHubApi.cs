@@ -21,14 +21,19 @@ internal static class GitHubApi
     private const string BaseUrl = "https://api.github.com/";
 
     /// <summary>
-    /// GitHub 官方在用的签发 CA。2026-10-29 实测真链路 issuer = Sectigo（*.github.com）；
-    /// DigiCert 为历史 CA（plan.md 探针时代）。本地 MITM（SteamTools/Fiddler 等）签发的
-    /// 链 issuer 不在此列即拒。GitHub 若再换 CA，拒绝消息会打印实际 issuer，加白即可。
+    /// GitHub 官方在用的签发 CA。Sectigo 为 2026-10-29/30 两次实测主流 issuer（*.github.com，
+    /// 覆盖 140.82.x 与 20.x 两段共 8 个边缘 IP）；DigiCert 为历史 CA（plan.md 探针时代）；
+    /// 2026-10-30 真机间歇撞见 Microsoft TLS G2 RSA CA OCSP 02——GitHub（微软旗下）向自家
+    /// PKI（Microsoft TLS RSA Root G2）灰度迁移的边缘节点已上线，命中即拒，故加白 "Microsoft TLS"
+    /// （微软中间 CA 私钥不外流，本地 MITM 拿不到其签名，加白不破防）。
+    /// GitHub 若再换 CA，拒绝消息会打印实际 issuer，加白即可。
     /// </summary>
-    private static readonly string[] AllowedIssuers = ["DigiCert", "Sectigo"];
+    private static readonly string[] AllowedIssuers = ["DigiCert", "Sectigo", "Microsoft TLS"];
 
-    /// <summary>最近一次被 issuer 校验拒绝的实际颁发者（诊断用， Describe 输出）。</summary>
+    /// <summary>最近一次被 issuer 校验拒绝的实际颁发者与时刻（诊断用， Describe 输出）。
+    /// 静态值可能滞留自上一次发作——间歇性故障靠时间戳对上时间窗，而非误读为"刚刚"。</summary>
     internal static string? LastRejectedIssuer;
+    internal static DateTime? LastRejectedAt;
 
     public enum OutcomeKind { Created, Unauthorized, NotSent, UnknownOutcome, Other }
 
@@ -92,7 +97,7 @@ internal static class GitHubApi
                     // 本地 MITM（SteamTools 等）签发的链在这里被拒。
                     var issuer = cert?.Issuer ?? "";
                     var ok = AllowedIssuers.Any(k => issuer.Contains(k, StringComparison.OrdinalIgnoreCase));
-                    if (!ok) LastRejectedIssuer = issuer;
+                    if (!ok) { LastRejectedIssuer = issuer; LastRejectedAt = DateTime.Now; }
                     return ok;
                 },
             },
@@ -328,7 +333,8 @@ internal static class GitHubApi
         if (root is System.Security.Authentication.AuthenticationException ||
             root.Message.Contains("RemoteCertificateValidationCallback", StringComparison.Ordinal))
         {
-            return $"证书颁发者校验失败——实际 issuer：{LastRejectedIssuer ?? "(未记录)"}；允许：{string.Join("/", AllowedIssuers)}。"
+            var when = LastRejectedAt is { } t ? $"，最近拒绝于 {t:yyyy-MM-dd HH:mm:ss}" : "";
+            return $"证书颁发者校验失败——实际 issuer：{LastRejectedIssuer ?? "(未记录)"}{when}；允许：{string.Join("/", AllowedIssuers)}。"
                  + "实际 issuer 若是 SteamTools/Fiddler/Clash 等本地代理证书，请关闭其对 GitHub 的劫持；"
                  + "若是 GitHub 官方新换的 CA，请将 issuer 关键词加入白名单后重编译";
         }
