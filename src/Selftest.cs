@@ -42,6 +42,8 @@ internal static class Selftest
         ("issuereopenrejected", ExitCodes.BadRequest, "after_fix"), // v2.11：PR 误用/权限/锁定透传
         ("preditrejected",    ExitCodes.BadRequest, "after_fix"), // v2.11：旧值未动，核对后重跑
         ("prreviewrejected",  ExitCodes.BadRequest, "after_fix"), // v2.11：APPROVE 自批 422 说破 → 改 RQC/COMMENT
+        ("tagrejected",       ExitCodes.BadRequest, "after_fix"), // v2.13：Reference already exists → 用既有 tag 勿重试
+        ("releaserejected",   ExitCodes.BadRequest, "after_fix"), // v2.13：already_exists → 查既有 release；未发通知未触发 webhook
         ("dispatched",        ExitCodes.Success,     "—"),         // v2.7：204 受理即完成，无需重发
         ("dispatchforbidden", ExitCodes.BadRequest, "after_fix"), // v2.7：PAT 缺 Actions:RW——用户动作，非 agent 可修
         ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
@@ -92,6 +94,7 @@ internal static class Selftest
                     or "prmergerejected" or "prmergeforbidden" or "prmergenotfound" or "branchdeleteforbidden"
                     or "prreopenrejected" or "issuecloserejected" or "dispatchforbidden" or "dispatchnotfound" or "dispatchrejected"
                     or "issuecreaterejected" or "prcloserejected" or "issuereopenrejected" or "preditrejected" or "prreviewrejected"
+                    or "tagrejected" or "releaserejected"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
@@ -202,6 +205,13 @@ internal static class Selftest
         var c11 = Build("""{"action":"pr_review","repo":"o/r","number":7,"event":"APPROVE"}""");
         Eq("pr_review argv", c11.Argv, new[] { "review", "--repo", "o/r", "--number", "7", "--event", "APPROVE" });
 
+        var c12 = Build("""{"action":"tag_create","repo":"o/r","tag":"v1.2.3","at":"master"}""");
+        Eq("tag_create argv", c12.Argv, new[] { "tag", "create", "--repo", "o/r", "--tag", "v1.2.3", "--at", "master" });
+
+        var c13 = Build("""{"action":"release_create","repo":"o/r","tag":"v1.2.3","body":"注记","prerelease":true,"target":"master"}""");
+        Eq("release_create argv", c13.Argv, new[] { "release", "create", "--repo", "o/r", "--tag", "v1.2.3", "--target", "master", "--prerelease", "--body-file", "BODY" });
+        Eq("release_create body", c13.Body, "注记");
+
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
         return fail;
     }
@@ -213,7 +223,7 @@ internal static class Selftest
     [
         "pr_comment", "pr_create", "pr_review", "push", "api", "pr_merge", "branch_delete",
         "pr_reopen", "issue_close", "workflow_dispatch",
-        "issue_create", "pr_close", "issue_reopen", "pr_edit",
+        "issue_create", "pr_close", "issue_reopen", "pr_edit", "tag_create", "release_create",
     ];
 
     /// <summary>§9 内的只读 op（不进 CLI 写动词表与 MCP Actions；新增读 op 须在此登记）。</summary>

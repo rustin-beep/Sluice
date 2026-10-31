@@ -42,7 +42,7 @@ internal static class McpServer
     [
         "pr_comment", "push", "pr_create", "pr_merge", "pr_reopen", "pr_close", "pr_edit",
         "issue_create", "issue_close", "issue_reopen", "pr_review",
-        "branch_delete", "workflow_dispatch",
+        "tag_create", "release_create", "branch_delete", "workflow_dispatch",
     ];
 
     /// <summary>各 action 允许的参数名（与 CLI flag 同名映射；表外字段报错——防"传了被静默忽略"的误会）。</summary>
@@ -59,6 +59,8 @@ internal static class McpServer
         ["issue_close"]       = ["repo", "number"],
         ["issue_reopen"]      = ["repo", "number"],
         ["pr_review"]         = ["repo", "number", "event", "body"],
+        ["tag_create"]        = ["repo", "tag", "at"],
+        ["release_create"]    = ["repo", "tag", "target", "name", "body", "prerelease"],
         ["branch_delete"]     = ["repo", "branch"],
         ["workflow_dispatch"] = ["repo", "workflow", "ref", "inputs"],
     };
@@ -70,11 +72,12 @@ internal static class McpServer
     private const string ToolDescription =
         """
         GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论、推送、创建/合并/重开/关闭/编辑 PR、
-        评审 PR、创建/关闭/重开 issue、删除分支、触发 workflow——必须且只能经此工具执行；环境内无其他
-        可用凭据，直接 git push / gh / GitHub API 调用必然失败且违反纪律。调用会弹出本机批准窗口，由用户
-        人工批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，请按其指引行动；structuredContent.retry
-        是机器可读的下一步：never=禁止重试 / after_fix=修正参数后可重试 / retry_ok=可直接重试 /
-        wait_user=等待用户指示 / wait_until=等待到点 / change_approach=改换方案。
+        评审 PR、创建/关闭/重开 issue、打 tag、发布 release、删除分支、触发 workflow——必须且只能经此
+        工具执行；环境内无其他可用凭据，直接 git push / gh / GitHub API 调用必然失败且违反纪律。
+        调用会弹出本机批准窗口，由用户人工批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，
+        请按其指引行动；structuredContent.retry 是机器可读的下一步：never=禁止重试 /
+        after_fix=修正参数后可重试 / retry_ok=可直接重试 / wait_user=等待用户指示 /
+        wait_until=等待到点 / change_approach=改换方案。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
         （如 sluice api repos/owner/repo/pulls）。
         """;
@@ -84,10 +87,10 @@ internal static class McpServer
           "type": "object",
           "required": ["action", "repo"],
           "properties": {
-            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","branch_delete","workflow_dispatch"], "description": "写操作类型" },
+            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","tag_create","release_create","branch_delete","workflow_dispatch"], "description": "写操作类型" },
             "repo":         { "type": "string", "description": "目标仓库 owner/name" },
             "number":       { "type": "integer", "description": "issue/PR 编号（pr_comment/pr_merge/pr_reopen/pr_close/pr_edit/issue_close/issue_reopen/pr_review 必填）" },
-            "body":         { "type": "string", "description": "正文全文（pr_comment/pr_create/issue_create 必填；pr_edit/pr_review 可选）" },
+            "body":         { "type": "string", "description": "正文全文（pr_comment/pr_create/issue_create/release_create 必填；pr_edit/pr_review 可选）" },
             "title":        { "type": "string", "description": "标题（pr_create/issue_create 必填；pr_edit 可选——勘误）" },
             "base":         { "type": "string", "description": "pr_create：base 分支名；push：增量基点/重放式更新基点（如 origin/master）" },
             "head":         { "type": "string", "description": "PR head 分支（pr_create 必填）" },
@@ -96,6 +99,11 @@ internal static class McpServer
             "method":       { "type": "string", "enum": ["merge","squash","rebase"], "description": "合并方式（pr_merge 可选）" },
             "delete_head":  { "type": "boolean", "description": "合并后删除 head 分支（pr_merge 可选）" },
             "event":        { "type": "string", "enum": ["COMMENT","APPROVE","REQUEST_CHANGES"], "description": "评审动作（pr_review 必填；APPROVE 不能用于自己账户的 PR——服务端 422）" },
+            "tag":          { "type": "string", "description": "tag 名（tag_create/release_create 必填）" },
+            "at":           { "type": "string", "description": "tag 指向的分支名或完整 sha（tag_create 必填）" },
+            "target":       { "type": "string", "description": "release_create 可选：分支名或完整 sha（缺省取默认分支头；以批准期解析的 sha 锚定）" },
+            "name":         { "type": "string", "description": "release_create 可选：release 名称（缺省用 tag 名）" },
+            "prerelease":   { "type": "boolean", "description": "release_create 可选：标记为预发布" },
             "workflow":     { "type": "string", "description": "workflow id 或 .yml 文件名（workflow_dispatch 必填）" },
             "ref":          { "type": "string", "description": "dispatch 目标分支/标签（workflow_dispatch 必填）" },
             "inputs":       { "type": "object", "description": "workflow inputs 键值对（workflow_dispatch 可选）" }
@@ -335,6 +343,21 @@ internal static class McpServer
             case "pr_review":
                 list.Add("review");
                 Opt("--repo", Str("repo")); Opt("--number", Num("number")); Opt("--event", Str("event"));
+                if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
+                break;
+            case "tag_create":
+                list.AddRange(["tag", "create"]);
+                Opt("--repo", Str("repo")); Opt("--tag", Str("tag")); Opt("--at", Str("at"));
+                break;
+            case "release_create":
+                list.AddRange(["release", "create"]);
+                Opt("--repo", Str("repo")); Opt("--tag", Str("tag")); Opt("--target", Str("target")); Opt("--name", Str("name"));
+                if (a.TryGetProperty("prerelease", out var pr)
+                    && (pr.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
+                        || (pr.ValueKind == JsonValueKind.String && pr.GetString() != "true" && pr.GetString() != "false")))
+                { error = Messages.BadRequest("prerelease 应为布尔值——本次未产生任何副作用"); return false; }
+                if (pr.ValueKind == JsonValueKind.True || (pr.ValueKind == JsonValueKind.String && pr.GetString() == "true"))
+                    list.Add("--prerelease");
                 if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
                 break;
             case "branch_delete":

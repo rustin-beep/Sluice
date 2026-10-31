@@ -63,6 +63,8 @@ internal static class Program
         ("issue close",      "issue_close",      RunIssueClose),
         ("issue reopen",     "issue_reopen",     RunIssueReopen),
         ("review",           "pr_review",        RunReview),
+        ("tag create",       "tag_create",       RunTagCreate),
+        ("release create",   "release_create",   RunReleaseCreate),
         ("workflow dispatch","workflow_dispatch",RunWorkflowDispatch),
         ("branch delete",    "branch_delete",    RunBranchDelete),
     ];
@@ -130,6 +132,12 @@ internal static class Program
               sluice review --repo O/R --number N --event COMMENT|APPROVE|REQUEST_CHANGES [--body-file F]
                                                         在 PR 上落评审（经批准；commit_id 锚定"所见即所评"。
                                                         注意 GitHub 禁止 APPROVE 自己账户的 PR）
+              sluice tag create --repo O/R --tag V --at <分支|完整sha>
+                                                        新建远端轻量 tag（经批准；create-or-fail 不覆盖；
+                                                        --at 私有库解析失败时给完整 40 位 sha）
+              sluice release create --repo O/R --tag V --body-file F [--target <分支|sha>] [--name N] [--prerelease]
+                                                        发布 release（经批准；target_commitish 以批准期
+                                                        解析的 sha 锚定；发布即通知 watchers）
               sluice workflow dispatch --repo O/R --workflow W --ref R [--inputs-file F]
                                                         手动触发 workflow（经批准；W 为 id 或文件名，R 为
                                                         分支/标签，F 为 JSON 对象对应 dispatch inputs。
@@ -154,14 +162,14 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.12");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.13");
         return 0;
     }
 
     private static int BadVerb(string verb)
     {
         Messages.Write(Messages.BadRequest(
-            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / review / workflow / branch / api / mcp / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
+            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / review / tag / release / workflow / branch / api / mcp / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
         return ExitCodes.BadRequest;
     }
 
@@ -2226,6 +2234,209 @@ internal static class Program
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "pr_review_rejected",
                         consent: TokenStore.ConsentChannel, result: detail);
                     Messages.Write(Messages.PrReviewRejected(target, detail));
+                }));
+    }
+
+    // ---------- sluice tag create（V1.8 · v2.13 发版面批：tag 推远端进动词面——发版是周期性硬场景，
+    //             曾只能网页。lightweight tag（直接指 ref，不建 annotated 对象——后续按需）；git/refs
+    //             create-or-fail 天然防覆盖，v2.7「update-ref 永不自动重试」不变量覆盖此路径） ----------
+
+    /// <summary>--at/--target 取值形态：40/64 位 hex = 对象 sha；其余按分支名匿名解析。</summary>
+    private static bool IsHexSha(string s) => s.Length is 40 or 64 && s.All(Uri.IsHexDigit);
+
+    private static int RunTagCreate(string[] args)
+    {
+        string? repo = null, tag = null, at = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? Next() => i + 1 < args.Length ? args[++i] : null;
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = Next();
+                    if (repo is null) return ErrMissing("tag_create", "--repo");
+                    break;
+                case "--tag":
+                    tag = Next();
+                    if (tag is null) return ErrMissing("tag_create", "--tag");
+                    break;
+                case "--at":
+                    at = Next();
+                    if (at is null) return ErrMissing("tag_create", "--at");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || tag is null || at is null)
+            return ErrBad("tag_create 缺少 --repo / --tag / --at（示例：sluice tag create --repo owner/repo --tag v1.2.3 --at master；--at 也可给完整 40 位 sha）");
+        if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (tag.Trim().Length == 0) return ErrBad("--tag 不能为空");
+        if (!TryPreflight("tag_create", repo, tag, out var pre)) return pre;
+
+        // 匿名预读（v2.8 纪律）：tag 已存在 = create-or-fail 的确定性拒绝，公开库零成本拦下（省一道弹窗）
+        var (tagSt, tagRef) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
+        var existing = tagSt == 200 ? tagRef?["object"]?["sha"]?.GetValue<string>() : null;
+        if (existing is { Length: >= 8 } e8)
+            return ErrBad($"tag {tag} 已存在（→ {e8[..8]}）——tag 创建是 create-or-fail，不提供移动/覆盖；如需重新打点请换新 tag 名；本次未产生任何副作用");
+        var warn404 = tagSt == 404
+            ? "\n⚠ 匿名预读 404：tag 不存在，或私有库对匿名读不可见——两者不可区分，由服务端执行时终判"
+            : "";
+
+        // 解析 --at：hex 直接用；分支名匿名解析——私有库匿名 404 不可辨时点名给完整 sha（本地 git 可得）
+        string targetSha, atDesc;
+        if (IsHexSha(at)) { targetSha = at; atDesc = "直接给定"; }
+        else
+        {
+            var (bst, bref) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(at)}");
+            var resolved = bst == 200 ? bref?["object"]?["sha"]?.GetValue<string>() : null;
+            if (resolved is null)
+                return ErrBad($"无法把 --at {at} 解析为提交（匿名读 {(bst == 404 ? "404：分支不存在，或私有库匿名不可见" : $"HTTP {bst}")}）——私有库请改给完整 40 位 sha（git rev-parse {at} 本地可得）后重跑；本次未产生任何副作用");
+            targetSha = resolved;
+            atDesc = $"解析自分支 {at}";
+        }
+
+        var sha = Sha8($"{repo}:tag:{tag}:{targetSha}");
+        var target = $"{repo}·{tag}";
+        var window = $"""
+            新建 tag：{tag} → {targetSha[..8]}（{atDesc}）
+            仓库：{repo}
+            轻量 tag（lightweight）：指向既有提交，不新建 tag 对象（annotated 待后续按需）。{warn404}
+            """;
+        return RunGatedOp("tag_create", repo, tag, target, sha, window,
+            tagSt == 404 ? "匿名预读 404：tag 不存在或私有库匿名不可见，由服务端执行时终判" : null,
+            a => ExecuteGated(a, "tag_create", repo, tag, target, sha,
+                HttpMethod.Post, $"repos/{repo}/git/refs",
+                new System.Text.Json.Nodes.JsonObject { ["ref"] = $"refs/tags/{tag}", ["sha"] = targetSha }.ToJsonString(),
+                _ => $"https://github.com/{repo}/releases/tag/{tag}",
+                (st, detail) =>
+                {
+                    Audit.Append("tag_create", repo, tag, sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "tag_create_rejected",
+                        consent: TokenStore.ConsentChannel, result: detail);
+                    Messages.Write(Messages.TagRejected(target, detail));
+                }));
+    }
+
+    // ---------- sluice release create（V1.8 · v2.13 发版面批。target_commitish 锚定 = 隐式建 tag 的
+    //             TOCTOU 处方（批准期解析 sha 显式传入，pr_merge head-sha 同族）；广播性披露（发布即通知
+    //             watchers + 触发 release webhook）；同 tag 已有 release → 服务端 422 already_exists 天然护栏） ----------
+
+    private static int RunReleaseCreate(string[] args)
+    {
+        string? repo = null, tag = null, bodyFile = null, name = null, target = null;
+        var prerelease = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? Next() => i + 1 < args.Length ? args[++i] : null;
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = Next();
+                    if (repo is null) return ErrMissing("release_create", "--repo");
+                    break;
+                case "--tag":
+                    tag = Next();
+                    if (tag is null) return ErrMissing("release_create", "--tag");
+                    break;
+                case "--body-file":
+                    bodyFile = Next();
+                    if (bodyFile is null) return ErrMissing("release_create", "--body-file");
+                    break;
+                case "--name":
+                    name = Next();
+                    if (name is null) return ErrMissing("release_create", "--name");
+                    break;
+                case "--target":
+                    target = Next();
+                    if (target is null) return ErrMissing("release_create", "--target");
+                    break;
+                case "--prerelease":
+                    prerelease = true;
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || tag is null || bodyFile is null)
+            return ErrBad("release_create 缺少 --repo / --tag / --body-file（示例：sluice release create --repo owner/repo --tag v1.2.3 --body-file notes.md [--target master] [--name 名称] [--prerelease]）");
+        if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (tag.Trim().Length == 0) return ErrBad("--tag 不能为空");
+        if (!File.Exists(bodyFile)) return ErrBad($"--body-file 不存在：{bodyFile}");
+        if (!TryPreflight("release_create", repo, tag, out var pre)) return pre;
+
+        string body;
+        try { body = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
+        catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
+
+        // 匿名预读①：tag 是否已存在——已存在则 release 挂其上（target 不参与，弹窗披露）
+        var (tagSt, tagRef) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
+        var existingTag = tagSt == 200 ? tagRef?["object"]?["sha"]?.GetValue<string>() : null;
+        var warn404 = tagSt == 404
+            ? "\n⚠ 匿名预读 404：tag 状态不可辨（不存在，或私有库匿名不可见）——由服务端执行时终判"
+            : "";
+
+        // 匿名预读②：发布锚点——tag 不存在时 target_commitish 必须以批准期解析的 sha 显式传入
+        // （隐式建 tag 的 TOCTOU 处方）；--target 缺省取默认分支头
+        string? anchorSha = null;
+        string anchorDesc;
+        if (existingTag is { Length: >= 8 } t8)
+        {
+            anchorDesc = $"tag 已存在（→ {t8[..8]}），release 挂其上（--target 不参与；该 tag 若已有 release，服务端将 422 already_exists）";
+        }
+        else
+        {
+            string src;
+            if (target is not null) src = target;
+            else
+            {
+                var (rst, rj) = TryReadMeta($"repos/{repo}");
+                var db = rst == 200 ? rj?["default_branch"]?.GetValue<string>() : null;
+                if (db is null)
+                    return ErrBad($"无法解析发布锚点（读取默认分支失败：HTTP {rst}）——请显式给 --target <分支|完整 sha> 后重跑；本次未产生任何副作用");
+                src = db;
+            }
+            if (IsHexSha(src)) { anchorSha = src; anchorDesc = $"tag 将创建于 {src[..8]}（--target 直接给定的 sha）"; }
+            else
+            {
+                var (bst, bref) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(src)}");
+                var resolved = bst == 200 ? bref?["object"]?["sha"]?.GetValue<string>() : null;
+                if (resolved is null)
+                    return ErrBad($"无法把发布锚点 {src} 解析为提交（匿名读 {(bst == 404 ? "404：分支不存在，或私有库匿名不可见" : $"HTTP {bst}")}）——私有库请改给 --target <完整 40 位 sha>（git rev-parse {src} 本地可得）后重跑；本次未产生任何副作用");
+                anchorSha = resolved;
+                anchorDesc = $"tag 将创建于 {resolved[..8]}（锚定自 {(target is null ? $"默认分支 {src} 头" : $"--target {src}")}——target_commitish 以此 sha 显式传入，杜绝隐式建 tag 的 TOCTOU）";
+            }
+        }
+
+        var sha = Sha8($"{repo}:release:{tag}:{existingTag ?? anchorSha}:{body}");
+        var msgTarget = $"{repo}·{tag}";
+        var window = $"""
+            发布 release：{repo} · {tag}{(prerelease ? "（预发布 prerelease）" : "")}
+            tag：{anchorDesc}
+            名称：{name ?? tag}
+            正文（{body.Length} 字符）：
+            {body}
+            发布即通知所有 watchers 并触发 release 事件 webhook——广播性动作。{warn404}
+            """;
+        var payload = new System.Text.Json.Nodes.JsonObject
+        {
+            ["tag_name"] = tag,
+            ["body"] = body,
+            ["prerelease"] = prerelease,
+        };
+        if (name is not null) payload["name"] = name;
+        if (existingTag is null && anchorSha is not null) payload["target_commitish"] = anchorSha;
+        return RunGatedOp("release_create", repo, tag, msgTarget, sha, window,
+            tagSt == 404 ? "匿名预读 404：tag 状态不可辨（不存在或私有库匿名不可见），由服务端执行时终判" : null,
+            a => ExecuteGated(a, "release_create", repo, tag, msgTarget, sha,
+                HttpMethod.Post, $"repos/{repo}/releases", payload.ToJsonString(),
+                b => GitHubApi.HtmlUrlOf(b) ?? $"https://github.com/{repo}/releases/tag/{tag}",
+                (st, detail) =>
+                {
+                    Audit.Append("release_create", repo, tag, sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "release_create_rejected",
+                        consent: TokenStore.ConsentChannel, result: detail);
+                    Messages.Write(Messages.ReleaseRejected(msgTarget, detail));
                 }));
     }
 

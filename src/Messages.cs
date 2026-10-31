@@ -539,6 +539,26 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- tag create 被服务端拒绝（exit 10，retry=after_fix；v2.13 发版面批） ----
+    public static Msg TagRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        tag_create 被服务端拒绝（{detail}）。常见原因：tag 已存在（Reference already exists——使用既有 tag，勿重试；sluice 不提供 tag 移动/覆盖）；token 无 Contents 写权限；tag 名含非法字符；仓库不存在或不可写。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：已存在 → 使用既有 tag；权限缺失 → 转告用户在 PAT 开 Contents: Read and write 后重跑 sluice setup；名称问题 → 换合法 tag 名后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- release create 被服务端拒绝（exit 10，retry=after_fix；v2.13 发版面批） ----
+    public static Msg ReleaseRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        release_create 被服务端拒绝（{detail}）。常见原因：该 tag 已有 release（already_exists——用 sluice api "repos/<owner/repo>/releases" 查既有 release 使用之；确需重发请先在网页删除旧 release 或换新 tag）；token 无 Contents 写权限；仓库不存在或不可写。
+        本次操作未执行，GitHub 上没有产生任何变更（未发通知、未触发 webhook）。
+        修正：按对应项处理后重跑同一命令；不要自行获取或更换凭据。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- workflow dispatch 已受理（exit 0；HTTP 204 无响应体——受理即完成，run 创建是异步的） ----
     public static Msg WorkflowDispatched(string repo, string wf, string rf) => new(
         "[Sluice]",
@@ -633,6 +653,8 @@ internal static class Messages
         ("issuereopenrejected", IssueReopenRejected("rustin-beep/Sluice#369", "HTTP 422：Issue is locked")),
         ("preditrejected", PrEditRejected("rustin-beep/Sluice#383", "HTTP 403：Resource not accessible by personal access token")),
         ("prreviewrejected", PrReviewRejected("rustin-beep/Vitro#390", "HTTP 422：Can not approve your own pull request")),
+        ("tagrejected", TagRejected("rustin-beep/Sluice·v0.6.0", "HTTP 422：Reference already exists")),
+        ("releaserejected", ReleaseRejected("rustin-beep/Sluice·v0.6.0", "HTTP 422：already_exists")),
         ("dispatched", WorkflowDispatched("rustin-beep/Vitro", "ci.yml", "master")),
         ("dispatchforbidden", DispatchForbidden("rustin-beep/Vitro", "ci.yml", "HTTP 403：Resource not accessible by personal access token")),
         ("dispatchnotfound", DispatchNotFound("rustin-beep/Vitro", "noci.yml")),

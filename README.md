@@ -35,7 +35,7 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | 动词 | Repository permissions |
 |---|---|
 | `comment` / `issue create` / `issue close` / `issue reopen` | **Issues: Read and write** |
-| `push` | **Contents: Read and write** |
+| `push` / `tag create` / `release create` | **Contents: Read and write**（tag 走 git/refs、release 走 releases 端点，同 Contents 面） |
 | `pr create` / `pr reopen` / `pr close` / `pr edit` / `review` | **Pull requests: Read and write** |
 | `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
 | `workflow dispatch` | **Actions: Read and write** |
@@ -62,6 +62,8 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice issue close --repo O/R --number N` | 关闭 issue | PR 编号会被预检拦下 |
 | `sluice issue create --repo O/R --title T --body-file F` | 新建 issue | issue close 的对偶件（立案闭环）；正文全文入窗 |
 | `sluice issue reopen --repo O/R --number N` | 重开已关 issue | issue close 的对偶件；PR 编号同样会被预检拦下 |
+| `sluice tag create --repo O/R --tag V --at <分支\|完整sha>` | 新建远端轻量 tag | create-or-fail 不覆盖；私有库 --at 解析失败时给完整 40 位 sha |
+| `sluice release create --repo O/R --tag V --body-file F [--target <分支\|sha>] [--name N] [--prerelease]` | 发布 release | target 以批准期解析的 sha 锚定（杜绝隐式建 tag 的 TOCTOU）；发布即通知 watchers |
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |
 | `sluice branch delete --repo O/R --branch B` | 删远端分支 ref | 弹窗会披露「将连带关闭其上的开放 PR」；commits 保留可重建 |
 | `sluice api <api-path> [--auth]` | GET 只读 | 公开数据匿名零交互；`--auth` 走 vault；logs 等端点 302→CDN 自动跟随（仅 GitHub 域 ≤3 跳）；每次调用入读审计 |
