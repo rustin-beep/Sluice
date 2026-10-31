@@ -36,7 +36,8 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 |---|---|
 | `comment` / `issue close` | **Issues: Read and write** |
 | `push` | **Contents: Read and write** |
-| `pr create` / `pr merge` / `pr reopen` | **Pull requests: Read and write** |
+| `pr create` / `pr reopen` | **Pull requests: Read and write** |
+| `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
 | `workflow dispatch` | **Actions: Read and write** |
 | `api --auth` 读 CI（runs/jobs/logs） | **Actions: Read**（actions 端点对匿名一律 403） |
 | 所有 | Metadata: Read（强制自带） |

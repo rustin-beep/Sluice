@@ -109,7 +109,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.7");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.8");
         return 0;
     }
 
@@ -267,7 +267,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -281,19 +281,19 @@ internal static class Program
         try { r = RestPush.ExecuteAsync(token, plan).GetAwaiter().GetResult(); }
         catch (HttpRequestException ex)
         {
-            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
-            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "unknown", consent: "hello", result: "timeout");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "unknown", consent: TokenStore.ConsentChannel, result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
         catch (RestPush.LocalPlanException ex)
         {
-            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "bad_request", consent: "hello");
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "bad_request", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.BadRequest(ex.Message));
             return ExitCodes.BadRequest;
         }
@@ -325,7 +325,7 @@ internal static class Program
 
     private static int PushFail(RestPush.Plan plan, string decision, Msg msg, int exit, string? reason = null)
     {
-        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], decision, consent: "hello",
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], decision, consent: TokenStore.ConsentChannel,
             result: reason is null ? "not_executed" : $"not_executed:{reason}");
         Messages.Write(msg);
         return exit;
@@ -333,7 +333,7 @@ internal static class Program
 
     private static int Done(RestPush.Result r, RestPush.Plan plan)
     {
-        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "approved", consent: "hello",
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "approved", consent: TokenStore.ConsentChannel,
             result: plan.ReplacingSha is string old
                 ? $"executed:{r.NewSha}（重放替换 {old[..8]}）"
                 : $"executed:{r.NewSha}");
@@ -344,7 +344,7 @@ internal static class Program
 
     private static int UpToDate(RestPush.Plan plan)
     {
-        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "up_to_date", consent: "hello");
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "up_to_date", consent: TokenStore.ConsentChannel);
         Messages.Write(Messages.PushUpToDate(plan.Repo, plan.Branch, plan.HeadSha[..8]));
         return ExitCodes.Success;
     }
@@ -499,7 +499,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("pr_comment", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("pr_comment", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -583,7 +583,7 @@ internal static class Program
             try { token = TokenStore.LoadApproved(sig); }
             catch (Exception)
             {
-                Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: "hello");
+                Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
                 Messages.Write(Messages.Internal(afterExecutionStarted: false));
                 return ExitCodes.Internal;
             }
@@ -760,7 +760,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -769,26 +769,26 @@ internal static class Program
         switch (r.Kind)
         {
             case GitHubApi.OutcomeKind.Created:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "approved", consent: "hello",
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "approved", consent: TokenStore.ConsentChannel,
                     result: $"executed:{r.Url}");
                 Messages.Write(Messages.Success("pr_create", target, 201, r.Url!));
                 return ExitCodes.Success;
             case GitHubApi.OutcomeKind.Unauthorized:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "credential_expired", consent: "hello",
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "credential_expired", consent: TokenStore.ConsentChannel,
                     result: $"http_{r.Status}");
                 Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
                 return ExitCodes.CredentialExpired;
             case GitHubApi.OutcomeKind.NotSent:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "http_failed", consent: "hello", result: "not_sent");
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
                 Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
                 return ExitCodes.HttpFailed;
             case GitHubApi.OutcomeKind.UnknownOutcome:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "unknown", consent: "hello",
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "unknown", consent: TokenStore.ConsentChannel,
                     result: $"unknown:{r.Reason}");
                 Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
                 return ExitCodes.Unknown;
             default:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal", consent: "hello",
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal", consent: TokenStore.ConsentChannel,
                     result: r.Reason ?? $"http_{r.Status}");
                 // 422（PR 已存在/分支无差异）：服务端明确拒绝，原样重跑必再 422——专用消息指引查已有 PR；
                 // 其余非 2xx（如 400 真·用法错）仍走通用 bad_request 模板
@@ -942,7 +942,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -958,7 +958,7 @@ internal static class Program
             if (vNotSent || vst == 0)
             {
                 // 复核 GET 无副作用且 merge 未发出——整条命令可安全重跑（retry_ok）
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: "hello",
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel,
                     result: vNotSent ? "not_sent" : "timeout_retry_safe_get");
                 Messages.Write(Messages.PrMergeVerifyFailed(vNotSent ? vWhy ?? "连接失败" : "复核请求超时"));
                 return ExitCodes.HttpFailed;
@@ -969,13 +969,13 @@ internal static class Program
                 if (now is null)
                 {
                     // 200 却无 head.sha：结构漂移按 sluice 侧错误诚实归类，不 fail-open
-                    Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_verify_failed", consent: "hello");
+                    Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_verify_failed", consent: TokenStore.ConsentChannel);
                     Messages.Write(Messages.Internal(afterExecutionStarted: false));
                     return ExitCodes.Internal;
                 }
                 if (now != snap)
                 {
-                    Audit.Append("pr_merge", repo, $"#{number}", sha, "head_moved", consent: "hello",
+                    Audit.Append("pr_merge", repo, $"#{number}", sha, "head_moved", consent: TokenStore.ConsentChannel,
                         result: $"expected:{snap[..8]} actual:{now[..8]}");
                     Messages.Write(Messages.PrMergeChanged(target, snap[..8], now[..8]));
                     return ExitCodes.BadRequest;
@@ -988,7 +988,7 @@ internal static class Program
         switch (r.Kind)
         {
             case GitHubApi.OutcomeKind.Created:
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "approved", consent: "hello",
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "approved", consent: TokenStore.ConsentChannel,
                     result: $"executed:{r.Url}");
                 Messages.Write(Messages.Success("pr_merge", target, 200, r.Url!));
                 // --delete-head：合并已生效（不可回滚）；删除失败不吞——如实附注并指引单独删除。
@@ -1001,36 +1001,36 @@ internal static class Program
                             $"repos/{repo}/git/refs/heads/{GitHubApi.RefPath(headBranch)}", token, null).GetAwaiter().GetResult();
                         Audit.Append("pr_merge", repo, headBranch, sha,
                             dst == 204 ? "delete_head_executed" : "delete_head_failed",
-                            consent: "hello", result: dst == 204 ? "executed" : $"http_{dst}");
+                            consent: TokenStore.ConsentChannel, result: dst == 204 ? "executed" : $"http_{dst}");
                         if (dst != 204)
                             Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, HttpDetail(dst, dbody)));
                     }
                     catch (TaskCanceledException)
                     {
                         Audit.Append("pr_merge", repo, headBranch, sha, "delete_head_failed",
-                            consent: "hello", result: "timeout");
+                            consent: TokenStore.ConsentChannel, result: "timeout");
                         Messages.Write(Messages.BranchDeleteFailed(repo, headBranch,
                             "删除请求超时（可能已送达）——查证 refs 后按需重删"));
                     }
                     catch (Exception ex)
                     {
                         Audit.Append("pr_merge", repo, headBranch, sha, "delete_head_failed",
-                            consent: "hello", result: "not_sent");
+                            consent: TokenStore.ConsentChannel, result: "not_sent");
                         Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, ex.Message));
                     }
                 }
                 return ExitCodes.Success;
             case GitHubApi.OutcomeKind.Unauthorized: // v2.5 起 401 专属（403 已在服务端拆出）
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "credential_expired", consent: "hello",
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "credential_expired", consent: TokenStore.ConsentChannel,
                     result: $"http_{r.Status}");
                 Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
                 return ExitCodes.CredentialExpired;
             case GitHubApi.OutcomeKind.NotSent:
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
                 Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
                 return ExitCodes.HttpFailed;
             case GitHubApi.OutcomeKind.UnknownOutcome:
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "unknown", consent: "hello",
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "unknown", consent: TokenStore.ConsentChannel,
                     result: $"unknown:{r.Reason}");
                 Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
                 return ExitCodes.Unknown;
@@ -1040,7 +1040,7 @@ internal static class Program
                 // 与 mergeability 无关）
                 Audit.Append("pr_merge", repo, $"#{number}", sha,
                     r.Status == 403 ? "forbidden" : r.Status == 404 ? "not_found" : "pr_merge_rejected",
-                    consent: "hello", result: r.Reason ?? $"http_{r.Status}");
+                    consent: TokenStore.ConsentChannel, result: r.Reason ?? $"http_{r.Status}");
                 Messages.Write(r.Status switch
                 {
                     403 => Messages.PrMergeForbidden(target, r.Reason ?? $"HTTP {r.Status}"),
@@ -1177,7 +1177,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("branch_delete", repo, branch, sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("branch_delete", repo, branch, sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -1189,7 +1189,7 @@ internal static class Program
             switch (st)
             {
                 case 204:
-                    Audit.Append("branch_delete", repo, branch, sha, "approved", consent: "hello",
+                    Audit.Append("branch_delete", repo, branch, sha, "approved", consent: TokenStore.ConsentChannel,
                         result: "executed");
                     Messages.Write(Messages.Success("branch_delete", target, 204,
                         $"https://github.com/{repo}/branches"));
@@ -1197,22 +1197,22 @@ internal static class Program
                 // 403 拆分（2026-10-30 评审）：403 多为分支保护/无删除权限（服务端策略拒），
                 // 归凭据过期(9)会把 agent 引向重新 setup 的死路；仅 401 是凭据问题
                 case 401:
-                    Audit.Append("branch_delete", repo, branch, sha, "credential_expired", consent: "hello",
+                    Audit.Append("branch_delete", repo, branch, sha, "credential_expired", consent: TokenStore.ConsentChannel,
                         result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
                 case 403:
-                    Audit.Append("branch_delete", repo, branch, sha, "forbidden", consent: "hello",
+                    Audit.Append("branch_delete", repo, branch, sha, "forbidden", consent: TokenStore.ConsentChannel,
                         result: HttpDetail(st, body));
                     Messages.Write(Messages.BranchDeleteForbidden(repo, branch, HttpDetail(st, body)));
                     return ExitCodes.BadRequest;
                 case 404:
-                    Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: "hello",
+                    Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: TokenStore.ConsentChannel,
                         result: $"http_404");
                     Messages.Write(Messages.BadRequest($"分支不存在（可能已被删除）：{repo}@{branch}。本次未产生任何副作用"));
                     return ExitCodes.BadRequest;
                 default:
-                    Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: "hello",
+                    Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: TokenStore.ConsentChannel,
                         result: $"http_{st}");
                     Messages.Write(Messages.BadRequest($"branch_delete 被服务端拒绝：{HttpDetail(st, body)}。本次未产生任何副作用"));
                     return ExitCodes.BadRequest;
@@ -1220,14 +1220,14 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("branch_delete", repo, branch, sha, "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("branch_delete", repo, branch, sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
             // DELETE 幂等（重删得 404）但请求可能已送达——诚实归 unknown，查证 refs/heads 即知
-            Audit.Append("branch_delete", repo, branch, sha, "unknown", consent: "hello", result: "timeout");
+            Audit.Append("branch_delete", repo, branch, sha, "unknown", consent: TokenStore.ConsentChannel, result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
@@ -1302,8 +1302,12 @@ internal static class Program
             }
         }
         catch { /* 元数据读失败不阻塞批准流 */ }
-        if (metaSt == 404)
-            return ErrBad($"PR #{number} 不存在（HTTP 404）——核对编号；列出当前 PR：sluice api repos/{repo}/pulls");
+        // v2.8（2026-10-31 评审 A）：匿名 404 不再断言"不存在"——私有库对匿名 GET 同样 404，
+        // 两者不可区分；断言成终态会误导 agent 认定编号错、换路重试，而正解（继续执行让服务端判）
+        // 永远不会被尝试。降级为弹窗警示行，存在性由服务端执行时终判（同 pr_merge 元数据读纪律）。
+        var warn404 = metaSt == 404
+            ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——两者不可区分，存在性由服务端执行时判定"
+            : "";
         if (prState == "open")
             return ErrBad($"PR #{number} 已是开放状态，无需 reopen；本次未产生任何副作用。若预期中的 CI 未触发，先核对仓库 workflow 的 on: 配置（push/pull_request 触发类型）");
         if (prMerged is not null)
@@ -1317,7 +1321,7 @@ internal static class Program
             PR：{target}（当前状态：{prState ?? "（元数据不可读：私有库或网络原因，重开前请自行核对）"}）
             标题：{prTitle ?? "（不可读）"}
             方向：{prBase ?? "?"} ← {prHead ?? "?"}{(prHeadSha is { Length: >= 8 } h ? $"（head {h[..8]}）" : "")}
-            重开将恢复该 PR 的讨论与审查上下文；reopened 事件会再次触发 pull_request 类 workflow。
+            重开将恢复该 PR 的讨论与审查上下文；reopened 事件会再次触发 pull_request 类 workflow。{warn404}
             """;
 
         Gate.Outcome outcome;
@@ -1325,7 +1329,8 @@ internal static class Program
         {
             outcome = Gate.Run(new Gate.Request("pr_reopen", repo, $"#{number}", window, sha,
                 TokenStore.PeekChallenge(),
-                prHeadSha is null ? "PR 元数据不可读，重开对象请自行核对" : null));
+                metaSt == 404 ? "匿名预读 404：编号不存在或私有库匿名不可见，存在性由服务端执行时终判"
+                    : prHeadSha is null ? "PR 元数据不可读，重开对象请自行核对" : null));
         }
 
         switch (outcome)
@@ -1364,7 +1369,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("pr_reopen", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -1377,32 +1382,32 @@ internal static class Program
             switch (st)
             {
                 case 200:
-                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "approved", consent: "hello", result: "executed");
+                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "approved", consent: TokenStore.ConsentChannel, result: "executed");
                     Messages.Write(Messages.Success("pr_reopen", target, 200, $"https://github.com/{repo}/pull/{number}"));
                     return ExitCodes.Success;
                 case 401:
-                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "credential_expired", consent: TokenStore.ConsentChannel, result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
                 default:
                     // 403（无 Pull requests 写权限）/ 404（批准期间被删）/ 422（已开放/已合并/head 已删）——透传服务端原话
                     Audit.Append("pr_reopen", repo, $"#{number}", sha,
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "pr_reopen_rejected",
-                        consent: "hello", result: HttpDetail(st, body));
+                        consent: TokenStore.ConsentChannel, result: HttpDetail(st, body));
                     Messages.Write(Messages.PrReopenRejected(target, HttpDetail(st, body)));
                     return ExitCodes.BadRequest;
             }
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("pr_reopen", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
             // PATCH 非幂等（重开可能已生效）——诚实归 unknown，查证 PR state 后决定是否重发
-            Audit.Append("pr_reopen", repo, $"#{number}", sha, "unknown", consent: "hello", result: "timeout");
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "unknown", consent: TokenStore.ConsentChannel, result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
@@ -1473,8 +1478,12 @@ internal static class Program
             }
         }
         catch { /* 元数据读失败不阻塞批准流 */ }
-        if (metaSt == 404)
-            return ErrBad($"#{number} 不存在（HTTP 404）——核对编号；列出 issue：sluice api repos/{repo}/issues?state=open");
+        // v2.8（2026-10-31 评审 A）：匿名 404 不再断言"不存在"——私有库对匿名 GET 同样 404，
+        // 两者不可区分（同 pr_reopen 降级）。且 issues API 对 PR 编号同样应答——404 降级后
+        // "是不是 PR"的类型守卫一并失效，警示行须说破：关到 PR 编号上就是关 PR。
+        var warn404 = metaSt == 404
+            ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——若实为 PR 编号，本操作将关闭该 PR（类型未验证）；存在性由服务端执行时判定"
+            : "";
         if (isPr)
             return ErrBad($"#{number} 是 PR 不是 issue——PR 的生命周期走 pr merge / pr reopen / branch delete，不走 issue close；本次未产生任何副作用");
         if (issueState == "closed")
@@ -1488,7 +1497,7 @@ internal static class Program
             关闭 issue：{target}
             标题：{issueTitle ?? "（元数据不可读：私有库或网络原因，关闭前请自行核对）"}
             当前状态：{issueState ?? "（不可读）"} → 关闭（closed）
-            评论（如需留证请先单独用 sluice comment 发出）不在本操作范围内。
+            评论（如需留证请先单独用 sluice comment 发出）不在本操作范围内。{warn404}
             """;
 
         Gate.Outcome outcome;
@@ -1496,7 +1505,8 @@ internal static class Program
         {
             outcome = Gate.Run(new Gate.Request("issue_close", repo, $"#{number}", window, sha,
                 TokenStore.PeekChallenge(),
-                issueTitle is null ? "issue 元数据不可读，关闭对象请自行核对" : null));
+                metaSt == 404 ? "匿名预读 404：编号不存在或私有库匿名不可见（可能是 PR 编号），由服务端执行时终判"
+                    : issueTitle is null ? "issue 元数据不可读，关闭对象请自行核对" : null));
         }
 
         switch (outcome)
@@ -1535,7 +1545,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("issue_close", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("issue_close", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -1548,32 +1558,32 @@ internal static class Program
             switch (st)
             {
                 case 200:
-                    Audit.Append("issue_close", repo, $"#{number}", sha, "approved", consent: "hello", result: "executed");
+                    Audit.Append("issue_close", repo, $"#{number}", sha, "approved", consent: TokenStore.ConsentChannel, result: "executed");
                     Messages.Write(Messages.Success("issue_close", target, 200, $"https://github.com/{repo}/issues/{number}"));
                     return ExitCodes.Success;
                 case 401:
-                    Audit.Append("issue_close", repo, $"#{number}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Audit.Append("issue_close", repo, $"#{number}", sha, "credential_expired", consent: TokenStore.ConsentChannel, result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
                 default:
                     // 403（无 Issues 写权限）/ 404（批准期间被删）/ 422（含 PR 编号误用透传）——服务端原话
                     Audit.Append("issue_close", repo, $"#{number}", sha,
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "issue_close_rejected",
-                        consent: "hello", result: HttpDetail(st, body));
+                        consent: TokenStore.ConsentChannel, result: HttpDetail(st, body));
                     Messages.Write(Messages.IssueCloseRejected(target, HttpDetail(st, body)));
                     return ExitCodes.BadRequest;
             }
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("issue_close", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("issue_close", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
             // PATCH 非幂等（关闭可能已生效）——诚实归 unknown，查证 issue state 后决定是否重发
-            Audit.Append("issue_close", repo, $"#{number}", sha, "unknown", consent: "hello", result: "timeout");
+            Audit.Append("issue_close", repo, $"#{number}", sha, "unknown", consent: TokenStore.ConsentChannel, result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
@@ -1693,7 +1703,7 @@ internal static class Program
         try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
-            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
             return ExitCodes.Internal;
         }
@@ -1709,41 +1719,41 @@ internal static class Program
             switch (st)
             {
                 case 204:
-                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "approved", consent: "hello", result: "executed");
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "approved", consent: TokenStore.ConsentChannel, result: "executed");
                     Messages.Write(Messages.WorkflowDispatched(repo, workflow, @ref));
                     return ExitCodes.Success;
                 case 401:
-                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "credential_expired", consent: TokenStore.ConsentChannel, result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
                 case 403:
                     // fine-grained PAT 缺 Actions: Read and write——用户动作可修，专属指引（勿归凭据过期死路）
-                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "forbidden", consent: "hello",
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "forbidden", consent: TokenStore.ConsentChannel,
                         result: HttpDetail(st, rbody));
                     Messages.Write(Messages.DispatchForbidden(repo, workflow, HttpDetail(st, rbody)));
                     return ExitCodes.BadRequest;
                 case 404:
-                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "not_found", consent: "hello",
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "not_found", consent: TokenStore.ConsentChannel,
                         result: "http_404");
                     Messages.Write(Messages.DispatchNotFound(repo, workflow));
                     return ExitCodes.BadRequest;
                 default:
                     Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "workflow_dispatch_rejected",
-                        consent: "hello", result: HttpDetail(st, rbody));
+                        consent: TokenStore.ConsentChannel, result: HttpDetail(st, rbody));
                     Messages.Write(Messages.DispatchRejected(HttpDetail(st, rbody)));
                     return ExitCodes.BadRequest;
             }
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
         catch (TaskCanceledException)
         {
             // 触发非幂等（可能已受理——重发 = 重复 run）——诚实归 unknown，先查 runs 再决定
-            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "unknown", consent: "hello", result: "timeout");
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "unknown", consent: TokenStore.ConsentChannel, result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }
@@ -1751,14 +1761,14 @@ internal static class Program
 
     private static int Created(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "approved", consent: "hello", result: $"executed:{r.Url}");
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "approved", consent: TokenStore.ConsentChannel, result: $"executed:{r.Url}");
         Messages.Write(Messages.Success("pr_comment", $"{repo}#{number}", 201, r.Url!));
         return ExitCodes.Success;
     }
 
     private static int Expired(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "credential_expired", consent: "hello",
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "credential_expired", consent: TokenStore.ConsentChannel,
             result: $"http_{r.Status}");
         Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
         return ExitCodes.CredentialExpired;
@@ -1766,14 +1776,14 @@ internal static class Program
 
     private static int NotSent(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
         Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
         return ExitCodes.HttpFailed;
     }
 
     private static int UnknownOutcome(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "unknown", consent: "hello",
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "unknown", consent: TokenStore.ConsentChannel,
             result: $"unknown:{r.Reason}");
         Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
         return ExitCodes.Unknown;
@@ -1781,7 +1791,7 @@ internal static class Program
 
     private static int InternalPost(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "internal", consent: "hello",
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "internal", consent: TokenStore.ConsentChannel,
             result: $"http_{r.Status}");
         Messages.Write(Messages.Internal(afterExecutionStarted: true));
         return ExitCodes.Internal;

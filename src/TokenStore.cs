@@ -95,6 +95,16 @@ internal static class TokenStore
     private static readonly byte[] MagicV2 = "SLCV2"u8.ToArray();
     private static readonly byte[] DpapiEntropy = "sluice-dpapi-vault-v2"u8.ToArray();
 
+    /// <summary>进程启动时的 vault 形态快照（字段初始化在类型首次触及时运行——每个写动词都在
+    /// 门控前触 TokenStore.Exists，必然早于任何批准/迁移）。**不能在落笔时读磁盘**：运行中
+    /// V1→V2 迁移发生在批准之后，迁移当次的批准事件仍是 Hello——audit 保真（2026-10-31 评审 B）。</summary>
+    private static readonly bool StartedAsDpapi = File.Exists(VaultPath) && IsDpapiVault;
+
+    /// <summary>本次批准事件的通道：SLCV2 静默 vault=桌面点击，V1 vault=Windows Hello。
+    /// §14 L1 让步（hello:false）入册后，"这次批准是生物事件还是点击"是审计唯一可事后
+    /// 区分的维度——consent 字段按此记 click/hello。</summary>
+    public static string ConsentChannel => StartedAsDpapi ? "click" : "hello";
+
     /// <summary>当前 vault 是否为静默（DPAPI）格式——决定批准后是否还需 Hello。</summary>
     public static bool IsDpapiVault
     {
@@ -109,11 +119,29 @@ internal static class TokenStore
         }
     }
 
+    /// <summary>SLCV2 唯一写者（setup 直存与 V1→V2 迁移共用）：覆盖唯一凭据文件必须先验证再替换
+    /// （v2.7 迁移路径实弹教训，v2.8 扩展到 setup 路径——写一半崩溃即损唯一凭据）：
+    /// 写临时文件 → 回读解密比对（布局/熵/DPAPI 全链路实证，不靠推断）→ 原子替换。
+    /// 任何一步失败保留原文件——迁移失败下次批准重试，vault 不因迁移而丢。</summary>
     public static void SaveDpapi(string pat)
     {
-        var blob = DpapiProtect(System.Text.Encoding.UTF8.GetBytes(pat), DpapiEntropy);
         Directory.CreateDirectory(Path.GetDirectoryName(VaultPath)!);
-        File.WriteAllBytes(VaultPath, [.. MagicV2, .. blob]);
+        var tmp = VaultPath + ".new";
+        try
+        {
+            var blob = DpapiProtect(System.Text.Encoding.UTF8.GetBytes(pat), DpapiEntropy);
+            File.WriteAllBytes(tmp, [.. MagicV2, .. blob]);
+            var b = File.ReadAllBytes(tmp);
+            if (b.Length <= 5 || !b.AsSpan(0, 5).SequenceEqual(MagicV2))
+                throw new InvalidDataException("vault 布局校验失败");
+            if (System.Text.Encoding.UTF8.GetString(DpapiUnprotect(b[5..], DpapiEntropy)) != pat)
+                throw new InvalidDataException("vault 回读比对失败");
+            File.Move(tmp, VaultPath, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* 清理尽力而为 */ }
+        }
     }
 
     private static string LoadDpapi()
@@ -206,7 +234,7 @@ internal static class TokenStore
         {
             try
             {
-                MigrateToDpapi(token);
+                SaveDpapi(token);
                 Console.Error.WriteLine("[Sluice] vault 已迁移为静默格式（config hello:false）——后续批准不再需要 Windows Hello。");
             }
             catch (Exception ex)
@@ -215,29 +243,5 @@ internal static class TokenStore
             }
         }
         return token;
-    }
-
-    /// <summary>迁移 = 覆盖唯一凭据文件，必须先验证再替换（v2.7 加固，92e902e 实弹教训）：
-    /// 写临时文件 → 回读解密比对（布局/熵/DPAPI 全链路实证，不靠推断）→ 原子替换。
-    /// 任何一步失败保留 V1 原文件——下次批准重试迁移，vault 不因迁移而丢。</summary>
-    private static void MigrateToDpapi(string token)
-    {
-        var tmp = VaultPath + ".migrate";
-        try
-        {
-            var blob = DpapiProtect(System.Text.Encoding.UTF8.GetBytes(token), DpapiEntropy);
-            File.WriteAllBytes(tmp, [.. MagicV2, .. blob]);
-            var b = File.ReadAllBytes(tmp);
-            if (b.Length <= 5 || !b.AsSpan(0, 5).SequenceEqual(MagicV2))
-                throw new InvalidDataException("迁移文件布局校验失败");
-            var roundTrip = System.Text.Encoding.UTF8.GetString(DpapiUnprotect(b[5..], DpapiEntropy));
-            if (roundTrip != token)
-                throw new InvalidDataException("迁移回读比对失败");
-            File.Move(tmp, VaultPath, overwrite: true);
-        }
-        finally
-        {
-            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* 清理尽力而为 */ }
-        }
     }
 }

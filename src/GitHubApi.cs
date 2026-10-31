@@ -341,7 +341,10 @@ internal static class GitHubApi
                     if (IsGithubApiOrCdnHost(host))
                     {
                         url = next;
-                        token = null; // CDN 签名 URL 自带授权
+                        // CDN 签名 URL 自带授权，多余的 Authorization 反而可能被拒；但同域 api.github.com
+                        // 跳转保留 token——否则下一跳变匿名 401/404（2026-10-31 评审 D；GitHub 现网
+                        // 这组端点不做同域 302，属正确性兜底而非实测行为）
+                        if (host != "api.github.com") token = null;
                         continue;
                     }
                     return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false,
