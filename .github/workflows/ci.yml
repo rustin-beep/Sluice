@@ -1,0 +1,60 @@
+# CI 防线（plan-lite v2.15 §13）：selftest 全离线纯函数——消息表穷举 / exit→retry 函数性 /
+# 面一致锁（§9 ↔ CLI 写动词表 ↔ MCP actions）/ push 逻辑锁。不碰 vault、不弹 gate、
+# 不打真 API，runner 可直接跑；红线不变——live 行为（vault/302/真 API）仍靠人工 dogfood。
+# exe 用 find 定位而非硬编码 TFM 路径：TFM/RID 变更不破 CI。
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # PR + master：快反馈（~2min）。面一致锁按文档实文核对——checkout 内 plan-lite.md
+  # 在 exe 向上 ≤4 级可达（bin/Release/<tfm>/ → 仓根 3 级）。
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet build -c Release
+      - name: selftest (JIT)
+        shell: bash
+        run: |
+          exe="$(find bin/Release -name sluice.exe | head -1)"
+          [ -n "$exe" ] || { echo "!! 未找到 sluice.exe"; exit 1; }
+          "$exe" selftest
+
+  # master 专属：AOT 是发布形态，"每批 selftest PASS JIT+AOT"双跑纪律由此自动化；
+  # 戳校验锁"干净 checkout 必出干净戳"（sha 对 HEAD、不带 +dirty）——构建戳对齐
+  # 从人眼核对（v2.5 滞后 v2.6 曾漏）转为机械断言。
+  aot:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet publish -c Release -r win-x64
+      - name: 戳校验 + selftest (AOT)
+        shell: bash
+        run: |
+          exe="$(find bin/Release -path '*publish*' -name sluice.exe | head -1)"
+          [ -n "$exe" ] || { echo "!! 未找到 AOT sluice.exe"; exit 1; }
+          out="$("$exe" --version)"
+          echo "$out"
+          sha="${GITHUB_SHA::8}"
+          echo "$out" | grep -q "git $sha" || { echo "!! 戳 sha 不符：期望 git $sha"; exit 1; }
+          if echo "$out" | grep -q '+dirty'; then echo "!! 干净 checkout 构出脏戳"; exit 1; fi
+          # 版本对齐：--version 自报的 plan-lite 版本须与文档版本行一致
+          # （v2.5 滞后 v2.6 曾靠人眼评审抓到——从此 CI 断言）
+          docv="$(grep -m1 -oE 'v2\.[0-9]+-lite' plan-lite.md | sed 's/-lite//')"
+          [ -n "$docv" ] || { echo "!! plan-lite.md 版本行解析失败"; exit 1; }
+          echo "$out" | grep -q "plan-lite $docv" || { echo "!! --version 版本滞后：文档已是 $docv"; exit 1; }
+          "$exe" selftest
