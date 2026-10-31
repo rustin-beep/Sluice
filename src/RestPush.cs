@@ -18,7 +18,7 @@ internal static class RestPush
         bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null,
         string? ReplacingSha = null); // ReplacingSha：重放入窗的 origin/{branch} 旧头（非 null 即重放模式，§9.6）
 
-    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved }
+    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved }
 
     public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null);
 
@@ -37,7 +37,14 @@ internal static class RestPush
         {
             baseSha = Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
             if (baseSha.Length < 40 || !GitIsAncestor(repoPath, baseSha, head))
-                throw new LocalPlanException($"--base {baseRef} 不是 HEAD 的祖先提交，无法作为增量基点");
+            {
+                // v2.10（2026-10-31 实战）：泛化提示逼 agent 自诊——两次踩的是同一个真实原因
+                // （远端基点已前进而本地引用未更新），点名正解即可自救
+                var fix = baseRef.StartsWith("origin/", StringComparison.Ordinal)
+                    ? $"\n最常见原因：远端 {baseRef} 已前进而本地引用未更新。修正：git fetch origin {baseRef["origin/".Length..]} 后 git rebase {baseRef}，再以 --base {baseRef} 重跑同一命令（目标分支已存在于远端时将走重放式更新通道，弹窗明示替换与丢弃清单）"
+                    : "";
+                throw new LocalPlanException($"--base {baseRef} 不是 HEAD 的祖先提交，无法作为增量基点。{fix}");
+            }
             if (hasTracking)
                 // --base + 已有远端分支 = 显式请求重放（原地替换旧头，PR 不换分支；§9.6 闸门①）。
                 // 裸 force（--force 参数）仍永禁——重放必须以"声明新基点"的形式表达
@@ -173,6 +180,13 @@ internal static class RestPush
             isNew = false;
         }
 
+        // 重放前置缺口（v2.10，2026-10-31 实战定案）：--base 已声明 + 远端分支已存在，但规划期
+        // 本地无 origin/{branch} 引用（ReplacingSha=null，弹窗按"新建分支"入窗）——丢弃清单 =
+        // rev-list HEAD..origin/{branch} 需要本地对象，闸门③销毁侧披露构造不出来。fail-closed
+        // 拒执行并点名 fetch；此处落 FF/NonFF 分流会开出"加 --base 重跑"这条已满足的死指令
+        if (plan.Base is not null && !isNew && plan.ReplacingSha is null)
+            return new(PushResult.ReplayUnresolved, Reason: "远端分支已存在但规划期无本地引用");
+
         // 重放式更新保真复核（§9.6 闸门④，pr_merge T5 同族手法）：规划期旧头入窗，执行前比对
         // 实况——批准到执行间远端头被推进（或分支被删）时，静默 force 会孤儿化窗口外的新提交。
         // fail-closed：fetch 后重跑即重新弹窗。残余窗口（GET→PATCH 之间）与 pr_merge 复核一致。
@@ -187,7 +201,8 @@ internal static class RestPush
         }
         var replay = !isNew && plan.ReplacingSha is not null;
 
-        // 快进校验（以本地对象库为准，fail-closed）；重放模式另行分流（闸门①：NonFF 判定不放宽，只分流）
+        // 快进校验（以本地对象库为准，fail-closed）；重放模式另行分流（闸门①：NonFF 判定不放宽，只分流；
+        // v2.10：--base+远端已存在+无本地引用已被上方 ReplayUnresolved 前置拦截——本分流内 NonFF 必然未声明 --base）
         string range;
         if (replay)
         {

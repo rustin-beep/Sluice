@@ -32,6 +32,7 @@ internal static class McpServer
         ExitCodes.BadRequest        => "after_fix",
         ExitCodes.HttpFailed        => "retry_ok",
         ExitCodes.Unknown           => "wait_user",
+        ExitCodes.RateLimitWait     => "wait_until",
         _ => "wait_user", // 表外 code = 契约破裂，fail-safe 交回用户
     };
 

@@ -21,6 +21,7 @@ internal static class ExitCodes
     public const int BadRequest = 10;
     public const int HttpFailed = 20;
     public const int Unknown = 21;
+    public const int RateLimitWait = 22;
 }
 
 internal static class Messages
@@ -32,6 +33,18 @@ internal static class Messages
         已完成：{op} → {target}（HTTP {httpCode}）
         结果：{url}
         操作已生效，无需再用其他命令验证。
+        """,
+        ExitCodes.Success, "—", false);
+
+    // ---- push 成功（exit 0；v2.10：REST 推送不回写本地 origin/{branch} 引用——成功消息必附
+    //      fetch 提示，掐掉"首次成功 → rebase → 再推必踩 NonFF/ReplayUnresolved"这条确定性路径） ----
+    public static Msg PushDone(string repo, string branch, string newSha, bool replay) => new(
+        "[Sluice]",
+        $"""
+        已完成：push → {repo}@{branch}（HTTP 200{(replay ? "，重放式更新" : "")}）
+        结果：https://github.com/{repo}/commit/{newSha}
+        注意：本地 origin/{branch} 未更新（REST 推送不回写本地引用）——后续 rebase / 重推同分支前先 git fetch origin {branch}。
+        操作已在远端生效，无需再用其他命令验证。
         """,
         ExitCodes.Success, "—", false);
 
@@ -210,6 +223,30 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- api 403 匿名配额耗尽（exit 10，retry=after_fix；v2.10：原实现 403 一律归"资源需要
+    //      认证（私有或受限）"——诊断分类 bug，配额与仓库可见性无关。2026-10-31 实测
+    //      "API rate limit exceeded for <ip>" 被误报为私有，逼 agent 换路） ----
+    public static Msg ApiRateLimitedAnon(string path, int st) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → HTTP {st}：匿名读配额耗尽（GitHub rate limit），与仓库是否私有无关。
+        本次未产生任何副作用（响应体已输出到 stdout）。
+        修正：加 --auth 参数重新运行同一命令——认证请求走独立且更高的配额，不受匿名额度影响。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- api 403 限流·等待档（exit 22，retry=wait_until；v2.10：带 token 的 primary 耗尽与
+    //      secondary/abuse 拦截原归 credential_expired，把"等 N 分钟"开成"重新 setup"死方子。
+    //      exit 22 新档：v2.9 函数性不变量下 wait_until 不能寄生在 20（retry_ok）上——selftest 当场拦下） ----
+    public static Msg ApiRateLimitedWait(string path, int st, string what) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → HTTP {st}：GitHub 限流（{what}）——凭据与权限均无问题，不要重新 setup、不要换路径绕行。
+        本次未产生任何副作用（响应体已输出到 stdout）。
+        修正：按上述窗口等待后重新运行同一命令；期间不要密集重试（会延长拦截）。
+        """,
+        ExitCodes.RateLimitWait, "wait_until", true);
+
     // 其余非 2xx（404/429/…）：HTTP 层面已应答，事实在响应体
     public static Msg ApiHttpError(string path, int st, int bytes) => new(
         "[Sluice]",
@@ -335,6 +372,20 @@ internal static class Messages
         若你已把分支 rebase 到新基点（如更新后的主干）、需原地更新同一 PR：加 --base origin/<新基点> 重跑同一命令，
         走重放式更新通道——弹窗明示旧头→新头与丢弃的远端提交清单，批准后替换。
         注意：--force 参数与任何未声明 --base 的覆盖推送仍被策略永禁。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push 重放前置缺口（exit 10，retry=after_fix；v2.10 §9.6 闸门⑤。2026-10-31 实战：
+    //      worktree 新建分支首推成功（REST 不回写本地引用）→ rebase 后带 --base 重推 →
+    //      规划期无 origin/{branch} 未入重放 → 静默落 NonFF，开出"加 --base"这条已满足的死指令。
+    //      丢弃清单需要本地对象，fetch 是销毁侧披露的价格——正解唯一且 agent 可自行完成） ----
+    public static Msg PushReplayUnresolved(string repo, string branch) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：远端 {repo}@{branch} 已存在且已声明 --base，但本地没有 origin/{branch} 引用——规划期按"新建分支"入窗，与远端现状不符；丢弃的远端提交清单需要本地对象，无法构造重放披露。
+        本次未产生任何副作用（GitHub 上没有产生任何变更）。
+        修正：git fetch origin {branch} 后重新运行同一命令（--base 保持不变）——届时走重放式更新通道，弹窗明示旧头→新头与丢弃清单，批准后替换。
+        背景：REST 推送不回写本地 origin/{branch} 引用，首次推送成功后本地引用仍缺——属预期路径而非异常。
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
@@ -479,6 +530,10 @@ internal static class Messages
         ("dispatchnotfound", DispatchNotFound("rustin-beep/Vitro", "noci.yml")),
         ("dispatchrejected", DispatchRejected("HTTP 422：Reference does not exist")),
         ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / *.githubusercontent.com）")),
+        ("pushdone", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false)),
+        ("replayunresolved", PushReplayUnresolved("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2")),
+        ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
+        ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
     ];
 
     public static void Write(Msg m)

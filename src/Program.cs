@@ -115,7 +115,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.9");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.10");
         return 0;
     }
 
@@ -325,6 +325,11 @@ internal static class Program
             // 与 HeadMoved / PrMergeChanged 同族——静默 force 会孤儿化窗口外的新提交
             RestPush.PushResult.RemoteMoved => PushFail(plan, "remote_moved",
                 Messages.PushRemoteMoved(plan.Repo, plan.Branch, r.Reason ?? "远端头已变化"), ExitCodes.BadRequest, r.Reason),
+            // 重放前置缺口（v2.10 §9.6 闸门⑤）：--base 已声明 + 远端分支已存在 + 规划期本地无
+            // origin/{branch}（REST 推送不回写本地引用）——丢弃清单需要本地对象，fail-closed 点名
+            // fetch；不落 NonFF（那会开出"加 --base"这条已满足的死指令，2026-10-31 实战绕圈根源）
+            RestPush.PushResult.ReplayUnresolved => PushFail(plan, "replay_unresolved",
+                Messages.PushReplayUnresolved(plan.Repo, plan.Branch), ExitCodes.BadRequest, r.Reason),
             _ => PushFail(plan, "other", Messages.Internal(afterExecutionStarted: true), ExitCodes.Internal, r.Reason),
         };
     }
@@ -343,8 +348,10 @@ internal static class Program
             result: plan.ReplacingSha is string old
                 ? $"executed:{r.NewSha}（重放替换 {old[..8]}）"
                 : $"executed:{r.NewSha}");
-        Messages.Write(Messages.Success("push", $"{plan.Repo}@{plan.Branch}", 200,
-            $"https://github.com/{plan.Repo}/commit/{r.NewSha}"));
+        // v2.10：换 PushDone 专属模板——REST 推送不回写本地 origin/{branch} 引用，成功消息
+        // 必附 fetch 提示（否则"首次成功 → rebase → 再推必踩"是隐形确定性路径）
+        // NewSha 兜底 HeadSha：Done 路径服务端必回 sha，兜底仅为可空性收口（内容寻址，二者同物）
+        Messages.Write(Messages.PushDone(plan.Repo, plan.Branch, r.NewSha ?? plan.HeadSha, plan.ReplacingSha is not null));
         return ExitCodes.Success;
     }
 
@@ -621,6 +628,24 @@ internal static class Program
                 Messages.Write(Messages.ApiRedirected(path, reason ?? "域外重定向"));
                 return ExitCodes.BadRequest;
             case 401 or 403:
+                // 403 限流嗅探（v2.10，2026-10-31 实战）：GitHub 对匿名配额耗尽与 secondary/abuse
+                // 拦截都回 403——与"私有/凭据失效"混流会开死方子（匿名限流被报成"仓库私有"、
+                // secondary 的等待分钟数就在 body 里却被开成"重新 setup"）
+                if (st == 403 && GitHubApi.ParseRateLimit(body) is { } rl)
+                {
+                    if (token is null && rl.Primary)
+                    {
+                        Messages.Write(Messages.ApiRateLimitedAnon(path, st));
+                        return ExitCodes.BadRequest;
+                    }
+                    var what = rl.Primary
+                        ? "配额（rate limit）耗尽，等待当前配额窗重置（约 1 小时内）"
+                        : rl.WaitMinutes is int m
+                            ? $"secondary rate limit，服务端要求等待约 {m} 分钟"
+                            : "secondary rate limit / 滥用检测拦截，等待数分钟";
+                    Messages.Write(Messages.ApiRateLimitedWait(path, st, what));
+                    return ExitCodes.RateLimitWait;
+                }
                 // 匿名：资源需要认证，加 --auth 是 agent 可自行完成的修正（after_fix）；
                 // 带 token：凭据真的失效/越权，才归 credential_expired（wait_user，交还用户）
                 if (token is null)

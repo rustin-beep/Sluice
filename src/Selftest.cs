@@ -42,6 +42,10 @@ internal static class Selftest
         ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
         ("dispatchrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：ref/inputs 校验拒
         ("apiredirected",     ExitCodes.BadRequest, "after_fix"), // v2.7：域外重定向不跟随，明说去向
+        ("pushdone",        ExitCodes.Success,      "—"),          // v2.10：push 成功附"本地引用不回写"提示
+        ("replayunresolved",ExitCodes.BadRequest,   "after_fix"),  // v2.10：--base+远端已存在+无本地引用 → fetch 后原命令重跑
+        ("apirateanon",     ExitCodes.BadRequest,   "after_fix"),  // v2.10：匿名配额耗尽 ≠ 私有，加 --auth 走独立配额
+        ("apiratewait",     ExitCodes.RateLimitWait, "wait_until"), // v2.10：限流等待 ≠ 凭据失效（exit 22 新档——wait_until 不寄生 20/retry_ok，函数性）
     ];
 
     private static readonly HashSet<string> ValidRetry =

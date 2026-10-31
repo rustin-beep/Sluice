@@ -304,6 +304,25 @@ internal static class GitHubApi
         catch { return ""; }
     }
 
+    /// <summary>GitHub 403 限流识别（v2.10，2026-10-31 实战）：GitHub 对匿名配额耗尽与
+    /// secondary/abuse 拦截都回 403——与"私有/凭据失效"混流会开死方子。primary body 为
+    /// "API rate limit exceeded for &lt;ip&gt;"（重置时刻只在响应头 x-ratelimit-reset，
+    /// SendRawAsync 不回 headers，首版不取）；secondary/abuse 为 "exceeded a secondary
+    /// rate limit" / "abuse detection mechanism"，body 自带 "wait N minutes"。非限流返回 null。</summary>
+    internal static (bool Primary, int? WaitMinutes)? ParseRateLimit(string? body)
+    {
+        if (string.IsNullOrEmpty(body)) return null;
+        var msg = MessageOfBody(body);
+        if (msg.Length == 0) return null;
+        var primary = msg.Contains("API rate limit exceeded", StringComparison.OrdinalIgnoreCase);
+        var secondary = msg.Contains("secondary rate limit", StringComparison.OrdinalIgnoreCase)
+                     || msg.Contains("abuse detection mechanism", StringComparison.OrdinalIgnoreCase);
+        if (!primary && !secondary) return null;
+        var m = System.Text.RegularExpressions.Regex.Match(msg, @"wait (\d+) minutes?",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return (primary, m.Success ? int.Parse(m.Groups[1].Value) : null);
+    }
+
     /// <summary>分支名 → refs URL 路径段（逐段 percent-encode）。分支名是自由字符（git 引用语法
     /// 允许 # ? 空格等），裸拼 URL 时 # 截成 fragment、? 截成 query（2026-10-30 评审）。
     /// POST refs 的 ref 名走 JSON body，不经过此函数——body 里要的是字面分支名。</summary>
