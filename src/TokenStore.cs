@@ -26,9 +26,13 @@ internal static class TokenStore
         return new VaultParams(salt, challenge);
     }
 
-    /// <summary>读回 token.bin 中存的挑战（弹批准窗前取，批准时签名用）。</summary>
+    /// <summary>读回 token.bin 中存的挑战（弹批准窗前取，批准时签名用）。
+    /// SLCV2 无 Hello 无挑战——返回空数组（GateWindow 静默批准路径不消费挑战）。
+    /// v2.7 实弹修复：92e902e 只改了批准后路径，漏了这里——迁移后写动词在 Gate.Request
+    /// 构造期撞 ReadFile 的 V1 magic 校验，InvalidDataException 在弹窗前即崩（首个迁移实弹暴露）。</summary>
     public static byte[] PeekChallenge()
     {
+        if (IsDpapiVault) return [];
         var (p, _) = ReadFile();
         return p.Challenge;
     }
@@ -202,7 +206,7 @@ internal static class TokenStore
         {
             try
             {
-                SaveDpapi(token);
+                MigrateToDpapi(token);
                 Console.Error.WriteLine("[Sluice] vault 已迁移为静默格式（config hello:false）——后续批准不再需要 Windows Hello。");
             }
             catch (Exception ex)
@@ -211,5 +215,29 @@ internal static class TokenStore
             }
         }
         return token;
+    }
+
+    /// <summary>迁移 = 覆盖唯一凭据文件，必须先验证再替换（v2.7 加固，92e902e 实弹教训）：
+    /// 写临时文件 → 回读解密比对（布局/熵/DPAPI 全链路实证，不靠推断）→ 原子替换。
+    /// 任何一步失败保留 V1 原文件——下次批准重试迁移，vault 不因迁移而丢。</summary>
+    private static void MigrateToDpapi(string token)
+    {
+        var tmp = VaultPath + ".migrate";
+        try
+        {
+            var blob = DpapiProtect(System.Text.Encoding.UTF8.GetBytes(token), DpapiEntropy);
+            File.WriteAllBytes(tmp, [.. MagicV2, .. blob]);
+            var b = File.ReadAllBytes(tmp);
+            if (b.Length <= 5 || !b.AsSpan(0, 5).SequenceEqual(MagicV2))
+                throw new InvalidDataException("迁移文件布局校验失败");
+            var roundTrip = System.Text.Encoding.UTF8.GetString(DpapiUnprotect(b[5..], DpapiEntropy));
+            if (roundTrip != token)
+                throw new InvalidDataException("迁移回读比对失败");
+            File.Move(tmp, VaultPath, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { /* 清理尽力而为 */ }
+        }
     }
 }

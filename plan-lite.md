@@ -142,7 +142,7 @@ agent 收到 stdout/stderr + exit code
 - 脆弱性注记：确定性依赖 PKCS1v15；若未来 Windows 更换填充方案，旧 vault 无法解密 → 恢复 = 重跑 setup 重贴 PAT。可接受。
 - P7b（NCRYPT_UI_POLICY 软件键）不再需要。
 - **静默 vault（SLCV2，config.json `"hello": false`；v2.7 正式采用——2026-10-31 owner 拍板，"试用后再定"落定）**：
-  owner 显式降级换免指纹体验：vault = DPAPI（crypt32 直调 `CryptProtectData/UnprotectData`，CurrentUser 作用域，零第三方依赖）包封，无 Hello 参与——**批准事件从生物特征降为桌面点击事件**；api `--auth` 认证读随之零交互。语义让步如实入册（§14 L1）：同用户进程可静默解密（回到 L1 级让步，owner 自选，2026-10-31 三枚指纹连弹后拍板）。InputFilter 注入拦截 / 倒计时 / seal / 审计全保留；旧 V1 vault 在下次批准或认证读时自动迁移（= 最后一次指纹，stderr 有提示，迁移失败不阻塞本次已批准的写）。**回滚 = config 改回 true 且重跑 setup**——SLCV2 下仅改回配置不恢复指纹（LoadApproved 先查 vault 形态再查配置）。
+  owner 显式降级换免指纹体验：vault = DPAPI（crypt32 直调 `CryptProtectData/UnprotectData`，CurrentUser 作用域，零第三方依赖）包封，无 Hello 参与——**批准事件从生物特征降为桌面点击事件**；api `--auth` 认证读随之零交互。语义让步如实入册（§14 L1）：同用户进程可静默解密（回到 L1 级让步，owner 自选，2026-10-31 三枚指纹连弹后拍板）。InputFilter 注入拦截 / 倒计时 / seal / 审计全保留；旧 V1 vault 在下次批准或认证读时自动迁移（= 最后一次指纹，stderr 有提示，迁移失败不阻塞本次已批准的写）。**回滚 = config 改回 true 且重跑 setup**——SLCV2 下仅改回配置不恢复指纹（LoadApproved 先查 vault 形态再查配置）。**v2.7 迁移实弹修复与加固（2026-10-31 首个迁移实弹暴露 92e902e 两处缺陷）**：①`PeekChallenge` 在 SLCV2 下返回空数组——挑战是 V1/Hello 专属概念，原实现无条件走 V1 布局校验，迁移后一切写动词在 `Gate.Request` 构造期即崩（弹窗都不出现，vault 本身无损——`api --auth` 静默读实测可解）；②迁移改「临时文件写入 → 回读解密比对 → 原子替换」，校验不过保留 V1——覆盖唯一凭据文件的动作必须先验证再替换。
 
 明确不做：内存加密、VirtualLock（可选 10 行加固，做不做不改变性质）。
 
