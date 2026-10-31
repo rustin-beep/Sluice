@@ -364,6 +364,82 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- pr reopen 被服务端拒绝（exit 10，retry=after_fix；403/404/422 透传服务端 message。
+    //      2026-10-31 Vitro 复盘 #2：PR 误关后只能开新 PR，讨论上下文断链——reopen 是正解，
+    //      也是 CI 卡死时比 workflow dispatch 更常用的补救（reopened 是 pull_request 默认触发 type）） ----
+    public static Msg PrReopenRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_reopen 被服务端拒绝（{detail}）。常见原因：PR 已是开放状态；head 分支已被删除；PR 已合并；token 无 Pull requests 写权限。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 已开放/已合并 → 使用既成状态，不要重跑本命令；
+        2. head 分支已删 → 先 push 重建同名分支（--base 给基点），再重跑本命令；
+        3. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth 读 state / head.ref / merged 字段。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- issue close 被服务端拒绝（exit 10，retry=after_fix；2026-10-31 Vitro 复盘 #3：
+    //      销案闭环——评论留证之后能落锤，不再"关闭等手动"） ----
+    public static Msg IssueCloseRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        issue_close 被服务端拒绝（{detail}）。常见原因：编号是 PR 而非 issue；token 无 Issues 写权限；编号不存在。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对编号与类型后重跑；PR 的生命周期走 pr merge / pr reopen / branch delete，不走 issue close。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- workflow dispatch 已受理（exit 0；HTTP 204 无响应体——受理即完成，run 创建是异步的） ----
+    public static Msg WorkflowDispatched(string repo, string wf, string rf) => new(
+        "[Sluice]",
+        $"""
+        已完成：workflow_dispatch → {repo} · {wf} @ {rf}（HTTP 204）
+        触发事件已受理，无需重发；run 通常数秒内创建（https://github.com/{repo}/actions）。
+        如需观察进度（非必须验证）：sluice api "repos/{repo}/actions/runs?event=workflow_dispatch&per_page=1" --auth。
+        """,
+        ExitCodes.Success, "—", false);
+
+    // ---- workflow dispatch 403（exit 10；fine-grained PAT 缺 Actions 写权限——用户动作，非 agent 可修） ----
+    public static Msg DispatchForbidden(string repo, string wf, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        workflow_dispatch 被服务端拒绝（{detail}）。最常见原因：fine-grained PAT 未开 Actions: Read and write 权限。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        请转告用户：GitHub → Settings → Developer settings → Fine-grained tokens → 该 token → Repository permissions →
+        Actions 设为 Read and write 并保存，然后重跑 sluice setup；不要自行获取或更换凭据。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- workflow dispatch 404（exit 10；workflow 不存在或未声明 dispatch 触发器） ----
+    public static Msg DispatchNotFound(string repo, string wf) => new(
+        "[Sluice·终态]",
+        $"""
+        workflow_dispatch 被服务端拒绝：{repo} 的 workflow "{wf}" 不存在，或其 on: 未声明 workflow_dispatch 触发器（HTTP 404）。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对 id/文件名：sluice api "repos/{repo}/actions/workflows"；再读该 workflow 文件确认 on: 块含 workflow_dispatch。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- workflow dispatch 422（exit 10；ref 不存在 / inputs 与声明不符） ----
+    public static Msg DispatchRejected(string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        workflow_dispatch 被服务端拒绝（{detail}）。常见原因：--ref 指向的分支/标签不存在；inputs 与 workflow 声明不匹配。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对 ref 与 inputs 后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- api 读通道遇到不可跟随的重定向（exit 10；跟随仅限 GitHub 域——这不是开放代理） ----
+    public static Msg ApiRedirected(string path, string detail) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → 重定向，且不可跟随（{detail}）。
+        本次未产生任何副作用（响应体已输出到 stdout）。sluice 仅跟随 api.github.com / *.githubusercontent.com 域内的重定向（≤3 跳）。
+        修正：此类资源请经浏览器或按响应体/Location 提示处理；不要尝试把绝对 URL 传给 sluice api。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- selftest 数据源：渲染全部消息样例 ----
     public static (string Name, Msg Sample)[] AllSamples() =>
     [
@@ -396,6 +472,13 @@ internal static class Messages
         ("nonff",  PushNonFF("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2", "b9a84c5b")),
         ("remotemoved", PushRemoteMoved("rustin-beep/Sluice", "feat/x", "批准期间远端头已变化（规划期 b9a84c5b → 现在 4d81e0c7），弹窗展示的替换对象已过期")),
         ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
+        ("prreopenrejected", PrReopenRejected("rustin-beep/Vitro#389", "HTTP 422：head branch was deleted")),
+        ("issuecloserejected", IssueCloseRejected("rustin-beep/Vitro#369", "HTTP 422：Can't close a pull request through the issues API")),
+        ("dispatched", WorkflowDispatched("rustin-beep/Vitro", "ci.yml", "master")),
+        ("dispatchforbidden", DispatchForbidden("rustin-beep/Vitro", "ci.yml", "HTTP 403：Resource not accessible by personal access token")),
+        ("dispatchnotfound", DispatchNotFound("rustin-beep/Vitro", "noci.yml")),
+        ("dispatchrejected", DispatchRejected("HTTP 422：Reference does not exist")),
+        ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / *.githubusercontent.com）")),
     ];
 
     public static void Write(Msg m)

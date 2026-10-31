@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.6-lite（v2.6：push 重放式更新通道——force 不变量从"永禁"改写为"唯一显式通道"（非主干分支 + `--base` 声明新基点 + 弹窗明示旧头→新头与丢弃清单 + 执行前远端头复核 RemoteMoved + audit 记 old→new），PR 分支可原地 rebase 更新、污染归零；裸 `--force` 参数与主干推送仍永禁；v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
-| 日期 | 2026-10-30 |
+| 文档版本 | v2.7-lite（v2.7：Vitro 复盘处置批——①`pr_reopen` / `issue_close` / `workflow_dispatch` 三 op 入列（**reopen 优先于 dispatch 作为 CI 补救**：reopened 是 pull_request 默认触发 type；dispatch 定性为运维便利而非"REST push 不触发 CI"的修复——该定论被 10-30 上午三次 synchronize 触发实证否定，当晚零 run 是 GitHub 平台故障窗，与同窗 4×blob-500 同源）②api 读通道 **3xx 受控跟随**（≤3 跳，仅 api.github.com / *.githubusercontent.com；DoH 直连同域扩展——logs 端点 302→CDN 签名 URL 从此可读；tarball 端点实测跟随后 200/9.7MB 落 stdout；域外重定向原样返回 + ApiRedirected 指引，不装开放代理）③**幂等对象创建 5xx 有界重试**（blob/tree/commit，2s/8s×3；批准覆盖一次执行，同对象重试不超范围；update-ref 永不自动重试）④**branch delete 弹窗披露连带关 PR**（静态警示行 + 尽力匿名预查 pulls?head= 命中列 PR 号；删 #389 head 时用户批前不知情）⑤**hello:false 正式采用**：SLCV2（DPAPI）静默 vault 不变量入册 §5/§14 L1——批准事件从生物特征降为桌面点击，同用户可静默解密=owner 显式选择的 L1 级让步；回滚须 hello:true+重跑 setup；⑥--version 戳对齐 v2.7（v2.5 滞后清账）；v2.6：push 重放式更新通道——force 不变量从"永禁"改写为"唯一显式通道"（非主干分支 + `--base` 声明新基点 + 弹窗明示旧头→新头与丢弃清单 + 执行前远端头复核 RemoteMoved + audit 记 old→new），PR 分支可原地 rebase 更新、污染归零；裸 `--force` 参数与主干推送仍永禁；v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 日期 | 2026-10-31 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
 | 目标平台 | Windows 10/11 x64（UI 与核心逻辑跨平台，Linux 为填空题，见 §1.5） |
@@ -141,6 +141,8 @@ agent 收到 stdout/stderr + exit code
 - **结论**：解锁 = 按指纹；批准因子与解密因子是同一次生物事件；静默解密路径被实测消灭（评审问题 1 落地，§1 措辞的"UI 门"成立）。
 - 脆弱性注记：确定性依赖 PKCS1v15；若未来 Windows 更换填充方案，旧 vault 无法解密 → 恢复 = 重跑 setup 重贴 PAT。可接受。
 - P7b（NCRYPT_UI_POLICY 软件键）不再需要。
+- **静默 vault（SLCV2，config.json `"hello": false`；v2.7 正式采用——2026-10-31 owner 拍板，"试用后再定"落定）**：
+  owner 显式降级换免指纹体验：vault = DPAPI（crypt32 直调 `CryptProtectData/UnprotectData`，CurrentUser 作用域，零第三方依赖）包封，无 Hello 参与——**批准事件从生物特征降为桌面点击事件**；api `--auth` 认证读随之零交互。语义让步如实入册（§14 L1）：同用户进程可静默解密（回到 L1 级让步，owner 自选，2026-10-31 三枚指纹连弹后拍板）。InputFilter 注入拦截 / 倒计时 / seal / 审计全保留；旧 V1 vault 在下次批准或认证读时自动迁移（= 最后一次指纹，stderr 有提示，迁移失败不阻塞本次已批准的写）。**回滚 = config 改回 true 且重跑 setup**——SLCV2 下仅改回配置不恢复指纹（LoadApproved 先查 vault 形态再查配置）。
 
 明确不做：内存加密、VirtualLock（可选 10 行加固，做不做不改变性质）。
 
@@ -206,6 +208,7 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 | **超时秒数可配**：config.json `gate_timeout_sec`（默认 60，夹 [30,600]）；剩 15s 提示音 + 闪任务栏（v2.4） | agent 同用户可改 config——改短只自伤（自动拒是安全侧）、改长不产生写动作，纯 UX 旋钮；召回给暂离用户一次回来机会 |
 | **pr_merge 弹窗带 head sha8，执行前复核**（v2.5） | 元数据是 fetch 时刻快照，批准→执行间 head 被推进则合并内容超出用户所见——与 push 的 HeadMoved 同族：sha 变了即中止（after_fix），重跑重新弹窗；批准指纹混入 head sha，审计行锚定"所见的是哪一版"；快照缺失（私有库匿名读失败）不阻断，弹窗已声明"请自行核对" |
 | **重放式更新弹窗明示替换内容**（v2.6，§9.6） | 「批准你所见」扩展到销毁侧：窗口顶部明示旧头→新头 + 丢弃清单（rev-list HEAD..origin/<B>，前 3 标题+总数）——feat 分支通常无服务端保护，本地闸门是唯一防线；执行前复核远端头（RemoteMoved） |
+| **branch delete 弹窗披露连带关 PR**（v2.7） | 删 PR head 分支 = 连带关闭该 PR，且重建同名分支**不会**恢复已关 PR——2026-10-30 Vitro 实战：删 #389 head 时用户批前不知情。静态警示行常驻弹窗；尽力匿名预查（`pulls?head=O:B&state=open`，读落审计）命中时列 PR 号与标题并红字提示（Warning 位）；预查失败（私有库/网络）不阻塞——静态行仍披露规则 |
 | 冷却：10 分钟内 3 次拒绝 → 全局冷却 10 分钟；冷却期内再试不弹窗、每次顺延 +5 分钟（上限 60） | 只能延长，做不到真阻止——封堵前提下"延长"已够；消息带绝对结束时间 |
 
 不承诺：窗口显示完整性（同用户可移动/遮挡，L3）。信任在 Hello，不在画面。
@@ -467,6 +470,60 @@ Avalonia 窗口（单对话框；Windows 端以 Win32 LL 钩子做 injected 输�
 ```
 （exit 10，retry=after_fix——v2.5 语义拆分：401 仍 9（凭据），403 归服务端策略拒）
 
+**V1.6 增补（v2.7，Vitro 复盘处置批——新 op 三族 + api 重定向）**：
+
+```
+[Sluice·终态] pr_reopen 被服务端拒绝（<服务端 message>）。常见原因：PR 已是开放状态；head 分支已被删除；PR 已合并；token 无 Pull requests 写权限。
+本次操作未执行，GitHub 上没有产生任何变更。
+1. 已开放/已合并 → 使用既成状态，不要重跑本命令；
+2. head 分支已删 → 先 push 重建同名分支（--base 给基点），再重跑本命令；
+3. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth 读 state / head.ref / merged 字段。
+```
+（exit 10，retry=after_fix——2026-10-31 Vitro 复盘 #2：PR 误关后只能开新 PR、讨论上下文断链；reopen 是正解，也是 CI 卡死时比 dispatch 更常用的补救——reopened 是 pull_request 默认触发 type）
+
+```
+[Sluice·终态] issue_close 被服务端拒绝（<服务端 message>）。常见原因：编号是 PR 而非 issue；token 无 Issues 写权限；编号不存在。
+本次操作未执行，GitHub 上没有产生任何变更。
+修正：核对编号与类型后重跑；PR 的生命周期走 pr merge / pr reopen / branch delete，不走 issue close。
+```
+（exit 10，retry=after_fix——复盘 #3：销案闭环，评论留证之后能落锤）
+
+```
+[Sluice] 已完成：workflow_dispatch → <R> · <W> @ <ref>（HTTP 204）
+触发事件已受理，无需重发；run 通常数秒内创建（https://github.com/<R>/actions）。
+如需观察进度（非必须验证）：sluice api "repos/<R>/actions/runs?event=workflow_dispatch&per_page=1" --auth。
+```
+（exit 0，retry=———204 无响应体，受理即完成；run 创建是异步的，观察是可选项不是验证义务）
+
+```
+[Sluice·终态] workflow_dispatch 被服务端拒绝（<服务端 message>）。最常见原因：fine-grained PAT 未开 Actions: Read and write 权限。
+本次操作未执行，GitHub 上没有产生任何变更。
+请转告用户：GitHub → Settings → Developer settings → Fine-grained tokens → 该 token → Repository permissions →
+Actions 设为 Read and write 并保存，然后重跑 sluice setup；不要自行获取或更换凭据。
+```
+（exit 10，retry=after_fix——403=权限矩阵问题，用户动作可修；勿归凭据过期(9)死路）
+
+```
+[Sluice·终态] workflow_dispatch 被服务端拒绝：<R> 的 workflow "<W>" 不存在，或其 on: 未声明 workflow_dispatch 触发器（HTTP 404）。
+本次操作未执行，GitHub 上没有产生任何变更。
+修正：核对 id/文件名：sluice api "repos/<R>/actions/workflows"；再读该 workflow 文件确认 on: 块含 workflow_dispatch。
+```
+（exit 10，retry=after_fix）
+
+```
+[Sluice·终态] workflow_dispatch 被服务端拒绝（<服务端 message>）。常见原因：--ref 指向的分支/标签不存在；inputs 与 workflow 声明不匹配。
+本次操作未执行，GitHub 上没有产生任何变更。
+修正：核对 ref 与 inputs 后重跑同一命令。
+```
+（exit 10，retry=after_fix）
+
+```
+[Sluice] api GET <path> → 重定向，且不可跟随（<去向与原因>）。
+本次未产生任何副作用（响应体已输出到 stdout）。sluice 仅跟随 api.github.com / *.githubusercontent.com 域内的重定向（≤3 跳）。
+修正：此类资源请经浏览器或按响应体/Location 提示处理；不要尝试把绝对 URL 传给 sluice api。
+```
+（exit 10，retry=after_fix——v2.7 受控跟随的边界侧：这不是开放代理，域外去向如实相告）
+
 ### 8.3 Exit code 表
 
 | code | 含义 | retry |
@@ -489,11 +546,13 @@ v2.4 注：push 非 ff 从 exit 4（policy_reject）移入 exit 10（after_fix�
 
 v2.6 注：重放式更新通道的 RemoteMoved 同归 exit 10（after_fix）——fetch 后重跑即重新弹窗；force 不变量改写见 §9.6（裸 `--force` 参数与主干推送仍 exit 4）。
 
+v2.7 注：新 op 的服务端拒绝（pr_reopen / issue_close / workflow_dispatch 的 403/404/422）与 api 域外重定向全部归 exit 10（after_fix——"修正后可重试"语义不变）；dispatch 受理归 0（204，受理即完成）。
+
 ### 8.4 AGENTS.md 片段（`sluice setup --install-snippet` 追加到工作区 AGENTS.md）
 
 ```markdown
 ## Sluice 规则（必须遵守）
-1. 一切 GitHub 写操作（评论/PR/评审/push）只能通过 `sluice` 命令执行；直接 git push / gh / curl 写 GitHub 会因无凭据失败。
+1. 一切 GitHub 写操作（评论 / PR 创建·合并·重开 / issue 关闭 / 评审 / push / workflow 手动触发）只能通过 `sluice` 命令执行；直接 git push / gh / curl 写 GitHub 会因无凭据失败。
 2. 输出中出现 `[Sluice·终态]`：这是最终结果。严格按消息内"要求"与 retry 语义执行；凡 retry=never / wait_user / wait_until / change_approach：禁止重试、禁止换方法、禁止尝试获取凭据或发起任何授权流程（含 gh auth login / device flow / 浏览器授权页）。
 3. 仅 retry=after_fix / retry=retry_ok 允许按消息说明修正或重试同一命令。
 4. 收到 seal_violation：把消息原文转告用户，暂停所有写操作。
@@ -511,9 +570,12 @@ v2.6 注：重放式更新通道的 RemoteMoved 同归 exit 10（after_fix）—
 | `pr_create` | `sluice pr create --repo R --base B --head H --title T --body-file F` | WinHTTP `POST /repos/{r}/pulls` | 仅 sluice 进程 |
 | `pr_review` | `sluice review --repo R --number N --event E [--body-file F]` | WinHTTP `POST /repos/{r}/pulls/{n}/reviews` | 仅 sluice 进程 |
 | `push` | `sluice push [--repo-path D] --remote R --refspec S` | 见下 push bridge | git 子进程内存（存活期） |
-| `api`（读，v2.2；V1 实现现状） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` `+` `,` `;` 查询字符——分页 cursor（base64 含 `+`）/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然）。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；其余非 2xx→10。响应体→stdout、消息→stderr（不污染数据）。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
+| `api`（读，v2.2；V1 实现现状；**v2.7 重定向跟随**） | `sluice api <api-path> [--auth]`（GET-only；graphql 未实现；路径白名单允许 `?` `&` `:` `+` `,` `;` 查询字符——分页 cursor（base64 含 `+`）/过滤可用，拒 `..`/scheme/前导 `/`） | GET，**无需批准**；匿名读无需 Hello，`--auth` 私有读需 Hello（vault 解密的技术必然；SLCV2 静默 vault 下零交互，§5）。**v2.7：3xx 受控跟随**——≤3 跳、仅 api.github.com / *.githubusercontent.com 域内（logs 等 actions 端点 302 到 CDN 签名 URL，不跟随则永远拿不到日志体——2026-10-30 实战 actions/jobs/{id}/logs http_failed ×8 空转的根治；tarball 端点实测跟随 200/9.7MB 落 stdout）；后续跳不带 Authorization（CDN 签名 URL 自带授权）；CDN 域同样走 DoH 直连 + issuer 校验（防线①随域扩展）；域外/超跳 → 原样返回 3xx + ApiRedirected（exit 10），**不装开放代理**。exit：2xx→0；超时→20（幂等，retry_ok）；匿名 401/403→10（加 --auth）；带 token 401/403→9；域外 3xx→10；其余非 2xx→10。响应体→stdout、消息→stderr。每次调用（路径+状态码+字节量）写 audit 读日志 | token 不出 sluice 进程 |
 | `pr_merge`（v2.4，PR 工作流闭环最后一米；v2.5 评审加固） | `sluice pr merge --repo R --number N [--method merge\|squash\|rebase] [--delete-head]` | PUT `/repos/{r}/pulls/{n}/merge`——**服务端执行，天然尊重分支保护与 required checks**；弹窗尽力展示匿名可读的 PR 元数据（title/head→base/变更统计 + head sha8）；**v2.5**：批准指纹混入 head sha、执行前带 token 复核 head sha，变了即中止（PrMergeChanged，与 push 的 HeadMoved 同族）；匿名元数据读入读审计（与 api 通道同纪律）；`--delete-head` 合并成功后删 head ref（**成败均落审计**；失败不回滚合并，附注指引 branch delete）。exit：200→0；401→9；403→10（PrMergeForbidden：保护/权限）；404→10（PrMergeNotFound）；405/409/422→10（PrMergeRejected，查 mergeable）；复核通道失败→20（retry_ok）；5xx/超时→21 | 仅 sluice 进程 |
-| `branch_delete`（v2.4，PR 作废后清残留；v2.5 评审加固） | `sluice branch delete --repo R --branch B` | DELETE `/repos/{r}/git/refs/heads/{b}`——**v2.5：b 逐段 percent-encode**（`#`/`?`/空格等合法分支名不再截断 URL，push 的 ref 路径同款）——删 ref 非销毁历史（commits 留在服务端，GC 窗口内可重建）；`main`/`master` tripwire（**v2.5 大小写不敏感**）→ policy_reject（exit 4）。exit：204→0；401→9；403→10（BranchDeleteForbidden：保护/权限，透传服务端 message）；404→10；超时→21（幂等但已送达，查证 refs） | 仅 sluice 进程 |
+| `branch_delete`（v2.4，PR 作废后清残留；v2.5 评审加固；**v2.7 连带披露**） | `sluice branch delete --repo R --branch B` | DELETE `/repos/{r}/git/refs/heads/{b}`——**v2.5：b 逐段 percent-encode**（`#`/`?`/空格等合法分支名不再截断 URL，push 的 ref 路径同款）——删 ref 非销毁历史（commits 留在服务端，GC 窗口内可重建）；`main`/`master` tripwire（**v2.5 大小写不敏感**）→ policy_reject（exit 4）；**v2.7：弹窗披露连带关 PR**（§7 规则行——静态警示行 + 尽力匿名预查命中列 PR 号）。exit：204→0；401→9；403→10（BranchDeleteForbidden：保护/权限，透传服务端 message）；404→10；超时→21（幂等但已送达，查证 refs） | 仅 sluice 进程 |
+| `pr_reopen`（v2.7，Vitro 复盘 #2：PR 断链的正解 + CI 首选补救） | `sluice pr reopen --repo R --number N` | PATCH `/repos/{r}/pulls/{n}` `{"state":"open"}`——**reopened 是 pull_request 默认触发 type，重开即再触发 CI**（优先于 workflow dispatch）。预检（尽力匿名读 pulls/{n}，落审计）：已开放 / 已合并 / 404 各有 early-exit 不弹窗；弹窗带标题/方向/head sha8，批准指纹混入 head sha（锚定"所见版本"，同 pr_merge v2.5）。**有意不做执行前 TOCTOU 复核**：reopen 非破坏性、不发布内容，批准→执行间漂移由服务端 422 原话兜底（已开放/已合并/head 已删各有指引）。exit：200→0；401→9；403/404/422→10（PrReopenRejected 透传）；超时→21（PATCH 非幂等，查证 state 再决定） | 仅 sluice 进程 |
+| `issue_close`（v2.7，Vitro 复盘 #3：销案闭环） | `sluice issue close --repo R --number N` | PATCH `/repos/{r}/issues/{n}` `{"state":"closed"}`——评论留证之后能落锤，不再"关闭等手动"。预检（尽力匿名读 issues/{n}，落审计）：PR 编号（响应含 `pull_request` 字段即 PR）/ 已关闭 / 404 各有 early-exit；批准指纹混入标题（锚定所见，同 comment 的 body 指纹族）。exit：200→0；401→9；403/404/422→10（IssueCloseRejected）；超时→21 | 仅 sluice 进程 |
+| `workflow_dispatch`（v2.7，Vitro 复盘 #4——**定性修正后落地**） | `sluice workflow dispatch --repo R --workflow W --ref B [--inputs-file F]` | POST `/repos/{r}/actions/workflows/{w}/dispatches` `{"ref":B,"inputs":{…}}`（W 为 id 或 .yml 文件名，路径段转义；204=受理）——**定位是运维便利（无 PR 场景的手动 CI nudge），不是"REST push 不触发 CI"的缺陷修复**：该定论已被 2026-10-30 上午三次同型 REST 推送触发 synchronize 的实证否定，当晚零 run 属 GitHub 平台故障窗（与 4×blob-500 同窗）。**需 fine-grained PAT Actions: Read and write**——缺失时 403 走 DispatchForbidden（用户重发 PAT，非 agent 可修）；同理读 CI runs/jobs/logs 需 Actions: Read（actions 端点对匿名收紧，403 加 --auth 即此）。exit：204→0（WorkflowDispatched，受理即完成）；401→9；403→10；404→10（不存在或 on: 未声明 dispatch）；422→10；超时→21（重发=重复 run，先查 runs） | 仅 sluice 进程 |
 
 **push bridge**（取代原方案 shim，无常驻、无 PATH 依赖）：
 
@@ -531,6 +593,8 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 - `--force` / 裸 force push → policy_reject，永不批准（**v2.6**：覆盖式更新的唯一合法形态是 `--base` 重放通道，见 §9.6——force 不是参数，是"声明新基点"这一显式动作的结论）
 - push 到 `main` / `master` → policy_reject，永不批准（重放通道同样过这条禁令——它在 push 前置检查之后才分流）
 - push 内容含 `.github/workflows/**` 变更 → 对话框红字单独标记，批准需二次确认
+
+**幂等对象创建的 5xx 有界重试（v2.7 不变量）**：REST push 序列中 blob/tree/commit 的创建是内容寻址的幂等操作（同内容必得同 sha，服务器去重）——对它们的 5xx 自动重试（2s/8s 退避，共 3 次尝试）**不超出批准范围**：批准覆盖的是"把这些内容放到该分支"的一次执行，对同一对象的重试既不引入新内容也不动分支（stderr 有重试提示）。**update-ref（唯一写点）与一切非幂等请求永不自动重试**。429 亦不自动重试（限流是"该慢下来"，不是抖动）。背景：2026-10-30 Vitro 平台故障窗 blob 连续 4×HTTP 500，每轮人工重试 = 一道批准 + 一枚指纹（弹窗疲劳实录）。
 
 **allowlist 的真墙在服务端（v2.2 修订，取代下面"改白名单要 Hello"的旧设计）**：vault 里的 fine-grained PAT 本身只授权指定仓库——本地 config.json 的白名单只是 UX 过滤器，改它不会扩大 token 的实际能力（未授权仓库 API 一律 403，fail-closed）。因此 `sluice allow-repo R` 就是普通配置编辑；setup 时打印 token 实际授权的仓库清单，服务端为准。最坏情况推演：agent 改本地白名单 → 人类看到未授权仓库的批准框 → 即便误批准，服务端仍 403 → fail-closed。
 
@@ -719,7 +783,7 @@ AGENTS.md 片段安装器、`sluice doctor`、installation token（1h）替换 p
 
 | 编号 | 缺口 | 态度 |
 |---|---|---|
-| L1 | 同用户攻击面：注入 / 读内存 / **静默解密本地文件** | 前两者让步（N1）；静默解密被 §5 的 Hello 门控 vault 消灭（P7 探针定形式；DPAPI 末选时降格为已知让步）；剩余让步部分爆炸半径 = PAT 上限；真隔离的唯一路径是 agent 独立 OS 账户 |
+| L1 | 同用户攻击面：注入 / 读内存 / **静默解密本地文件** | 前两者让步（N1）；静默解密被 §5 的 Hello 门控 vault 消灭（P7 探针定形式；DPAPI 末选时降格为已知让步）；剩余让步部分爆炸半径 = PAT 上限；真隔离的唯一路径是 agent 独立 OS 账户。**v2.7：owner 正式采用 hello:false 静默 vault（SLCV2/DPAPI，§5）——"静默解密被消灭"按 owner 显式选择降格为已知让步**（批准事件降为桌面点击；回滚须重跑 setup） |
 | L2 | 人疲劳误批 | tripwire 硬拒 + Hello 双因子缓解，不消除 |
 | L3 | 对话框可被同用户移动/遮挡 | 信任在 Hello；不承诺显示完整性 |
 | L4 | audit 可篡改 | 接受；真相源 GitHub |

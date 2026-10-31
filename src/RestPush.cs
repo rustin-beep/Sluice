@@ -235,12 +235,12 @@ internal static class RestPush
         var blobs = CollectBlobs(plan.RepoPath, commits);
         if (blobs.Count > 2000) return new(PushResult.Other, Reason: $"待传对象 {blobs.Count} 超过 2000 上限");
 
-        // blob 上传（内容寻址，幂等；服务器返回 sha 必与本地一致，不符即停）
+        // blob 上传（内容寻址，幂等；服务器返回 sha 必与本地一致，不符即停；5xx 有界重试 v2.7）
         foreach (var sha in blobs)
         {
             var content = Convert.ToBase64String(GitBytes(plan.RepoPath, $"cat-file blob {sha}"));
             var blobBody = new JsonObject { ["content"] = content, ["encoding"] = "base64" };
-            var (bst, bbody) = await GitHubApi.SendRawAsync(HttpMethod.Post,
+            var (bst, bbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                 $"repos/{plan.Repo}/git/blobs", token, blobBody.ToJsonString());
             if (bst is not (200 or 201)) return Net(bst, $"blob 上传 {Why(bst, bbody)}");
             if (JsonNode.Parse(bbody)?["sha"]?.GetValue<string>() != sha)
@@ -284,7 +284,7 @@ internal static class RestPush
             {
                 var treeBody = new JsonObject { ["tree"] = entries };
                 if (prevTree.Length > 0) treeBody["base_tree"] = prevTree;
-                var (tst, tbody) = await GitHubApi.SendRawAsync(HttpMethod.Post,
+                var (tst, tbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                     $"repos/{plan.Repo}/git/trees", token, treeBody.ToJsonString());
                 if (tst is not (200 or 201)) return Net(tst, $"tree 创建 {Why(tst, tbody)}");
                 treeSha = JsonNode.Parse(tbody)?["sha"]?.GetValue<string>() ?? "";
@@ -308,7 +308,7 @@ internal static class RestPush
                 parents.Add(p);
                 commitBody["parents"] = parents;
             }
-            var (cst, cbody) = await GitHubApi.SendRawAsync(HttpMethod.Post,
+            var (cst, cbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                 $"repos/{plan.Repo}/git/commits", token, commitBody.ToJsonString());
             if (cst != 201) return Net(cst, $"commit 创建 {Why(cst, cbody)}");
             lastSha = JsonNode.Parse(cbody)?["sha"]?.GetValue<string>() ?? "";

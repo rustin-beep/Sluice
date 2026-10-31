@@ -49,21 +49,34 @@ internal static class GitHubApi
     ];
 
     private sealed record DnsCache(string[] Ips, DateTime Expires);
-    private static DnsCache? _dnsCache; // 引用原子交换，无锁；读侧容忍短暂陈旧
+    private static DnsCache? _dnsCache; // api.github.com 热路径（一次 push 最多 ~90 请求）；引用原子交换，无锁
+    // CDN 域（*.githubusercontent.com——api 读通道跟随 logs 等端点的 302 签名 URL 时到达）：冷路径，小并发字典够用
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DnsCache> _cdnDnsCache = new();
 
-    /// <summary>解析 api.github.com 的真实 IP；全失败返回 null（调用方退回系统解析，由 issuer 校验兜底）。</summary>
-    internal static async Task<string[]?> ResolveViaDoHAsync(CancellationToken ct)
+    /// <summary>DoH 直连 + 重定向跟随共同的主机集合（v2.7）：api.github.com 与 GitHub CDN
+    /// （*.githubusercontent.com）。logs 等 actions 端点 302 到 CDN 签名 URL——不跟随则永远
+    /// 拿不到日志体（2026-10-30 实战：actions/jobs/{id}/logs http_failed ×8，agent 空转重试）。</summary>
+    internal static bool IsGithubApiOrCdnHost(string host) =>
+        host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>解析 GitHub 域名的真实 IP（绕过系统 hosts）；全失败返回 null（调用方退回系统解析，由 issuer 校验兜底）。</summary>
+    internal static async Task<string[]?> ResolveViaDoHAsync(string host, CancellationToken ct)
     {
-        var c = _dnsCache;
-        if (c is { } cc && cc.Expires > DateTime.UtcNow)
-            return cc.Ips;
+        if (host == "api.github.com")
+        {
+            if (_dnsCache is { } cc && cc.Expires > DateTime.UtcNow)
+                return cc.Ips;
+        }
+        else if (_cdnDnsCache.TryGetValue(host, out var cached) && cached.Expires > DateTime.UtcNow)
+            return cached.Ips;
 
         foreach (var (ip, _) in DohEndpoints)
         {
             try
             {
                 using var doh = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-                using var resp = await doh.GetAsync($"https://{ip}/resolve?name=api.github.com&type=A", ct);
+                using var resp = await doh.GetAsync($"https://{ip}/resolve?name={Uri.EscapeDataString(host)}&type=A", ct);
                 if (!resp.IsSuccessStatusCode) continue;
                 using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
                 // 结构：{"Status":0,"Answer":[{"name":"api.github.com.","type":1,"TTL":..,"data":"140.82.x.x"}]}
@@ -75,7 +88,8 @@ internal static class GitHubApi
                             list.Add(d.GetString() ?? "");
                 if (list.Count == 0) continue;
                 var arr = list.ToArray();
-                _dnsCache = new DnsCache(arr, DateTime.UtcNow.AddMinutes(5));
+                if (host == "api.github.com") _dnsCache = new DnsCache(arr, DateTime.UtcNow.AddMinutes(5));
+                else _cdnDnsCache[host] = new DnsCache(arr, DateTime.UtcNow.AddMinutes(5));
                 return arr;
             }
             catch { /* 换下一个 DoH 端点 */ }
@@ -103,9 +117,9 @@ internal static class GitHubApi
             },
             ConnectCallback = async (ctx, ct) =>
             {
-                // 只对 api.github.com 启用 DoH 直连；DoH 失败退回系统解析（hosts 若被劫持由 issuer 校验拦截并报清晰错误）
-                if (ctx.DnsEndPoint.Host == "api.github.com" &&
-                    await ResolveViaDoHAsync(ct) is { Length: > 0 } ips)
+                // 只对 api.github.com 与 GitHub CDN 域启用 DoH 直连；DoH 失败退回系统解析（hosts 若被劫持由 issuer 校验拦截并报清晰错误）
+                if (IsGithubApiOrCdnHost(ctx.DnsEndPoint.Host) &&
+                    await ResolveViaDoHAsync(ctx.DnsEndPoint.Host, ct) is { Length: > 0 } ips)
                 {
                     Exception? last = null;
                     foreach (var ip in ips)
@@ -299,21 +313,45 @@ internal static class GitHubApi
     /// <summary>
     /// api 读通道（§9 v2.2）：GET-only。token=null 走匿名（公开数据零摩擦）；
     /// 认证读由调用方先过 Hello 解 vault。NotSent=true 表示请求未发出（无副作用）。
+    /// v2.7：3xx 受控跟随（≤3 跳，仅 api.github.com / *.githubusercontent.com 域内）——
+    /// logs 等 actions 端点 302 到 CDN 签名 URL，不跟随则永远拿不到日志体；跳出域内或超跳数
+    /// → 原样返回 3xx 与去向（Reason），由调用方明说——这不是开放代理。后续跳不再带
+    /// Authorization（CDN 签名 URL 自带授权，多余的 Authorization 头反而可能被拒）。
     /// </summary>
     public static async Task<(int Status, string Body, bool NotSent, string? Reason)> ApiGetAsync(
         string? token, string path)
     {
         using var http = CreateClient();
+        var url = BaseUrl + path;
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, BaseUrl + path);
-            req.Headers.Add("Accept", "application/vnd.github+json");
-            req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
-            req.Headers.Add("User-Agent", "sluice/0.1");
-            if (token is not null)
-                req.Headers.Add("Authorization", "Bearer " + token);
-            using var resp = await http.SendAsync(req);
-            return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false, null);
+            for (var hop = 0; ; hop++)
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.Add("Accept", "application/vnd.github+json");
+                req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+                req.Headers.Add("User-Agent", "sluice/0.1");
+                if (token is not null)
+                    req.Headers.Add("Authorization", "Bearer " + token);
+                using var resp = await http.SendAsync(req);
+                if ((int)resp.StatusCode is >= 300 and < 400 && resp.Headers.Location is { } loc && hop < 3)
+                {
+                    var next = loc.IsAbsoluteUri ? loc.ToString() : new Uri(new Uri(url), loc).ToString();
+                    var host = new Uri(next).Host;
+                    if (IsGithubApiOrCdnHost(host))
+                    {
+                        url = next;
+                        token = null; // CDN 签名 URL 自带授权
+                        continue;
+                    }
+                    return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false,
+                        $"去向 {host} 不在跟随白名单（api.github.com / *.githubusercontent.com）");
+                }
+                if ((int)resp.StatusCode is >= 300 and < 400)
+                    return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false,
+                        "重定向超过 3 跳或缺少 Location，停止跟随");
+                return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false, null);
+            }
         }
         catch (HttpRequestException ex)
         {
@@ -358,6 +396,29 @@ internal static class GitHubApi
         return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync());
     }
 
+    /// <summary>
+    /// 幂等对象创建（blob/tree/commit——内容寻址，同内容必得同 sha，服务器去重）的 5xx 有界重试（v2.7）。
+    /// 不变量：批准覆盖"把这些内容放到该分支"的一次执行；对同一对象的创建重试不超出该范围
+    /// （sha 不变、分支未动）。update-ref（唯一写点）与一切非幂等请求永不自动重试。
+    /// 背景：2026-10-30 Vitro 平台故障窗 blob 连续 4×HTTP 500，每轮人工重试 = 一道批准 + 一枚指纹。
+    /// 退避 2s/8s 共 3 次尝试；429 不在此列（限流是"该慢"，不是抖动）。
+    /// </summary>
+    internal static async Task<(int Status, string Body)> SendIdempotentAsync(
+        HttpMethod m, string path, string token, string? jsonBody)
+    {
+        const int maxAttempts = 3;
+        for (var attempt = 1; ; attempt++)
+        {
+            var (st, body) = await SendRawAsync(m, path, token, jsonBody);
+            if (st < 500 || attempt >= maxAttempts)
+                return (st, body);
+            var delay = attempt == 1 ? 2 : 8;
+            Console.Error.WriteLine(
+                $"[Sluice] HTTP {st}（{path}），{delay}s 后第 {attempt + 1}/{maxAttempts} 次尝试（幂等对象创建，不超出本次批准范围）");
+            await Task.Delay(TimeSpan.FromSeconds(delay));
+        }
+    }
+
     private static async Task<ApiResult> ReadCreatedAsync(HttpResponseMessage resp)
     {
         var json = await resp.Content.ReadAsStringAsync();
@@ -396,7 +457,7 @@ internal static class GitHubApi
     {
         // 诊断（仅 setup，人运行；不进 §8 消息流）：显示 DoH 解析结果——该结果来自
         // IP 直连的公共 DNS over HTTPS，不经过系统 hosts，劫持是否存在一目了然。
-        var doh = await ResolveViaDoHAsync(CancellationToken.None);
+        var doh = await ResolveViaDoHAsync("api.github.com", CancellationToken.None);
         Console.WriteLine(doh is { Length: > 0 }
             ? $"[net] api.github.com → {doh[0]}（DoH 解析，绕过系统 hosts；候选 {doh.Length} 个）"
             : "[net] DoH 解析不可用——退回系统解析（若 hosts 被劫持将由证书校验拦截）");

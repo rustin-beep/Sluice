@@ -56,6 +56,9 @@ internal static class Program
         ["push", .. var rest] => RunPush(rest),
         ["pr", "create", .. var rest] => RunPrCreate(rest),
         ["pr", "merge", .. var rest] => RunPrMerge(rest),
+        ["pr", "reopen", .. var rest] => RunPrReopen(rest),
+        ["issue", "close", .. var rest] => RunIssueClose(rest),
+        ["workflow", "dispatch", .. var rest] => RunWorkflowDispatch(rest),
         ["branch", "delete", .. var rest] => RunBranchDelete(rest),
         ["api", .. var rest] => RunApi(rest),
         [var verb, ..] => BadVerb(verb),
@@ -81,10 +84,20 @@ internal static class Program
               sluice pr merge --repo O/R --number N [--method merge|squash|rebase] [--delete-head]
                                                         合并 PR（服务端 merge API：天然尊重分支保护与
                                                         required checks；--delete-head 合并后删 head 分支）
+              sluice pr reopen --repo O/R --number N
+                                                        重开已关闭的 PR（经批准；reopened 事件会再次触发
+                                                        pull_request 类 CI——也是 CI 卡死时的首选补救）
+              sluice issue close --repo O/R --number N
+                                                        关闭 issue（经批准；销案闭环。PR 编号会被预检拦下）
+              sluice workflow dispatch --repo O/R --workflow W --ref R [--inputs-file F]
+                                                        手动触发 workflow（经批准；W 为 id 或文件名，R 为
+                                                        分支/标签，F 为 JSON 对象对应 dispatch inputs。
+                                                        需 PAT Actions:Read and write，缺则 403 有专属指引）
               sluice branch delete --repo O/R --branch B
                                                         删除远端分支 ref（commits 保留，可用 sha 重建）
               sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 过 Hello 带 token；
-                                                        路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计）
+                                                        路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计；
+                                                        logs 等端点 302→CDN 签名 URL 自动跟随，仅限 GitHub 域 ≤3 跳）
               sluice selftest                           消息表与 exit code 自检
 
             退出码见 `sluice selftest` 输出；消息规范见 plan-lite.md §8。
@@ -96,14 +109,14 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.5");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.7");
         return 0;
     }
 
     private static int BadVerb(string verb)
     {
         Messages.Write(Messages.BadRequest(
-            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / branch / api / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
+            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / workflow / branch / api / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
         return ExitCodes.BadRequest;
     }
 
@@ -597,6 +610,10 @@ internal static class Program
         {
             case >= 200 and < 300:
                 return ExitCodes.Success;
+            case >= 300 and < 400:
+                // v2.7：域外/超跳重定向不跟随——去向在 Reason 里明说，不装开放代理
+                Messages.Write(Messages.ApiRedirected(path, reason ?? "域外重定向"));
+                return ExitCodes.BadRequest;
             case 401 or 403:
                 // 匿名：资源需要认证，加 --auth 是 agent 可自行完成的修正（after_fix）；
                 // 带 token：凭据真的失效/越权，才归 credential_expired（wait_user，交还用户）
@@ -1080,17 +1097,48 @@ internal static class Program
 
         var target = $"{repo}@{branch}";
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(target)))[..8].ToLowerInvariant();
+
+        // 连带后果披露（2026-10-31 Vitro 复盘 #7：删 #389 的 head 分支，弹窗没说会关 PR，用户批前不知情）：
+        // 尽力而为的匿名预查该分支是否为开放 PR 的 head（公开库可查；私有库/网络失败不阻塞——静态警示行仍生效）。
+        // 读无破坏力，走 api 读通道同款匿名 GET 并落读审计（与 pr_merge 元数据读同纪律）。
+        var prQuery = $"repos/{repo}/pulls?head={repo[..repo.IndexOf('/')]}:{branch}&state=open";
+        var openPrLine = "该分支若是某开放 PR 的 head，删除将连带关闭该 PR（讨论上下文断链；重建同名分支不会恢复已关的 PR）";
+        try
+        {
+            var (pst, pbody, pNotSent, _) = GitHubApi.ApiGetAsync(null, prQuery).GetAwaiter().GetResult();
+            if (pNotSent)
+                Audit.Append("api_read", "api.github.com", prQuery, null, "http_failed", result: "not_sent");
+            else if (pst == 0)
+                Audit.Append("api_read", "api.github.com", prQuery, null, "timeout", result: "retry_safe_get");
+            else
+                Audit.Append("api_read", "api.github.com", prQuery, null, $"http_{pst}", result: $"{pbody.Length}B anon");
+            if (pst == 200 && System.Text.Json.Nodes.JsonNode.Parse(pbody) is System.Text.Json.Nodes.JsonArray prArr)
+            {
+                var prs = new List<string>();
+                foreach (var p in prArr)
+                {
+                    var n = p?["number"]?.GetValue<int>();
+                    var t = p?["title"]?.GetValue<string>() ?? "";
+                    if (n is { } nn) prs.Add(nn + " " + (t.Length > 40 ? t[..40] + "…" : t));
+                }
+                if (prs.Count > 0)
+                    openPrLine = $"⚠ 删除将连带关闭该分支上的开放 PR：{string.Join("；", prs)}——讨论上下文断链，重建同名分支不会恢复已关的 PR";
+            }
+        }
+        catch { /* 预查失败不阻塞删除流——静态警示行仍披露规则 */ }
+
         var window = $"""
             删除远端分支：{target}
             这是删除分支 ref，不是销毁历史：commits 仍留在服务端（GC 窗口内可用 sha 重建）。
             但若该分支含未合并的独有提交，删除后它将不再出现在任何 PR/分支列表中。
+            {openPrLine}
             """;
 
         Gate.Outcome outcome;
         using (InputFilter.Install())
         {
             outcome = Gate.Run(new Gate.Request("branch_delete", repo, branch, window, sha,
-                TokenStore.PeekChallenge()));
+                TokenStore.PeekChallenge(), openPrLine.StartsWith('⚠') ? openPrLine : null));
         }
 
         switch (outcome)
@@ -1180,6 +1228,522 @@ internal static class Program
         {
             // DELETE 幂等（重删得 404）但请求可能已送达——诚实归 unknown，查证 refs/heads 即知
             Audit.Append("branch_delete", repo, branch, sha, "unknown", consent: "hello", result: "timeout");
+            Messages.Write(Messages.Unknown("超时"));
+            return ExitCodes.Unknown;
+        }
+    }
+
+    // ---------- sluice pr reopen（V1.6 · 2026-10-31 Vitro 复盘 #2：PR 误关/断链后讨论上下文的正解；
+    //             reopened 亦会再次触发 pull_request 类 CI——比 workflow dispatch 更常用的 CI 补救。
+    //             有意不做 pr_merge 式执行前 TOCTOU 复核：reopen 非破坏性、不发布内容，
+    //             批准→执行间的状态漂移由服务端 422 原话兜底（已开放/已合并/head 已删各有专属指引）） ----------
+
+    private static int RunPrReopen(string[] args)
+    {
+        string? repo = null;
+        int number = 0;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = i + 1 < args.Length ? args[++i] : null;
+                    if (repo is null) return ErrMissing("pr_reopen", "--repo");
+                    break;
+                case "--number":
+                    var v = i + 1 < args.Length ? args[++i] : null;
+                    if (v is null || !int.TryParse(v, out number) || number <= 0)
+                        return ErrBad("--number 需要正整数");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || number <= 0)
+            return ErrBad("pr_reopen 缺少 --repo / --number（示例：sluice pr reopen --repo owner/repo --number 389）");
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
+            return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (!TokenStore.Exists)
+        {
+            Messages.Write(Messages.NotInitialized());
+            return ExitCodes.NotInitialized;
+        }
+        var violations = SealCheck.Run();
+        if (violations.Count > 0)
+        {
+            Audit.Append("pr_reopen", repo, $"#{number}", null, "seal_violation");
+            Messages.Write(Messages.SealViolation(string.Join("；", violations)));
+            return ExitCodes.SealViolation;
+        }
+
+        // 尽力而为的匿名元数据读（同 pr_merge 纪律：读落审计，失败不阻塞，弹窗退化为参数展示）
+        string? prTitle = null, prHead = null, prBase = null, prHeadSha = null, prState = null, prMerged = null;
+        int metaSt = 0;
+        try
+        {
+            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/pulls/{number}")
+                .GetAwaiter().GetResult();
+            metaSt = notSent ? -1 : st;
+            if (notSent)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "http_failed", result: "not_sent");
+            else if (st == 0)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "timeout", result: "retry_safe_get");
+            else
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
+            if (st == 200)
+            {
+                var pr = System.Text.Json.Nodes.JsonNode.Parse(body);
+                prTitle = pr?["title"]?.GetValue<string>();
+                prHead = pr?["head"]?["ref"]?.GetValue<string>();
+                prBase = pr?["base"]?["ref"]?.GetValue<string>();
+                prHeadSha = pr?["head"]?["sha"]?.GetValue<string>();
+                prState = pr?["state"]?.GetValue<string>();
+                prMerged = pr?["merged_at"]?.GetValue<string>();
+            }
+        }
+        catch { /* 元数据读失败不阻塞批准流 */ }
+        if (metaSt == 404)
+            return ErrBad($"PR #{number} 不存在（HTTP 404）——核对编号；列出当前 PR：sluice api repos/{repo}/pulls");
+        if (prState == "open")
+            return ErrBad($"PR #{number} 已是开放状态，无需 reopen；本次未产生任何副作用。若预期中的 CI 未触发，先核对仓库 workflow 的 on: 配置（push/pull_request 触发类型）");
+        if (prMerged is not null)
+            return ErrBad($"PR #{number} 已合并关闭，不能 reopen（服务端同样会拒）；如需继续变更请开新 PR；本次未产生任何副作用");
+
+        var target = $"{repo}#{number}";
+        // 批准指纹混入 head sha（同 pr_merge v2.5 语义）：编号不变内容可变——指纹锚定"所见版本"
+        var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+            $"{repo}#{number}:reopen:{prHeadSha ?? "?"}")))[..8].ToLowerInvariant();
+        var window = $"""
+            PR：{target}（当前状态：{prState ?? "（元数据不可读：私有库或网络原因，重开前请自行核对）"}）
+            标题：{prTitle ?? "（不可读）"}
+            方向：{prBase ?? "?"} ← {prHead ?? "?"}{(prHeadSha is { Length: >= 8 } h ? $"（head {h[..8]}）" : "")}
+            重开将恢复该 PR 的讨论与审查上下文；reopened 事件会再次触发 pull_request 类 workflow。
+            """;
+
+        Gate.Outcome outcome;
+        using (InputFilter.Install())
+        {
+            outcome = Gate.Run(new Gate.Request("pr_reopen", repo, $"#{number}", window, sha,
+                TokenStore.PeekChallenge(),
+                prHeadSha is null ? "PR 元数据不可读，重开对象请自行核对" : null));
+        }
+
+        switch (outcome)
+        {
+            case Gate.Outcome.Denied d:
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "denied", d.Preset, d.FreeText, consent: "none");
+                Messages.Write(Messages.Denied("pr_reopen", target, d.Preset, d.FreeText));
+                return ExitCodes.Denied;
+            case Gate.Outcome.TimedOut:
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "timeout");
+                Messages.Write(Messages.Timeout("pr_reopen", target, Gate.TimeoutSeconds));
+                return ExitCodes.Timeout;
+            case Gate.Outcome.ConsentFailed:
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed("pr_reopen", target));
+                return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
+            case Gate.Outcome.Crashed c:
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "internal_gate_crash", result: c.Error);
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            case Gate.Outcome.Approved a:
+                return ExecutePrReopen(a, repo, number, sha, target);
+            default:
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+        }
+    }
+
+    private static int ExecutePrReopen(Gate.Outcome.Approved a, string repo, int number, string sha, string target)
+    {
+        string token;
+        try { token = TokenStore.LoadApproved(a.Signature); }
+        catch (Exception)
+        {
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            return ExitCodes.Internal;
+        }
+
+        try
+        {
+            var (st, body) = GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{repo}/pulls/{number}", token,
+                new System.Text.Json.Nodes.JsonObject { ["state"] = "open" }.ToJsonString())
+                .GetAwaiter().GetResult();
+            switch (st)
+            {
+                case 200:
+                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "approved", consent: "hello", result: "executed");
+                    Messages.Write(Messages.Success("pr_reopen", target, 200, $"https://github.com/{repo}/pull/{number}"));
+                    return ExitCodes.Success;
+                case 401:
+                    Audit.Append("pr_reopen", repo, $"#{number}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Messages.Write(Messages.CredentialExpired("HTTP 401"));
+                    return ExitCodes.CredentialExpired;
+                default:
+                    // 403（无 Pull requests 写权限）/ 404（批准期间被删）/ 422（已开放/已合并/head 已删）——透传服务端原话
+                    Audit.Append("pr_reopen", repo, $"#{number}", sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "pr_reopen_rejected",
+                        consent: "hello", result: HttpDetail(st, body));
+                    Messages.Write(Messages.PrReopenRejected(target, HttpDetail(st, body)));
+                    return ExitCodes.BadRequest;
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
+            return ExitCodes.HttpFailed;
+        }
+        catch (TaskCanceledException)
+        {
+            // PATCH 非幂等（重开可能已生效）——诚实归 unknown，查证 PR state 后决定是否重发
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "unknown", consent: "hello", result: "timeout");
+            Messages.Write(Messages.Unknown("超时"));
+            return ExitCodes.Unknown;
+        }
+    }
+
+    // ---------- sluice issue close（V1.6 · 2026-10-31 Vitro 复盘 #3：销案闭环——评论留证之后能落锤，
+    //             不再"关闭等手动"。同为非破坏性状态写：预检拦常见误用（PR 编号/已关闭），漂移由服务端兜底） ----------
+
+    private static int RunIssueClose(string[] args)
+    {
+        string? repo = null;
+        int number = 0;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = i + 1 < args.Length ? args[++i] : null;
+                    if (repo is null) return ErrMissing("issue_close", "--repo");
+                    break;
+                case "--number":
+                    var v = i + 1 < args.Length ? args[++i] : null;
+                    if (v is null || !int.TryParse(v, out number) || number <= 0)
+                        return ErrBad("--number 需要正整数");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || number <= 0)
+            return ErrBad("issue_close 缺少 --repo / --number（示例：sluice issue close --repo owner/repo --number 369）");
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
+            return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (!TokenStore.Exists)
+        {
+            Messages.Write(Messages.NotInitialized());
+            return ExitCodes.NotInitialized;
+        }
+        var violations = SealCheck.Run();
+        if (violations.Count > 0)
+        {
+            Audit.Append("issue_close", repo, $"#{number}", null, "seal_violation");
+            Messages.Write(Messages.SealViolation(string.Join("；", violations)));
+            return ExitCodes.SealViolation;
+        }
+
+        // 尽力而为的匿名元数据读（issues API 对 PR 编号同样应答——靠 pull_request 字段区分类型）
+        string? issueTitle = null, issueState = null;
+        var isPr = false;
+        int metaSt = 0;
+        try
+        {
+            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/issues/{number}")
+                .GetAwaiter().GetResult();
+            metaSt = notSent ? -1 : st;
+            if (notSent)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, "http_failed", result: "not_sent");
+            else if (st == 0)
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, "timeout", result: "retry_safe_get");
+            else
+                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
+            if (st == 200)
+            {
+                var iss = System.Text.Json.Nodes.JsonNode.Parse(body);
+                issueTitle = iss?["title"]?.GetValue<string>();
+                issueState = iss?["state"]?.GetValue<string>();
+                isPr = iss?["pull_request"] is not null;
+            }
+        }
+        catch { /* 元数据读失败不阻塞批准流 */ }
+        if (metaSt == 404)
+            return ErrBad($"#{number} 不存在（HTTP 404）——核对编号；列出 issue：sluice api repos/{repo}/issues?state=open");
+        if (isPr)
+            return ErrBad($"#{number} 是 PR 不是 issue——PR 的生命周期走 pr merge / pr reopen / branch delete，不走 issue close；本次未产生任何副作用");
+        if (issueState == "closed")
+            return ErrBad($"#{number} 已处于关闭状态，无需重复关闭；本次未产生任何副作用");
+
+        var target = $"{repo}#{number}";
+        // 批准指纹混入标题：编号不变标题可变——指纹锚定"所见内容"（与 comment 的 body 指纹同族）
+        var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+            $"{repo}#{number}:{issueTitle ?? "?"}")))[..8].ToLowerInvariant();
+        var window = $"""
+            关闭 issue：{target}
+            标题：{issueTitle ?? "（元数据不可读：私有库或网络原因，关闭前请自行核对）"}
+            当前状态：{issueState ?? "（不可读）"} → 关闭（closed）
+            评论（如需留证请先单独用 sluice comment 发出）不在本操作范围内。
+            """;
+
+        Gate.Outcome outcome;
+        using (InputFilter.Install())
+        {
+            outcome = Gate.Run(new Gate.Request("issue_close", repo, $"#{number}", window, sha,
+                TokenStore.PeekChallenge(),
+                issueTitle is null ? "issue 元数据不可读，关闭对象请自行核对" : null));
+        }
+
+        switch (outcome)
+        {
+            case Gate.Outcome.Denied d:
+                Audit.Append("issue_close", repo, $"#{number}", sha, "denied", d.Preset, d.FreeText, consent: "none");
+                Messages.Write(Messages.Denied("issue_close", target, d.Preset, d.FreeText));
+                return ExitCodes.Denied;
+            case Gate.Outcome.TimedOut:
+                Audit.Append("issue_close", repo, $"#{number}", sha, "timeout");
+                Messages.Write(Messages.Timeout("issue_close", target, Gate.TimeoutSeconds));
+                return ExitCodes.Timeout;
+            case Gate.Outcome.ConsentFailed:
+                Audit.Append("issue_close", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed("issue_close", target));
+                return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("issue_close", repo, $"#{number}", sha, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
+            case Gate.Outcome.Crashed c:
+                Audit.Append("issue_close", repo, $"#{number}", sha, "internal_gate_crash", result: c.Error);
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            case Gate.Outcome.Approved a:
+                return ExecuteIssueClose(a, repo, number, sha, target);
+            default:
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+        }
+    }
+
+    private static int ExecuteIssueClose(Gate.Outcome.Approved a, string repo, int number, string sha, string target)
+    {
+        string token;
+        try { token = TokenStore.LoadApproved(a.Signature); }
+        catch (Exception)
+        {
+            Audit.Append("issue_close", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            return ExitCodes.Internal;
+        }
+
+        try
+        {
+            var (st, body) = GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{repo}/issues/{number}", token,
+                new System.Text.Json.Nodes.JsonObject { ["state"] = "closed" }.ToJsonString())
+                .GetAwaiter().GetResult();
+            switch (st)
+            {
+                case 200:
+                    Audit.Append("issue_close", repo, $"#{number}", sha, "approved", consent: "hello", result: "executed");
+                    Messages.Write(Messages.Success("issue_close", target, 200, $"https://github.com/{repo}/issues/{number}"));
+                    return ExitCodes.Success;
+                case 401:
+                    Audit.Append("issue_close", repo, $"#{number}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Messages.Write(Messages.CredentialExpired("HTTP 401"));
+                    return ExitCodes.CredentialExpired;
+                default:
+                    // 403（无 Issues 写权限）/ 404（批准期间被删）/ 422（含 PR 编号误用透传）——服务端原话
+                    Audit.Append("issue_close", repo, $"#{number}", sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "issue_close_rejected",
+                        consent: "hello", result: HttpDetail(st, body));
+                    Messages.Write(Messages.IssueCloseRejected(target, HttpDetail(st, body)));
+                    return ExitCodes.BadRequest;
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Audit.Append("issue_close", repo, $"#{number}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
+            return ExitCodes.HttpFailed;
+        }
+        catch (TaskCanceledException)
+        {
+            // PATCH 非幂等（关闭可能已生效）——诚实归 unknown，查证 issue state 后决定是否重发
+            Audit.Append("issue_close", repo, $"#{number}", sha, "unknown", consent: "hello", result: "timeout");
+            Messages.Write(Messages.Unknown("超时"));
+            return ExitCodes.Unknown;
+        }
+    }
+
+    // ---------- sluice workflow dispatch（V1.6 · 2026-10-31 Vitro 复盘 #4——定性修正后落地：
+    //             这是运维便利（手动 nudge 无 PR 场景的 CI），不是"REST push 不触发 CI"的修复
+    //             （该定论已被 10-30 上午三次 synchronize 触发实证否定）；CI 卡死优先 pr reopen） ----------
+
+    private static int RunWorkflowDispatch(string[] args)
+    {
+        string? repo = null, workflow = null, @ref = null, inputsFile = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = i + 1 < args.Length ? args[++i] : null;
+                    if (repo is null) return ErrMissing("workflow_dispatch", "--repo");
+                    break;
+                case "--workflow":
+                    workflow = i + 1 < args.Length ? args[++i] : null;
+                    if (workflow is null) return ErrMissing("workflow_dispatch", "--workflow");
+                    break;
+                case "--ref":
+                    @ref = i + 1 < args.Length ? args[++i] : null;
+                    if (@ref is null) return ErrMissing("workflow_dispatch", "--ref");
+                    break;
+                case "--inputs-file":
+                    inputsFile = i + 1 < args.Length ? args[++i] : null;
+                    if (inputsFile is null) return ErrMissing("workflow_dispatch", "--inputs-file");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || workflow is null || @ref is null)
+            return ErrBad("workflow_dispatch 缺少 --repo / --workflow / --ref（示例：sluice workflow dispatch --repo owner/repo --workflow ci.yml --ref master）");
+        if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
+            return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (workflow.Trim().Length == 0) return ErrBad("--workflow 不能为空（workflow id 或 .yml 文件名）");
+        if (@ref.Trim().Length == 0) return ErrBad("--ref 不能为空（分支或标签名）");
+        if (!TokenStore.Exists)
+        {
+            Messages.Write(Messages.NotInitialized());
+            return ExitCodes.NotInitialized;
+        }
+        var violations = SealCheck.Run();
+        if (violations.Count > 0)
+        {
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", null, "seal_violation");
+            Messages.Write(Messages.SealViolation(string.Join("；", violations)));
+            return ExitCodes.SealViolation;
+        }
+
+        string? inputsJson = null;
+        if (inputsFile is not null)
+        {
+            if (!File.Exists(inputsFile)) return ErrBad($"--inputs-file 不存在：{inputsFile}");
+            try { inputsJson = File.ReadAllText(inputsFile, System.Text.Encoding.UTF8); }
+            catch (Exception ex) { return ErrBad($"无法读取 --inputs-file：{ex.Message}"); }
+            if (System.Text.Json.Nodes.JsonNode.Parse(inputsJson) is not System.Text.Json.Nodes.JsonObject)
+                return ErrBad("--inputs-file 须为 JSON 对象（键值对应 workflow 的 workflow_dispatch inputs 声明）");
+        }
+
+        var target = $"{repo} · {workflow} @ {@ref}";
+        var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
+            $"{repo}:{workflow}:{@ref}:{inputsJson ?? ""}")))[..8].ToLowerInvariant();
+        var window = $"""
+            手动触发 workflow：{target}
+            inputs：{(inputsJson is null ? "（无）" : (inputsJson.Length > 200 ? inputsJson[..200] + "…" : inputsJson))}
+            将向该 workflow 的 dispatches 端点发出触发事件（HTTP 204 = 受理）。
+            注意：需要 PAT 具备 Actions: Read and write 权限，缺失时服务端 403。
+            """;
+
+        Gate.Outcome outcome;
+        using (InputFilter.Install())
+        {
+            outcome = Gate.Run(new Gate.Request("workflow_dispatch", repo, $"{workflow}@{@ref}", window, sha,
+                TokenStore.PeekChallenge()));
+        }
+
+        switch (outcome)
+        {
+            case Gate.Outcome.Denied d:
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "denied", d.Preset, d.FreeText, consent: "none");
+                Messages.Write(Messages.Denied("workflow_dispatch", target, d.Preset, d.FreeText));
+                return ExitCodes.Denied;
+            case Gate.Outcome.TimedOut:
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "timeout");
+                Messages.Write(Messages.Timeout("workflow_dispatch", target, Gate.TimeoutSeconds));
+                return ExitCodes.Timeout;
+            case Gate.Outcome.ConsentFailed:
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed("workflow_dispatch", target));
+                return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
+            case Gate.Outcome.Crashed c:
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "internal_gate_crash", result: c.Error);
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            case Gate.Outcome.Approved a:
+                return ExecuteWorkflowDispatch(a, repo, workflow, @ref, inputsJson, sha, target);
+            default:
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+        }
+    }
+
+    private static int ExecuteWorkflowDispatch(Gate.Outcome.Approved a, string repo, string workflow, string @ref,
+        string? inputsJson, string sha, string target)
+    {
+        string token;
+        try { token = TokenStore.LoadApproved(a.Signature); }
+        catch (Exception)
+        {
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "internal_vault_decrypt_failed", consent: "hello");
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            return ExitCodes.Internal;
+        }
+
+        try
+        {
+            var body = new System.Text.Json.Nodes.JsonObject { ["ref"] = @ref };
+            if (inputsJson is not null)
+                body["inputs"] = System.Text.Json.Nodes.JsonNode.Parse(inputsJson);
+            var (st, rbody) = GitHubApi.SendRawAsync(HttpMethod.Post,
+                $"repos/{repo}/actions/workflows/{Uri.EscapeDataString(workflow)}/dispatches", token,
+                body.ToJsonString()).GetAwaiter().GetResult();
+            switch (st)
+            {
+                case 204:
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "approved", consent: "hello", result: "executed");
+                    Messages.Write(Messages.WorkflowDispatched(repo, workflow, @ref));
+                    return ExitCodes.Success;
+                case 401:
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "credential_expired", consent: "hello", result: "http_401");
+                    Messages.Write(Messages.CredentialExpired("HTTP 401"));
+                    return ExitCodes.CredentialExpired;
+                case 403:
+                    // fine-grained PAT 缺 Actions: Read and write——用户动作可修，专属指引（勿归凭据过期死路）
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "forbidden", consent: "hello",
+                        result: HttpDetail(st, rbody));
+                    Messages.Write(Messages.DispatchForbidden(repo, workflow, HttpDetail(st, rbody)));
+                    return ExitCodes.BadRequest;
+                case 404:
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "not_found", consent: "hello",
+                        result: "http_404");
+                    Messages.Write(Messages.DispatchNotFound(repo, workflow));
+                    return ExitCodes.BadRequest;
+                default:
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "workflow_dispatch_rejected",
+                        consent: "hello", result: HttpDetail(st, rbody));
+                    Messages.Write(Messages.DispatchRejected(HttpDetail(st, rbody)));
+                    return ExitCodes.BadRequest;
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "http_failed", consent: "hello", result: "not_sent");
+            Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
+            return ExitCodes.HttpFailed;
+        }
+        catch (TaskCanceledException)
+        {
+            // 触发非幂等（可能已受理——重发 = 重复 run）——诚实归 unknown，先查 runs 再决定
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "unknown", consent: "hello", result: "timeout");
             Messages.Write(Messages.Unknown("超时"));
             return ExitCodes.Unknown;
         }

@@ -35,6 +35,13 @@ internal static class Selftest
         ("nonff",       ExitCodes.BadRequest,     "after_fix"),  // 2026-10-30 实战改档：rebase 后可重推同分支
         ("remotemoved", ExitCodes.BadRequest,     "after_fix"),  // v2.6 重放通道保真复核：fetch 后重跑重新弹窗
         ("hasmerge",    ExitCodes.BadRequest,     "after_fix"),  // rebase 成线性后重跑（列问题提交）
+        ("prreopenrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：403/404/422 透传，含"分支已删先重建"正解
+        ("issuecloserejected", ExitCodes.BadRequest, "after_fix"), // v2.7：PR 误用/权限/不存在
+        ("dispatched",        ExitCodes.Success,     "—"),         // v2.7：204 受理即完成，无需重发
+        ("dispatchforbidden", ExitCodes.BadRequest, "after_fix"), // v2.7：PAT 缺 Actions:RW——用户动作，非 agent 可修
+        ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
+        ("dispatchrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：ref/inputs 校验拒
+        ("apiredirected",     ExitCodes.BadRequest, "after_fix"), // v2.7：域外重定向不跟随，明说去向
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -70,11 +77,13 @@ internal static class Selftest
             { fail++; Console.WriteLine("!! unknown 缺\"结果未知\""); }
             if (name is "denied" or "timeout" or "policy" or "cooldown" or "consent" or "seal" or "internal1"
                     or "prmergerejected" or "prmergeforbidden" or "prmergenotfound" or "branchdeleteforbidden"
+                    or "prreopenrejected" or "issuecloserejected" or "dispatchforbidden" or "dispatchnotfound" or "dispatchrejected"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
             { fail++; Console.WriteLine("!! internal(后) 缺\"可能已完成\""); }
             if (name is "badreq" or "nonff" or "remotemoved" or "hasmerge" or "prmergechanged" or "prmergeverify"
+                    or "apiredirected"
                     && !sample.Text.Contains("本次未产生任何副作用"))
             { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
             if (name == "httpfail" && !sample.Text.Contains("无任何副作用"))
