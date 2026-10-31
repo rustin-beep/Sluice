@@ -415,6 +415,50 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- push 基点不在远端（exit 10，retry=after_fix；v2.12 缺陷一主案：校验前移到任何上传之前，
+    //      失败零上传零副作用——原在 blob 全传完后才炸并谎报"内部错误/可能已完成"） ----
+    public static Msg PushBaseMissing(string detail) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：{detail}。
+        本次未产生任何副作用（分支未动；基点校验先于一切对象上传）。
+        修正：先把基点所在分支推上远端（或等其所在 PR 合并），或改用远端已有的祖先提交作 --base，然后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push 超限（exit 10，retry=after_fix；v2.12 前置到规划期——不烧批准；执行期保留为范围收窄后的兜底） ----
+    public static Msg PushTooLarge(string detail) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：{detail}。
+        本次未产生任何副作用。
+        修正：分批推送——先以 --base 指向更早的远端基点推前一段，git fetch 后再推剩余段（fast-forward）；或精简历史后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push 序列步骤被服务端拒绝（exit 10，retry=after_fix；v2.12 缺陷三：原 Other→Internal(1)
+    //      无 Reason 槽位、wait_user——把一批 after_fix 可自修错误错标成内部错误。现渲染服务端原话；
+    //      "分支未动"是可证事实（update-ref 是唯一写点且未执行） ----
+    public static Msg PushStepRejected(string? detail) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：推送序列被服务端拒绝（{detail ?? "HTTP 非 2xx"}）。
+        本次未产生任何副作用：分支未动（update-ref 未执行）；已上传对象为内容寻址孤儿（无引用、不可见，服务端将回收）。
+        修正：按上方服务端原话处理（权限/保护类 → 转告用户；校验类 → 核对参数）后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- push blob sha 不符（exit 20，retry=retry_ok；v2.12：内容寻址对象同内容必同 sha——不符
+    //      = 服务端异常窗（Vitro 4×blob-500 同族）；分支未动、blob 幂等重传安全） ----
+    public static Msg PushBlobMismatch(string detail) => new(
+        "[Sluice]",
+        $"""
+        push 未执行：{detail}——内容寻址对象同内容必同 sha，属服务端异常（重试安全）。
+        本次无任何副作用：分支未动；blob 为幂等对象。
+        可间隔 30 秒后重试同一命令（将重新弹窗批准）；连续 3 次失败则报告用户。
+        """,
+        ExitCodes.HttpFailed, "retry_ok", true);
+
     // ---- pr reopen 被服务端拒绝（exit 10，retry=after_fix；403/404/422 透传服务端 message。
     //      2026-10-31 Vitro 复盘 #2：PR 误关后只能开新 PR，讨论上下文断链——reopen 是正解，
     //      也是 CI 卡死时比 workflow dispatch 更常用的补救（reopened 是 pull_request 默认触发 type）） ----
@@ -578,6 +622,10 @@ internal static class Messages
         ("nonff",  PushNonFF("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2", "b9a84c5b")),
         ("remotemoved", PushRemoteMoved("rustin-beep/Sluice", "feat/x", "批准期间远端头已变化（规划期 b9a84c5b → 现在 4d81e0c7），弹窗展示的替换对象已过期")),
         ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
+        ("pushbasemissing", PushBaseMissing("--base 基点提交 21028006 不在远端（HTTP 404：Not Found）——增量基点必须是远端已有对象（增量 base_tree 的锚）")),
+        ("pushtoolarge", PushTooLarge("提交数 341 超过 200 上限，请分批")),
+        ("pushsteprejected", PushStepRejected("tree 创建 HTTP 422：Invalid request")),
+        ("pushblobmismatch", PushBlobMismatch("blob 上传返回 sha 51d0c7a3 与内容寻址不符（本地 9f3c2a1b）")),
         ("prreopenrejected", PrReopenRejected("rustin-beep/Vitro#389", "HTTP 422：head branch was deleted")),
         ("issuecloserejected", IssueCloseRejected("rustin-beep/Vitro#369", "HTTP 422：Can't close a pull request through the issues API")),
         ("issuecreaterejected", IssueCreateRejected("rustin-beep/Sluice 新建 issue", "HTTP 403：Resource not accessible by personal access token")),

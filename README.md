@@ -68,6 +68,7 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice seal [--fix]` / `sluice selftest` / `sluice --version` | 自查 / 自检 / 版本戳 | |
 
 推送序列的 5xx（blob/tree/commit，内容寻址幂等）自动退避重试（2s/8s×3）；update-ref 永不自动重试。
+步骤被服务端拒绝会**原样透传服务端 message**（exit 10，分支未动）；`--base` 基点不在远端在**一切上传之前**拦截（exit 10，零副作用）；blob sha 与内容寻址不符归 20（平台异常，重传安全）。
 
 ## config.json（`%LOCALAPPDATA%\Sluice\config.json`）
 

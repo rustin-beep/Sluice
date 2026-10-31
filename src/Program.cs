@@ -154,7 +154,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.11");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.12");
         return 0;
     }
 
@@ -264,16 +264,40 @@ internal static class Program
             return ExitCodes.Internal;
         }
 
+        // v2.12（缺陷一 belts 层）：--base 基点远端在场的匿名预检——公开库可在弹窗前警示（省一道批准），
+        // 私有库匿名 404 与"不在远端"不可区分（v2.8 纪律：不硬拒）；权威终判在执行期首步（已前移到
+        // 任何上传之前，带 token）。读落审计，失败不阻塞。
+        string? baseWarn = null;
+        if (plan.Base is { Length: 40 or 64 } baseSha)
+        {
+            try
+            {
+                var (bst, bbody, bNotSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/git/commits/{baseSha}")
+                    .GetAwaiter().GetResult();
+                if (!bNotSent)
+                    Audit.Append("api_read", "api.github.com", $"repos/{repo}/git/commits/{baseSha}", null,
+                        $"http_{bst}", result: $"{bbody.Length}B anon");
+                if (!bNotSent && bst == 404)
+                    baseWarn = $"--base 基点 {baseSha[..8]} 未见於远端匿名读：公开库 = 确不在远端（执行将拒绝、零上传零副作用）；私有库匿名不可见属正常——由执行时带 token 终判";
+            }
+            catch { /* 预检尽力而为，不阻塞 */ }
+        }
+
         // 重放式更新：弹窗 target 行明示替换（§9.6 闸门③）——旧头→新头一眼可辨，与常规推送区分
         var gateTarget = plan.ReplacingSha is string oldHead
             ? $"{branch} {oldHead[..8]}→{plan.HeadSha[..8]}（重放式更新）"
             : $"{branch} @ {plan.HeadSha[..8]}";
+        var gateWarns = new[]
+        {
+            plan.TouchesWorkflows ? "本次推送修改 .github/workflows/** —— 批准即部署 CI 变更，请特别确认" : null,
+            baseWarn,
+        }.Where(w => w is not null).ToArray();
         Gate.Outcome outcome;
         using (InputFilter.Install())
         {
             outcome = Gate.Run(new Gate.Request("push", repo, gateTarget,
                 plan.WindowText, plan.HeadSha[..8], TokenStore.PeekChallenge(),
-                plan.TouchesWorkflows ? "本次推送修改 .github/workflows/** —— 批准即部署 CI 变更，请特别确认" : null));
+                gateWarns.Length > 0 ? string.Join("\n", gateWarns) : null));
         }
 
         switch (outcome)
@@ -369,7 +393,15 @@ internal static class Program
             // fetch；不落 NonFF（那会开出"加 --base"这条已满足的死指令，2026-10-31 实战绕圈根源）
             RestPush.PushResult.ReplayUnresolved => PushFail(plan, "replay_unresolved",
                 Messages.PushReplayUnresolved(plan.Repo, plan.Branch), ExitCodes.BadRequest, r.Reason),
-            _ => PushFail(plan, "other", Messages.Internal(afterExecutionStarted: true), ExitCodes.Internal, r.Reason),
+            // v2.12：三新档 + Other 兜底臂改渲染 Reason——原 Internal(after=true) 无 Reason 槽位且
+            // "可能已完成"对整个 Other 族都是假话（update-ref 未执行，分支必未动）
+            RestPush.PushResult.BaseMissing => PushFail(plan, "base_missing",
+                Messages.PushBaseMissing(r.Reason ?? "--base 基点不在远端"), ExitCodes.BadRequest, r.Reason),
+            RestPush.PushResult.TooLarge => PushFail(plan, "too_large",
+                Messages.PushTooLarge(r.Reason ?? "超过推送上限"), ExitCodes.BadRequest, r.Reason),
+            RestPush.PushResult.BlobMismatch => PushFail(plan, "blob_mismatch",
+                Messages.PushBlobMismatch(r.Reason ?? "blob sha 与内容寻址不符"), ExitCodes.HttpFailed, r.Reason),
+            _ => PushFail(plan, "other", Messages.PushStepRejected(r.Reason), ExitCodes.BadRequest, r.Reason),
         };
     }
 

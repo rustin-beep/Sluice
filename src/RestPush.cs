@@ -18,7 +18,7 @@ internal static class RestPush
         bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null,
         string? ReplacingSha = null); // ReplacingSha：重放入窗的 origin/{branch} 旧头（非 null 即重放模式，§9.6）
 
-    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved }
+    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved, BaseMissing, TooLarge, BlobMismatch }
 
     public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null);
 
@@ -71,7 +71,28 @@ internal static class RestPush
         var stat = Git(repoPath, $"diff --stat --no-renames {diffBase} HEAD").Trim();
         var workflows = GitLines(repoPath, $"diff --name-only --no-renames {diffBase} HEAD")
             .Any(p => p.StartsWith(".github/workflows/", StringComparison.Ordinal));
-        var blobs = CollectBlobs(repoPath, commits);
+
+        // v2.12（缺陷二处置）：全历史形态 = 规划期盲区——本地无 tracking 引用时无法区分"真新建分支"
+        // 与"曾推过远端但 REST 不回写引用"。错误文案附 fetch 正解、弹窗加警示行；有意不 fail-closed：
+        // FF 推送无销毁侧（闸门⑤ fail-closed 的理由在此不成立），且批准内容 ⊇ 执行内容（执行以远端现状收窄）
+        string FhHint(string what) => !hasTracking && baseSha is null
+            ? $"\n提示：本次因本地无 origin/{branch} 引用走了全历史回溯——若该分支曾推过远端（REST 推送不回写本地引用），git fetch origin {branch} 后重跑即改走增量，可绕开此{what}"
+            : "";
+        var assumeNewNote = !hasTracking && baseSha is null
+            ? $"""
+              ⚠ 本地无 origin/{branch} 引用，按「新建分支·全历史」规划——若该分支远端已存在（如曾用 sluice 推过，REST 不回写本地引用），先 git fetch origin {branch} 重跑可得精确增量；执行发现分支已存在时将以远端现状收窄并做 fast-forward 校验（不销毁任何远端提交）
+
+              """
+            : "";
+        HashSet<string> blobs;
+        try { blobs = CollectBlobs(repoPath, commits); }
+        catch (LocalPlanException ex) { throw new LocalPlanException(ex.Message + FhHint("历史提交")); }
+
+        // v2.12：超限前置到规划期（原只在执行期——批准已烧）；执行期同款检查保留为范围收窄后的兜底
+        if (commits.Count > 200)
+            throw new LocalPlanException($"提交数 {commits.Count} 超过 200 上限，请分批推送{FhHint("限制")}");
+        if (blobs.Count > 2000)
+            throw new LocalPlanException($"待传对象 {blobs.Count} 超过 2000 上限，请分批或精简{FhHint("限制")}");
 
         // 重放披露（§9.6 闸门③——"批准你所见"扩展到销毁侧）：所见必须覆盖将被替换/丢弃的部分。
         // 丢弃清单 = rev-list HEAD..origin/{branch}（远端有而新历史没有的提交），规划期算出入窗
@@ -91,7 +112,7 @@ internal static class RestPush
         }
 
         var window = $"""
-            {replayNote}提交数：{commits.Count}{(replay ? $"（重放，基点 {baseSha![..8]}..HEAD）" : hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
+            {assumeNewNote}{replayNote}提交数：{commits.Count}{(replay ? $"（重放，基点 {baseSha![..8]}..HEAD）" : hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
             待传对象：{blobs.Count} 个 blob
 
             提交：
@@ -201,6 +222,27 @@ internal static class RestPush
         }
         var replay = !isNew && plan.ReplacingSha is not null;
 
+        // v2.12（缺陷一处置）：基点/远端头在场校验 + base_tree 解析前移到任何上传之前——原位置在
+        // blob 全部上传之后，基点缺失时白传全部 blob 才失败；前移后失败零上传零副作用。
+        // 请求数量不变（该 GET 原本就有，只是来得晚）；执行期位置即权威终判（带 token，无私有不可辨问题）
+        string prevCommit = replay ? plan.Base! : isNew ? plan.Base ?? "" : remoteSha;
+        string prevTree = "";
+        if (prevCommit.Length > 0)
+        {
+            var (gst, gbody) = await GitHubApi.SendRawAsync(HttpMethod.Get,
+                $"repos/{plan.Repo}/git/commits/{prevCommit}", token, null);
+            if (gst != 200)
+            {
+                if (plan.Base is not null && prevCommit == plan.Base)
+                    return new(PushResult.BaseMissing,
+                        $"--base 基点提交 {prevCommit[..8]} 不在远端（{Why(gst, gbody)}）——增量基点必须是远端已有对象（增量 base_tree 的锚）");
+                // plain-FF：prevCommit=remoteSha 刚经 GET ref 取得，此处读不到属竞态/平台异常
+                return new(PushResult.Other,
+                    Reason: $"远端头提交 {prevCommit[..8]} 读取失败（{Why(gst, gbody)}）");
+            }
+            prevTree = JsonNode.Parse(gbody)?["tree"]?["sha"]?.GetValue<string>() ?? "";
+        }
+
         // 快进校验（以本地对象库为准，fail-closed）；重放模式另行分流（闸门①：NonFF 判定不放宽，只分流；
         // v2.10：--base+远端已存在+无本地引用已被上方 ReplayUnresolved 前置拦截——本分流内 NonFF 必然未声明 --base）
         string range;
@@ -245,10 +287,10 @@ internal static class RestPush
             return new(PushResult.HasMerge, $"{shown}（共 {merges.Count} 个）");
         }
         var commits = GitLines(plan.RepoPath, $"rev-list --reverse {range}");
-        if (commits.Count > 200) return new(PushResult.Other, Reason: $"提交数 {commits.Count} 超过 200 上限，请分批");
+        if (commits.Count > 200) return new(PushResult.TooLarge, Reason: $"提交数 {commits.Count} 超过 200 上限，请分批");
 
         var blobs = CollectBlobs(plan.RepoPath, commits);
-        if (blobs.Count > 2000) return new(PushResult.Other, Reason: $"待传对象 {blobs.Count} 超过 2000 上限");
+        if (blobs.Count > 2000) return new(PushResult.TooLarge, Reason: $"待传对象 {blobs.Count} 超过 2000 上限");
 
         // blob 上传（内容寻址，幂等；服务器返回 sha 必与本地一致，不符即停；5xx 有界重试 v2.7）
         foreach (var sha in blobs)
@@ -258,23 +300,16 @@ internal static class RestPush
             var (bst, bbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                 $"repos/{plan.Repo}/git/blobs", token, blobBody.ToJsonString());
             if (bst is not (200 or 201)) return Net(bst, $"blob 上传 {Why(bst, bbody)}");
-            if (JsonNode.Parse(bbody)?["sha"]?.GetValue<string>() != sha)
-                return new(PushResult.Other, Reason: $"blob sha 不符：{sha[..8]}");
+            var gotSha = JsonNode.Parse(bbody)?["sha"]?.GetValue<string>();
+            if (gotSha != sha)
+                // v2.12：内容寻址对象同内容必同 sha——不符属服务端异常窗（Vitro 4×blob-500 同族）；
+                // 分支未动、blob 幂等，重传安全 → BlobMismatch（20/retry_ok）
+                return new(PushResult.BlobMismatch, Reason: $"blob 上传返回 sha {gotSha?[..Math.Min(8, gotSha.Length)] ?? "?"} 与内容寻址不符（本地 {sha[..8]}）");
         }
 
         // 逐 commit：tree（base_tree 增量）+ commit（保真 author/committer/date）
-        // 重放锚点 = 声明的新基点（不是远端旧头——旧头正是要被替换掉的）
-        string prevCommit = replay ? plan.Base! : isNew ? plan.Base ?? "" : remoteSha;
-        string prevTree = "";
-        if (prevCommit.Length > 0)
-        {
-            // 基点/远端 HEAD 的 tree 必须取自服务端（增量 base_tree 的锚）——取不到即 fail-closed
-            var (gst, gbody) = await GitHubApi.SendRawAsync(HttpMethod.Get,
-                $"repos/{plan.Repo}/git/commits/{prevCommit}", token, null);
-            if (gst != 200)
-                return new(PushResult.Other, Reason: $"基点提交 {prevCommit[..8]} 远端不存在（{Why(gst, gbody)}）——增量基点必须是远端已有对象");
-            prevTree = JsonNode.Parse(gbody)?["tree"]?["sha"]?.GetValue<string>() ?? "";
-        }
+        // 重放锚点 = 声明的新基点（不是远端旧头——旧头正是要被替换掉的）；
+        // prevCommit/prevTree 已在前移段（任何上传之前）解析完毕
         var lastSha = prevCommit;
 
         foreach (var c in commits)

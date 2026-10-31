@@ -48,6 +48,10 @@ internal static class Selftest
         ("dispatchrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：ref/inputs 校验拒
         ("apiredirected",     ExitCodes.BadRequest, "after_fix"), // v2.7：域外重定向不跟随，明说去向
         ("pushdone",        ExitCodes.Success,      "—"),          // v2.10：push 成功附"本地引用不回写"提示
+        ("pushbasemissing", ExitCodes.BadRequest,   "after_fix"),  // v2.12：基点不在远端——推基点或换祖先；校验前移零上传
+        ("pushtoolarge",    ExitCodes.BadRequest,   "after_fix"),  // v2.12：超限分批（规划期先拦不烧批准）
+        ("pushsteprejected",ExitCodes.BadRequest,   "after_fix"),  // v2.12：Other 族渲染服务端原话，分支未动是事实
+        ("pushblobmismatch",ExitCodes.HttpFailed,   "retry_ok"),   // v2.12：内容寻址平台异常，重传安全
         ("replayunresolved",ExitCodes.BadRequest,   "after_fix"),  // v2.10：--base+远端已存在+无本地引用 → fetch 后原命令重跑
         ("apirateanon",     ExitCodes.BadRequest,   "after_fix"),  // v2.10：匿名配额耗尽 ≠ 私有，加 --auth 走独立配额
         ("apiratewait",     ExitCodes.RateLimitWait, "wait_until"), // v2.10：限流等待 ≠ 凭据失效（exit 22 新档——wait_until 不寄生 20/retry_ok，函数性）
@@ -93,10 +97,10 @@ internal static class Selftest
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
             { fail++; Console.WriteLine("!! internal(后) 缺\"可能已完成\""); }
             if (name is "badreq" or "nonff" or "remotemoved" or "hasmerge" or "prmergechanged" or "prmergeverify"
-                    or "apiredirected"
-                    && !sample.Text.Contains("本次未产生任何副作用"))
+                    or "apiredirected" or "pushbasemissing" or "pushtoolarge" or "pushsteprejected"
+                && !sample.Text.Contains("本次未产生任何副作用"))
             { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
-            if (name == "httpfail" && !sample.Text.Contains("无任何副作用"))
+            if (name is "httpfail" or "pushblobmismatch" && !sample.Text.Contains("无任何副作用"))
             { fail++; Console.WriteLine("!! http_failed 缺\"无任何副作用\"句"); }
 
             // 设计原则 4：拒绝类消息必含绕行禁止语义（措辞按 §8.2 原文：cooldown 用"绕过"，其余用"重试"）
