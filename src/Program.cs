@@ -251,7 +251,7 @@ internal static class Program
     private static int ExecutePush(Gate.Outcome.Approved a, RestPush.Plan plan)
     {
         string token;
-        try { token = TokenStore.Load(a.Signature); }
+        try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
             Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "internal_vault_decrypt_failed", consent: "hello");
@@ -483,7 +483,7 @@ internal static class Program
     private static int Execute(Gate.Outcome.Approved a, string repo, int number, string target, string sha, string body)
     {
         string token;
-        try { token = TokenStore.Load(a.Signature); }
+        try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
             Audit.Append("pr_comment", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
@@ -544,25 +544,30 @@ internal static class Program
                 Messages.Write(Messages.NotInitialized());
                 return ExitCodes.NotInitialized;
             }
-            // 读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然
-            byte[]? sig;
-            try
+            // 读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然。
+            // D1：静默 vault（SLCV2，hello:false）无签名可言，直接静默取——
+            // vault 本身已是 owner 显式选择的静默格式，--auth 读随之下沉为零交互。
+            byte[]? sig = null;
+            if (!TokenStore.IsDpapiVault)
             {
-                sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+                try
+                {
+                    sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+                }
+                catch (VaultKeyMissingException ex)
+                {
+                    Audit.Append("api_read", "api.github.com", path, null, "vault_broken");
+                    Messages.Write(Messages.VaultBroken(ex.Message));
+                    return ExitCodes.NotInitialized;
+                }
+                if (sig is null)
+                {
+                    Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
+                    Messages.Write(Messages.ConsentFailed("api", path));
+                    return ExitCodes.ConsentFailed;
+                }
             }
-            catch (VaultKeyMissingException ex)
-            {
-                Audit.Append("api_read", "api.github.com", path, null, "vault_broken");
-                Messages.Write(Messages.VaultBroken(ex.Message));
-                return ExitCodes.NotInitialized;
-            }
-            if (sig is null)
-            {
-                Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
-                Messages.Write(Messages.ConsentFailed("api", path));
-                return ExitCodes.ConsentFailed;
-            }
-            try { token = TokenStore.Load(sig); }
+            try { token = TokenStore.LoadApproved(sig); }
             catch (Exception)
             {
                 Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: "hello");
@@ -735,7 +740,7 @@ internal static class Program
         string title, string body, string sha, string target)
     {
         string token;
-        try { token = TokenStore.Load(a.Signature); }
+        try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
             Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal_vault_decrypt_failed", consent: "hello");
@@ -917,7 +922,7 @@ internal static class Program
         bool deleteHead, string? headBranch, string? headShaSnapshot, string sha, string target)
     {
         string token;
-        try { token = TokenStore.Load(a.Signature); }
+        try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
             Audit.Append("pr_merge", repo, $"#{number}", sha, "internal_vault_decrypt_failed", consent: "hello");
@@ -1121,7 +1126,7 @@ internal static class Program
     private static int ExecuteBranchDelete(Gate.Outcome.Approved a, string repo, string branch, string sha, string target)
     {
         string token;
-        try { token = TokenStore.Load(a.Signature); }
+        try { token = TokenStore.LoadApproved(a.Signature); }
         catch (Exception)
         {
             Audit.Append("branch_delete", repo, branch, sha, "internal_vault_decrypt_failed", consent: "hello");

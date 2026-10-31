@@ -47,18 +47,29 @@ internal static class SetupCommand
         Console.WriteLine($"校验通过：login = {info}");
         Console.WriteLine("（注意：本地无法完整校验 fine-grained PAT 的仓库授权范围，以 GitHub 服务端为准——未授权仓库的写请求会 403。）");
 
-        Console.WriteLine();
-        Console.WriteLine("下一步将弹出 Windows Hello：创建/打开 vault 密钥并签名。");
-        Console.WriteLine("这次验证会加密你的 token；此后每次写操作解密时都需要同样的生物验证（批准即解密）。");
-        var p = TokenStore.NewParams();
-        var sig = await HelloConsent.SignForSetupAsync(p.Challenge);
-        if (sig is null)
+        if (Gate.HelloEnabled)
         {
-            Console.WriteLine("Windows Hello 未通过，setup 未完成（未保存任何内容）。");
-            return 1;
-        }
+            Console.WriteLine();
+            Console.WriteLine("下一步将弹出 Windows Hello：创建/打开 vault 密钥并签名。");
+            Console.WriteLine("这次验证会加密你的 token；此后每次写操作解密时都需要同样的生物验证（批准即解密）。");
+            var p = TokenStore.NewParams();
+            var sig = await HelloConsent.SignForSetupAsync(p.Challenge);
+            if (sig is null)
+            {
+                Console.WriteLine("Windows Hello 未通过，setup 未完成（未保存任何内容）。");
+                return 1;
+            }
 
-        TokenStore.Save(p, pat, sig);
+            TokenStore.Save(p, pat, sig);
+        }
+        else
+        {
+            // D1（2026-10-31）：config hello:false——vault 直接存 DPAPI 静默格式，setup 全程无 Hello。
+            // 代价：token 同用户进程可静默解密（owner 显式降级，见 Gate.HelloEnabled 注释）；
+            // 改回 true 后重跑 setup 即恢复 Hello 派生格式。
+            TokenStore.SaveDpapi(pat);
+            Console.WriteLine("config hello:false——vault 已存为静默格式（DPAPI），批准不再需要 Windows Hello。");
+        }
 
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice");
         if (!File.Exists(Path.Combine(dir, "config.json")))

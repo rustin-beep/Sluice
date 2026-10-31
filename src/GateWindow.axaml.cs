@@ -146,6 +146,15 @@ public partial class GateWindow : Window
         _timer?.Stop();
         Countdown.Text = $"{_secondsLeft}s";
 
+        // D1（2026-10-31，hello:false）：静默 vault（SLCV2）无需签名派生——批准点击即批准事件，
+        // 不弹 Hello。注入点击仍被 InputFilter 拦（LLMHF_INJECTED）；此路径的降级前提见 Gate.HelloEnabled 注释。
+        if (TokenStore.IsDpapiVault)
+        {
+            Gate.Result = new Gate.Outcome.Approved([]);
+            CloseWindow();
+            return;
+        }
+
         // UI-2/3（2026-10-30 实测修订）：Hello 系统凭据 UI **不是 TOPMOST 且 Z 序在调用者
         // 窗口之下**——本窗在前必遮 Hello（置顶版实测：Hello 恰在批准窗下面）。正解是
         // 弹 Hello 前隐藏本窗；Activate 先行确保 sluice 是前台（credential UI 定位跟随

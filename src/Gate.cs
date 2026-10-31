@@ -31,6 +31,30 @@ internal static class Gate
     /// </summary>
     public static int TimeoutSeconds { get; } = ReadTimeout();
 
+    /// <summary>
+    /// D1（2026-10-31 用户决策）：config.json "hello": false 时 vault 走 DPAPI 静默格式（SLCV2），
+    /// 批准点击即批准事件，不再弹 Windows Hello。默认 true = 原行为（Hello 签名派生密钥，一次
+    /// 生物事件 = 解锁 + 授权）。这是 owner 显式的防护降级：批准事件从生物事件降为桌面事件、
+    /// vault 从 Hello 派生降为同用户可静默解密（并发 agent/后台进程不被 sluice 阻塞，注入输入仅剩
+    /// InputFilter 用户态拦截）。agent 也可改此文件，但改 false = 降低自身防护（自伤侧），无防篡改必要。
+    /// </summary>
+    public static bool HelloEnabled { get; } = ReadHello();
+
+    private static bool ReadHello()
+    {
+        try
+        {
+            var cfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Sluice", "config.json");
+            if (!File.Exists(cfg)) return true;
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(cfg));
+            // 仅显式 false 才降级；缺失/true/其它值一律保持 Hello
+            return !(doc.RootElement.TryGetProperty("hello", out var v)
+                && v.ValueKind == System.Text.Json.JsonValueKind.False);
+        }
+        catch { return true; }
+    }
+
     private static int ReadTimeout()
     {
         try

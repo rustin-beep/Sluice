@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 
 namespace Sluice;
@@ -81,4 +82,134 @@ internal static class TokenStore
     private static byte[] DeriveKey(byte[] signature, byte[] salt) =>
         HKDF.DeriveKey(HashAlgorithmName.SHA256, signature, 32, salt,
             System.Text.Encoding.UTF8.GetBytes(Info));
+
+    // ---------- D1（2026-10-31）：hello:false 静默 vault（SLCV2 = DPAPI 包封） ----------
+    // owner 显式降级（config.json "hello": false）换免指纹体验：批准点击即批准事件，
+    // vault 同用户进程可静默解密——防线 = 批准窗 + InputFilter 注入拦截 + seal。
+    // Entropy 非密钥（二进制可见），仅让"随手 Unprotect"多一步。改回 true + 重跑 setup 可恢复 V1。
+
+    private static readonly byte[] MagicV2 = "SLCV2"u8.ToArray();
+    private static readonly byte[] DpapiEntropy = "sluice-dpapi-vault-v2"u8.ToArray();
+
+    /// <summary>当前 vault 是否为静默（DPAPI）格式——决定批准后是否还需 Hello。</summary>
+    public static bool IsDpapiVault
+    {
+        get
+        {
+            try
+            {
+                var b = File.ReadAllBytes(VaultPath);
+                return b.Length > 5 && b.AsSpan(0, 5).SequenceEqual(MagicV2);
+            }
+            catch { return false; }
+        }
+    }
+
+    public static void SaveDpapi(string pat)
+    {
+        var blob = DpapiProtect(System.Text.Encoding.UTF8.GetBytes(pat), DpapiEntropy);
+        Directory.CreateDirectory(Path.GetDirectoryName(VaultPath)!);
+        File.WriteAllBytes(VaultPath, [.. MagicV2, .. blob]);
+    }
+
+    private static string LoadDpapi()
+    {
+        var b = File.ReadAllBytes(VaultPath);
+        if (b.Length <= 5 || !b.AsSpan(0, 5).SequenceEqual(MagicV2))
+            throw new InvalidDataException("token.bin 不是静默格式（SLCV2）");
+        var plain = DpapiUnprotect(b[5..], DpapiEntropy);
+        return System.Text.Encoding.UTF8.GetString(plain);
+    }
+
+    // DPAPI（crypt32 直调，CurrentUser 作用域）：不引 System.Security.Cryptography.ProtectedData
+    // 包——零依赖纪律（同 MessageBeep 先例），NativeAOT 友好。
+    private const uint LMEM_FIXED = 0;
+    private const int CRYPTPROTECT_UI_FORBIDDEN = 0x1; // 静默：绝不弹 DPAPI 自己的 UI
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DATA_BLOB { public int cbData; public IntPtr pbData; }
+
+    [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CryptProtectData(
+        ref DATA_BLOB pDataIn, string? szDataDescr, ref DATA_BLOB pOptionalEntropy,
+        IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
+
+    [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CryptUnprotectData(
+        ref DATA_BLOB pDataIn, IntPtr ppszDataDescr, ref DATA_BLOB pOptionalEntropy,
+        IntPtr pvReserved, IntPtr pPromptStruct, int dwFlags, ref DATA_BLOB pDataOut);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalAlloc(uint uFlags, nuint cb);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr hMem);
+
+    private static byte[] DpapiProtect(byte[] plain, byte[] entropy)
+    {
+        var pin = ToBlob(plain);
+        var pent = ToBlob(entropy);
+        try
+        {
+            var @out = new DATA_BLOB();
+            if (!CryptProtectData(ref pin, null, ref pent, IntPtr.Zero, IntPtr.Zero, CRYPTPROTECT_UI_FORBIDDEN, ref @out))
+                throw new CryptographicException(Marshal.GetLastWin32Error());
+            return FromBlob(@out, free: true);
+        }
+        finally { FreeBlob(pin); FreeBlob(pent); }
+    }
+
+    private static byte[] DpapiUnprotect(byte[] blob, byte[] entropy)
+    {
+        var pin = ToBlob(blob);
+        var pent = ToBlob(entropy);
+        try
+        {
+            var @out = new DATA_BLOB();
+            if (!CryptUnprotectData(ref pin, IntPtr.Zero, ref pent, IntPtr.Zero, IntPtr.Zero, CRYPTPROTECT_UI_FORBIDDEN, ref @out))
+                throw new CryptographicException(Marshal.GetLastWin32Error());
+            return FromBlob(@out, free: true);
+        }
+        finally { FreeBlob(pin); FreeBlob(pent); }
+    }
+
+    private static DATA_BLOB ToBlob(byte[] data)
+    {
+        var p = LocalAlloc(LMEM_FIXED, (nuint)data.Length);
+        if (p == IntPtr.Zero) throw new OutOfMemoryException("LocalAlloc");
+        Marshal.Copy(data, 0, p, data.Length);
+        return new DATA_BLOB { cbData = data.Length, pbData = p };
+    }
+
+    private static byte[] FromBlob(DATA_BLOB blob, bool free)
+    {
+        var r = new byte[blob.cbData];
+        Marshal.Copy(blob.pbData, r, 0, blob.cbData);
+        if (free) LocalFree(blob.pbData);
+        return r;
+    }
+
+    private static void FreeBlob(DATA_BLOB blob) => LocalFree(blob.pbData);
+
+    /// <summary>批准/解锁后的统一取 token：静默 vault 直接解；Hello vault 用签名解，
+    /// 且当 config 已关闭 Hello 时顺手迁移为静默格式（等于最后一次生物事件），之后全程免指纹。
+    /// 迁移失败不阻断本次写（token 已解密且已批准）——下次再试即可。</summary>
+    public static string LoadApproved(byte[]? signature)
+    {
+        if (IsDpapiVault) return LoadDpapi();
+        var token = Load(signature!);
+        if (!Gate.HelloEnabled)
+        {
+            try
+            {
+                SaveDpapi(token);
+                Console.Error.WriteLine("[Sluice] vault 已迁移为静默格式（config hello:false）——后续批准不再需要 Windows Hello。");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Sluice] vault 迁移静默格式失败（{ex.Message}）——本次继续执行，下次批准仍会弹 Hello 重试迁移。");
+            }
+        }
+        return token;
+    }
 }
