@@ -64,7 +64,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14 push 逻辑锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -119,6 +119,7 @@ internal static class Selftest
 
         fail += McpChecks();
         fail += SurfaceLock();
+        fail += PushLogicChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -213,6 +214,44 @@ internal static class Selftest
         Eq("release_create body", c13.Body, "注记");
 
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
+        return fail;
+    }
+
+    // ---------- push 逻辑锁（v2.14） ----------
+
+    /// <summary>卡慢/平行链事故处置批的三个 pure 决策入锁：闸门⑦ 裸名消歧 / blob 去重分区 / CI 聋哑判定。
+    /// 与 git、网络解耦——决策表本身就是不变量（同名两侧异 sha 必拒绝；null 集必全传；聋哑只在单向缺失时响）。</summary>
+    private static int PushLogicChecks()
+    {
+        Console.WriteLine("--- push 逻辑锁（v2.14：基点消歧 / blob 去重分区 / CI 聋哑判定）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) 闸门⑦：同名两侧并存且异 sha 必 Ambiguous（fail-closed）；两侧皆无走 tag 兜底
+        Eq("两侧皆无→兜底(tag)", RestPush.ResolveBaseName(false, false, sameSha: false), RestPush.BaseResolution.Fallback);
+        Eq("仅本地→采用", RestPush.ResolveBaseName(true, false, false), RestPush.BaseResolution.LocalOnly);
+        Eq("仅远端→采用", RestPush.ResolveBaseName(false, true, false), RestPush.BaseResolution.RemoteOnly);
+        Eq("两侧同sha→采用", RestPush.ResolveBaseName(true, true, true), RestPush.BaseResolution.BothSame);
+        Eq("两侧异sha→拒绝", RestPush.ResolveBaseName(true, true, false), RestPush.BaseResolution.Ambiguous);
+
+        // (2) 去重分区：null 集（去重不可用/truncated）必全传；命中集只减不改
+        var blobs = new HashSet<string> { "aaa", "bbb", "ccc" };
+        var (up1, sk1) = RestPush.PartitionBlobs(blobs, null);
+        Eq("无集全传", (up1.Count, sk1), (3, 0));
+        var (up2, sk2) = RestPush.PartitionBlobs(blobs, new HashSet<string> { "bbb", "ccc", "zzz" });
+        Eq("命中跳过数", (up2.Count, sk2), (1, 2));
+        Eq("保留者", string.Join(",", up2), "aaa");
+
+        // (3) CI 聋哑：头树缺 workflows 且主干树有 → 警示；其余（含"仓本无 CI"）静默
+        Eq("头缺主干有→警示", RestPush.CiDeafNeeded(false, true), true);
+        Eq("两侧都有", RestPush.CiDeafNeeded(true, true), false);
+        Eq("两侧都无(仓本无CI)", RestPush.CiDeafNeeded(false, false), false);
+        Eq("头有主干无", RestPush.CiDeafNeeded(true, false), false);
+
+        Console.WriteLine(fail == 0 ? "push 逻辑锁通过。" : "push 逻辑锁有不符项（见上）。");
         return fail;
     }
 

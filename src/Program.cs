@@ -162,7 +162,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.13");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.14");
         return 0;
     }
 
@@ -295,10 +295,15 @@ internal static class Program
         var gateTarget = plan.ReplacingSha is string oldHead
             ? $"{branch} {oldHead[..8]}→{plan.HeadSha[..8]}（重放式更新）"
             : $"{branch} @ {plan.HeadSha[..8]}";
+        // v2.14（CI 聋哑警示）：被推头树不含 .github/workflows 而远端主干树含——on:push 型 CI
+        // 该分支此后结构性零运行（平行链事故终态症状）；纯本地判定，agent 在 sluice 外
+        // 裸名 rebase 造出平行链时，sluice 在推门前兜住症状
+        var ciDeaf = RestPush.CiDeafWarning(plan.RepoPath, plan.HeadSha);
         var gateWarns = new[]
         {
             plan.TouchesWorkflows ? "本次推送修改 .github/workflows/** —— 批准即部署 CI 变更，请特别确认" : null,
             baseWarn,
+            ciDeaf,
         }.Where(w => w is not null).ToArray();
         Gate.Outcome outcome;
         using (InputFilter.Install())
@@ -423,14 +428,16 @@ internal static class Program
 
     private static int Done(RestPush.Result r, RestPush.Plan plan)
     {
+        // v2.14：去重跳过数入审计（blobs 远端已有未重传——重放/全历史推送的实付成本可追溯）
+        var skip = r.SkippedBlobs > 0 ? $"，跳过 {r.SkippedBlobs} blob（远端已有）" : "";
         Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "approved", consent: TokenStore.ConsentChannel,
             result: plan.ReplacingSha is string old
-                ? $"executed:{r.NewSha}（重放替换 {old[..8]}）"
-                : $"executed:{r.NewSha}");
+                ? $"executed:{r.NewSha}（重放替换 {old[..8]}{skip}）"
+                : $"executed:{r.NewSha}{skip}");
         // v2.10：换 PushDone 专属模板——REST 推送不回写本地 origin/{branch} 引用，成功消息
         // 必附 fetch 提示（否则"首次成功 → rebase → 再推必踩"是隐形确定性路径）
         // NewSha 兜底 HeadSha：Done 路径服务端必回 sha，兜底仅为可空性收口（内容寻址，二者同物）
-        Messages.Write(Messages.PushDone(plan.Repo, plan.Branch, r.NewSha ?? plan.HeadSha, plan.ReplacingSha is not null));
+        Messages.Write(Messages.PushDone(plan.Repo, plan.Branch, r.NewSha ?? plan.HeadSha, plan.ReplacingSha is not null, r.SkippedBlobs));
         return ExitCodes.Success;
     }
 

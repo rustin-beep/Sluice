@@ -37,13 +37,14 @@ internal static class Messages
         ExitCodes.Success, "—", false);
 
     // ---- push 成功（exit 0；v2.10：REST 推送不回写本地 origin/{branch} 引用——成功消息必附
-    //      fetch 提示，掐掉"首次成功 → rebase → 再推必踩 NonFF/ReplayUnresolved"这条确定性路径） ----
-    public static Msg PushDone(string repo, string branch, string newSha, bool replay) => new(
+    //      fetch 提示，掐掉"首次成功 → rebase → 再推必踩 NonFF/ReplayUnresolved"这条确定性路径；
+    //      v2.14：skipped>0 时附去重行——远端已有未重传的 blob 数一目了然） ----
+    public static Msg PushDone(string repo, string branch, string newSha, bool replay, int skipped = 0) => new(
         "[Sluice]",
         $"""
         已完成：push → {repo}@{branch}（HTTP 200{(replay ? "，重放式更新" : "")}）
         结果：https://github.com/{repo}/commit/{newSha}
-        注意：本地 origin/{branch} 未更新（REST 推送不回写本地引用）——后续 rebase / 重推同分支前先 git fetch origin {branch}。
+        {(skipped > 0 ? $"去重：{skipped} 个 blob 远端默认分支已有，未重传。\n" : "")}注意：本地 origin/{branch} 未更新（REST 推送不回写本地引用）——后续 rebase / 重推同分支前先 git fetch origin {branch}。
         操作已在远端生效，无需再用其他命令验证。
         """,
         ExitCodes.Success, "—", false);

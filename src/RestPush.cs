@@ -20,7 +20,7 @@ internal static class RestPush
 
     public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved, BaseMissing, TooLarge, BlobMismatch }
 
-    public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null);
+    public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null, int SkippedBlobs = 0);
 
     private const string EmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -33,10 +33,48 @@ internal static class RestPush
         var hasTracking = GitExists(repoPath, tracking);
         string? baseSha = null;
         string? replacingSha = null; // 重放式更新（§9.6）：将被替换的 origin/{branch} 旧头；非 null 即重放模式
+        var baseDesc = baseRef ?? ""; // v2.14：基点来源披露——消歧后标注解析到了哪个引用（弹窗基点行）
         if (baseRef is not null)
         {
-            baseSha = Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
-            if (baseSha.Length < 40 || !GitIsAncestor(repoPath, baseSha, head))
+            // 闸门⑦（v2.14，2026-10-31 三连坑定案）：git 裸名 DWIM 优先 refs/heads/、永不尝试
+            // refs/remotes/origin/*——worktree 场景本地分支常年陈旧（主仓 checkout 别的分支），
+            // --base master 静默吃到影子引用（实测落后 17 笔：2 笔增量被放大成 19 笔重放/276 blob）。
+            // 同名两侧并存且异 sha ⇒ fail-closed 点名二选一（与闸门⑤同型：静默误路由才是缺陷，
+            // 重跑一次 << 冗余重传）；仅一侧存在 ⇒ 采用并披露来源（仅远端存在是新增可解形态——
+            // 原裸名 rev-parse 直接失败）。副作用：裸名自此为分支命名空间语义，tag 须写 refs/tags/<name>。
+            if (!baseRef.Contains('/') && baseRef.Length is not (40 or 64))
+            {
+                var localRef = $"refs/heads/{baseRef}";
+                var remoteRef = $"refs/remotes/origin/{baseRef}";
+                var localSha = GitTryRevParse(repoPath, localRef);
+                var remoteSha = GitTryRevParse(repoPath, remoteRef);
+                switch (ResolveBaseName(localSha is not null, remoteSha is not null,
+                        localSha is not null && localSha == remoteSha))
+                {
+                    case BaseResolution.Ambiguous:
+                        throw new LocalPlanException(
+                            $"""
+                            --base 裸名 {baseRef} 有歧义：本地分支与远端跟踪引用同名，但指向不同提交——
+                              {localRef}  → {localSha![..8]}（{BaseMeta(repoPath, localSha!)}）
+                              {remoteRef} → {remoteSha![..8]}（{BaseMeta(repoPath, remoteSha!)}）
+                            worktree 场景本地分支常陈旧（主仓 checkout 别的分支时不更新），增量基点通常应取远端跟踪引用。
+                            请二选一后重跑：--base origin/{baseRef}（荐）或 --base refs/heads/{baseRef}（确要用本地分支）。
+                            """);
+                    case BaseResolution.LocalOnly:
+                        baseSha = localSha; baseDesc = $"本地分支 {baseRef}"; break;
+                    case BaseResolution.RemoteOnly:
+                        baseSha = remoteSha; baseDesc = $"origin/{baseRef}（远端跟踪引用）"; break;
+                    case BaseResolution.BothSame:
+                        baseSha = localSha; baseDesc = $"{baseRef}（本地=origin/{baseRef}）"; break;
+                    default:
+                        baseSha = null; // 两侧皆无 → rev-parse 兜底（tag 等其它引用形态）
+                        break;
+                }
+            }
+            else if (baseRef.Length is 40 or 64)
+                baseDesc = "显式 sha";
+            baseSha ??= Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
+            if (baseSha is not { Length: 40 or 64 } || !GitIsAncestor(repoPath, baseSha, head))
             {
                 // v2.10（2026-10-31 实战）：泛化提示逼 agent 自诊——两次踩的是同一个真实原因
                 // （远端基点已前进而本地引用未更新），点名正解即可自救
@@ -111,8 +149,11 @@ internal static class RestPush
                 """;
         }
 
+        // v2.14：基点行带来源与日期——"陈旧与否"批前肉眼可辨（消歧闸门拦不住两侧同陈旧的形态，这是兜底）
+        var baseLabel = baseSha is null ? ""
+            : $"{baseSha[..Math.Min(8, baseSha.Length)]}（{baseDesc}，{Git(repoPath, $"log -1 --format=%ad --date=short {baseSha}").Trim()}）";
         var window = $"""
-            {assumeNewNote}{replayNote}提交数：{commits.Count}{(replay ? $"（重放，基点 {baseSha![..8]}..HEAD）" : hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseSha[..8]}..HEAD）" : "（全历史，新建分支）")}
+            {assumeNewNote}{replayNote}提交数：{commits.Count}{(replay ? $"（重放，基点 {baseLabel}..HEAD）" : hasTracking ? $"（origin/{branch}..HEAD）" : baseSha is not null ? $"（新建分支，基点 {baseLabel}..HEAD）" : "（全历史，新建分支）")}
             待传对象：{blobs.Count} 个 blob
 
             提交：
@@ -124,6 +165,123 @@ internal static class RestPush
             （若目标仓库为空，将先自动创建 README.md 完成初始化）
             """;
         return new Plan(repo, branch, repoPath, head, window, workflows, commits.Count, blobs.Count, baseSha, replacingSha);
+    }
+
+    // ---------- v2.14 纯函数（selftest 锁：决策/分区/判定与 git、网络解耦） ----------
+
+    public enum BaseResolution { Fallback, LocalOnly, RemoteOnly, BothSame, Ambiguous }
+
+    /// <summary>闸门⑦ 裸名消歧决策（纯函数，selftest 锁）：同名两侧并存且异 sha 必 Ambiguous
+    /// （fail-closed）；两侧皆无走 rev-parse 兜底（tag 等其它引用形态）。</summary>
+    public static BaseResolution ResolveBaseName(bool hasLocal, bool hasRemote, bool sameSha) =>
+        (hasLocal, hasRemote) switch
+        {
+            (false, false) => BaseResolution.Fallback,
+            (true, false) => BaseResolution.LocalOnly,
+            (false, true) => BaseResolution.RemoteOnly,
+            (true, true) => sameSha ? BaseResolution.BothSame : BaseResolution.Ambiguous,
+        };
+
+    /// <summary>blob 去重分区（纯函数，selftest 锁）：remote 为 null = 去重不可用 → 全传。
+    /// 返回（待传列表, 跳过数）；命中集只减不改（保序遍历入列表）。</summary>
+    public static (List<string> Upload, int Skipped) PartitionBlobs(HashSet<string> blobs, HashSet<string>? remote)
+    {
+        if (remote is null) return (blobs.ToList(), 0);
+        var upload = new List<string>();
+        var skipped = 0;
+        foreach (var b in blobs)
+        {
+            if (remote.Contains(b)) skipped++;
+            else upload.Add(b);
+        }
+        return (upload, skipped);
+    }
+
+    /// <summary>CI 聋哑判定（纯函数，selftest 锁）：被推头树无 workflows 而远端主干树有 → 需警示。</summary>
+    public static bool CiDeafNeeded(bool headHasWorkflows, bool trunkHasWorkflows) =>
+        !headHasWorkflows && trunkHasWorkflows;
+
+    /// <summary>
+    /// CI 聋哑警示（v2.14，平行链事故终态症状；纯本地 git，零 API）：on:push 型 CI 的工作流
+    /// 文件取被推头所在树——链根早于 CI 引入（陈旧 master / 平行链）时头树不含
+    /// .github/workflows，该分支此后每次推送都结构性零运行。agent 在 sluice 外用裸名
+    /// git rebase 造出平行链时，sluice 在推门前兜住症状。返回警示行；正常/判不了返回 null。
+    /// </summary>
+    public static string? CiDeafWarning(string repoPath, string headSha)
+    {
+        try
+        {
+            var headHas = GitLines(repoPath, $"ls-tree {headSha} -- .github/workflows").Count > 0;
+            foreach (var trunk in new[] { "origin/master", "origin/main" })
+                if (GitExists(repoPath, trunk))
+                {
+                    var trunkHas = GitLines(repoPath, $"ls-tree {trunk} -- .github/workflows").Count > 0;
+                    if (CiDeafNeeded(headHas, trunkHas))
+                        return $"被推头 {headSha[..Math.Min(8, headSha.Length)]} 的树不含 .github/workflows（{trunk} 的树含）——"
+                            + "若 CI 为 on:push 触发，该分支推送后不会触发任何工作流。常见根因：基点/分支根选在了 CI 引入之前"
+                            + "（如陈旧的本地 master）；若非有意，请 git fetch origin 后基于 origin/<主干> 重做再推。";
+                    if (trunkHas) break; // 主干树有 workflows 且头树也有 → 正常
+                }
+            return null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>rev-parse --verify --quiet：解析得 commit sha；引用不存在/异常返回 null（不抛）。</summary>
+    private static string? GitTryRevParse(string repoPath, string rev)
+    {
+        var psi = new ProcessStartInfo("git", $"rev-parse --verify --quiet {rev}^{{commit}}")
+        {
+            WorkingDirectory = repoPath, UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+        };
+        using var p = Process.Start(psi);
+        if (p is null || !p.WaitForExit(5000) || p.ExitCode != 0) return null;
+        var sha = p.StandardOutput.ReadToEnd().Trim();
+        return sha.Length is 40 or 64 ? sha : null;
+    }
+
+    /// <summary>基点元数据一行（消歧报错共用）：日期 + 标题（截断，读不动给占位）。</summary>
+    private static string BaseMeta(string repoPath, string sha)
+    {
+        try
+        {
+            var s = Git(repoPath, $"log -1 --format=\"%ad %s\" --date=short {sha}").Trim();
+            return s.Length > 60 ? s[..60] + "…" : s;
+        }
+        catch { return "元数据不可读"; }
+    }
+
+    /// <summary>远端默认分支头树的 blob sha 集（recursive）；任一步失败或截断返回 null=放弃去重。
+    /// 3 个 GET：repos/{repo}（default_branch）→ ref/heads/{默认分支}（tip）→ trees/{tip}?recursive=1。</summary>
+    private static async Task<HashSet<string>?> FetchDefaultBranchBlobSet(string token, string repo)
+    {
+        try
+        {
+            var (rst, rbody) = await GitHubApi.SendRawAsync(HttpMethod.Get, $"repos/{repo}", token, null);
+            if (rst != 200) return null;
+            var defBranch = JsonNode.Parse(rbody)?["default_branch"]?.GetValue<string>();
+            if (string.IsNullOrEmpty(defBranch)) return null;
+            var (rst2, rbody2) = await GitHubApi.SendRawAsync(HttpMethod.Get,
+                $"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(defBranch)}", token, null);
+            if (rst2 != 200) return null;
+            var tip = JsonNode.Parse(rbody2)?["object"]?["sha"]?.GetValue<string>();
+            if (string.IsNullOrEmpty(tip)) return null;
+            var (tst, tbody) = await GitHubApi.SendRawAsync(HttpMethod.Get,
+                $"repos/{repo}/git/trees/{tip}?recursive=1", token, null);
+            if (tst != 200) return null;
+            var root = JsonNode.Parse(tbody);
+            if (root?["truncated"]?.GetValue<bool>() == true) return null; // 截断=集不全，去重降级为全传
+            var set = new HashSet<string>();
+            if (root?["tree"] is JsonArray arr)
+                foreach (var n in arr)
+                {
+                    var sha = n?["type"]?.GetValue<string>() == "blob" ? n?["sha"]?.GetValue<string>() : null;
+                    if (sha is { Length: 40 or 64 }) set.Add(sha);
+                }
+            return set;
+        }
+        catch { return null; }
     }
 
     /// <summary>收集 commit 序列相对第一父引入的全部 blob（去重；跳过删除/未合并）。</summary>
@@ -292,9 +450,24 @@ internal static class RestPush
         var blobs = CollectBlobs(plan.RepoPath, commits);
         if (blobs.Count > 2000) return new(PushResult.TooLarge, Reason: $"待传对象 {blobs.Count} 超过 2000 上限");
 
-        // blob 上传（内容寻址，幂等；服务器返回 sha 必与本地一致，不符即停；5xx 有界重试 v2.7）
-        foreach (var sha in blobs)
+        // blob 去重（v2.14，卡慢事故 Bug B）：远端默认分支头树 recursive 一次拉取，命中即跳过。
+        // blob POST 幂等但每 blob 一趟往返（实测串行 0.5s+/个：276 个里 ~250 远端已存在=纯浪费）。
+        // 逐 blob 探测被否决——已存在的只省请求体不省往返、缺失的反成双往返；树集 3 个 GET 换
+        // N 次 POST，覆盖全历史首推/陈旧基点/平行链等"冗余大头在默认分支"的场景。探不到的
+        // （在远端但不在该树，如中断重试的悬空 blob）照传——幂等无害。仅大对象集启用（>25）：
+        // 小推送常态全为新 blob，3 个 GET 不回本。truncated/任一步失败 ⇒ 放弃去重全传（退回 v2.13 行为）。
+        HashSet<string>? remoteBlobs = blobs.Count > 25 ? await FetchDefaultBranchBlobSet(token, plan.Repo) : null;
+        var (upload, skipped) = PartitionBlobs(blobs, remoteBlobs);
+        if (skipped > 0)
+            Console.Error.WriteLine($"[Sluice] blob 去重：{blobs.Count} 个中 {skipped} 个远端默认分支已有，跳过；实际上传 {upload.Count} 个");
+
+        // blob 上传（内容寻址，幂等；服务器返回 sha 必与本地一致，不符即停；5xx 有界重试 v2.7）。
+        // v2.14（卡慢事故 Bug C）：每 25 blob 一行 stderr 心跳——首行 banner 后全程静默 >1min 即观感卡死
+        var uploaded = 0;
+        foreach (var sha in upload)
         {
+            if (uploaded > 0 && uploaded % 25 == 0)
+                Console.Error.WriteLine($"[Sluice] blob {uploaded}/{upload.Count}（另跳过 {skipped}）…");
             var content = Convert.ToBase64String(GitBytes(plan.RepoPath, $"cat-file blob {sha}"));
             var blobBody = new JsonObject { ["content"] = content, ["encoding"] = "base64" };
             var (bst, bbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
@@ -305,6 +478,7 @@ internal static class RestPush
                 // v2.12：内容寻址对象同内容必同 sha——不符属服务端异常窗（Vitro 4×blob-500 同族）；
                 // 分支未动、blob 幂等，重传安全 → BlobMismatch（20/retry_ok）
                 return new(PushResult.BlobMismatch, Reason: $"blob 上传返回 sha {gotSha?[..Math.Min(8, gotSha.Length)] ?? "?"} 与内容寻址不符（本地 {sha[..8]}）");
+            uploaded++;
         }
 
         // 逐 commit：tree（base_tree 增量）+ commit（保真 author/committer/date）
@@ -312,8 +486,13 @@ internal static class RestPush
         // prevCommit/prevTree 已在前移段（任何上传之前）解析完毕
         var lastSha = prevCommit;
 
+        // v2.14（Bug C）：逐 commit 心跳——每笔 2 次往返（tree+commit），19 笔即 ~40s 静默段
+        var done = 0;
         foreach (var c in commits)
         {
+            done++;
+            if (commits.Count > 1)
+                Console.Error.WriteLine($"[Sluice] commit {done}/{commits.Count}（{c[..8]}）…");
             var parent = FirstParentOrEmpty(plan.RepoPath, c);
             var entries = new JsonArray();
             foreach (var line in GitLines(plan.RepoPath, $"-c core.quotePath=false diff-tree -r --no-renames --raw {parent} {c}"))
@@ -375,7 +554,7 @@ internal static class RestPush
             : await GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{plan.Repo}/git/refs/heads/{GitHubApi.RefPath(plan.Branch)}", token,
                 new JsonObject { ["sha"] = lastSha, ["force"] = replay }.ToJsonString());
         if (rst is not (200 or 201)) return Net(rst, $"update-ref {Why(rst, rbody)}");
-        return new(PushResult.Done, NewSha: lastSha);
+        return new(PushResult.Done, NewSha: lastSha, SkippedBlobs: skipped);
     }
 
     private static Result Net(int status, string detail) => status >= 500
