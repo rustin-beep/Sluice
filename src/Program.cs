@@ -31,8 +31,9 @@ internal static class Program
     {
         try
         {
-            Console.OutputEncoding = System.Text.Encoding.UTF8;
-            return Dispatch(args);
+        // GUI 宿主可能无控制台句柄（sluice mcp 被宿主以管道方式拉起时 setter 会抛）——尽力设置
+        try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { /* 管道/无控制台：McpServer 自带显式 UTF-8 流 */ }
+        return Dispatch(args);
         }
         catch (Exception ex)
         {
@@ -61,6 +62,7 @@ internal static class Program
         ["workflow", "dispatch", .. var rest] => RunWorkflowDispatch(rest),
         ["branch", "delete", .. var rest] => RunBranchDelete(rest),
         ["api", .. var rest] => RunApi(rest),
+        ["mcp", .. var rest] => McpServer.Run(rest),
         [var verb, ..] => BadVerb(verb),
     };
 
@@ -99,6 +101,10 @@ internal static class Program
                                                         路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计；
                                                         logs 等端点 302→CDN 签名 URL 自动跟随，仅限 GitHub 域 ≤3 跳）
               sluice selftest                           消息表与 exit code 自检
+              sluice mcp [--print-config]               MCP 前门（§9.7）：stdio JSON-RPC 服务，
+                                                        单一类型化工具 github_write；spawn-child
+                                                        拓扑——本进程不持凭据，每次调用绝对路径
+                                                        spawn CLI 子进程走完整闸门
 
             退出码见 `sluice selftest` 输出；消息规范见 plan-lite.md §8。
             """);
@@ -109,14 +115,14 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.8");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.9");
         return 0;
     }
 
     private static int BadVerb(string verb)
     {
         Messages.Write(Messages.BadRequest(
-            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / workflow / branch / api / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
+            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / workflow / branch / api / mcp / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
         return ExitCodes.BadRequest;
     }
 

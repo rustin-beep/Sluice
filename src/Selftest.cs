@@ -49,7 +49,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -100,9 +100,83 @@ internal static class Selftest
         foreach (var missing in Expected.Where(e => !samplesSet.Contains(e.Name)))
         { Console.WriteLine($"!! 样例缺失：{missing.Name}"); fail++; }
 
+        fail += McpChecks();
+
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
             : $"FAIL：{fail} 处不符。");
         return fail == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// §9.7 MCP 前门自检：(1) exit→retry 映射函数性——AllSamples 按 exit 分组 retry 必单值且与
+    /// RetryOf 一致（"同 exit 不同 retry"的新消息在此 FAIL，逼作者开新 exit 档或统一措辞，杜绝双表漂移）；
+    /// (2) BuildArguments 抽查（纯函数，零文件系统）。
+    /// </summary>
+    private static int McpChecks()
+    {
+        Console.WriteLine("--- mcp 映射（§9.7）---");
+        int fail = 0;
+
+        // (1) 函数性 + 一致性
+        foreach (var g in Messages.AllSamples().GroupBy(s => s.Sample.ExitCode).OrderBy(g => g.Key))
+        {
+            var retries = g.Select(x => x.Sample.Retry).Distinct().ToArray();
+            if (retries.Length != 1)
+            { fail++; Console.WriteLine($"!! exit {g.Key} 的 retry 不单值：{string.Join(" / ", retries)}——MCP 映射需要函数性：新消息请开新 exit 档或统一 retry 措辞"); }
+            else if (McpServer.RetryOf(g.Key) != retries[0])
+            { fail++; Console.WriteLine($"!! McpServer.RetryOf({g.Key}) = {McpServer.RetryOf(g.Key)} ≠ 消息表 {retries[0]}"); }
+        }
+        Console.WriteLine("exit→retry 函数性："
+            + string.Join(", ", Messages.AllSamples().GroupBy(s => s.Sample.ExitCode).OrderBy(g => g.Key)
+                .Select(g => $"{g.Key}→{McpServer.RetryOf(g.Key)}")));
+
+        // (2) BuildArguments 抽查
+        (string[] Argv, string? Body, string? Inputs, Msg? Err) Build(string json)
+        {
+            using var d = System.Text.Json.JsonDocument.Parse(json);
+            var ok = McpServer.BuildArguments(d.RootElement, "BODY", "INPUTS", out var argv, out var body, out var inputs, out var err);
+            return (argv, body, inputs, ok ? null : err);
+        }
+        void Eq(string what, object? actual, object? expected)
+        {
+            var a = actual is string[] arr ? string.Join(" ", arr) : actual;
+            var e = expected is string[] exp ? string.Join(" ", exp) : expected;
+            if (!Equals(a, e)) { fail++; Console.WriteLine($"!! {what}：{a} ≠ 期望 {e}"); }
+        }
+
+        var c1 = Build("""{"action":"comment","repo":"o/r","number":5,"body":"中文正文"}""");
+        Eq("comment argv", c1.Argv, new[] { "comment", "--repo", "o/r", "--number", "5", "--body-file", "BODY" });
+        Eq("comment body", c1.Body, "中文正文"); Eq("comment err", c1.Err, null);
+
+        var c2 = Build("""{"action":"push","repo":"o/r","branch":"feat/x","base":"origin/master","repo_path":"D:/x"}""");
+        Eq("push argv", c2.Argv, new[] { "push", "--repo", "o/r", "--branch", "feat/x", "--repo-path", "D:/x", "--base", "origin/master" });
+
+        // 必填缺省不在 MCP 层拦——省略 flag 交子进程 verb-aware ErrMissing（单源，文案带示例）
+        var c3 = Build("""{"action":"comment"}""");
+        Eq("缺省透传 argv", c3.Argv, new[] { "comment" }); Eq("缺省透传 err", c3.Err, null);
+
+        var c4 = Build("""{"action":"pr_merge","repo":"o/r","number":"383","method":"squash","delete_head":true}""");
+        Eq("number 字符串宽容 + delete_head", c4.Argv,
+           new[] { "pr", "merge", "--repo", "o/r", "--number", "383", "--method", "squash", "--delete-head" });
+
+        var c5 = Build("""{"action":"workflow_dispatch","repo":"o/r","workflow":"ci.yml","ref":"master","inputs":{"k":"v"}}""");
+        Eq("dispatch argv", c5.Argv, new[] { "workflow", "dispatch", "--repo", "o/r", "--workflow", "ci.yml", "--ref", "master", "--inputs-file", "INPUTS" });
+        Eq("dispatch inputs 原样", c5.Inputs, """{"k":"v"}""");
+
+        var c6 = Build("""{"action":"push","repo":"o/r","branch":"x","body":"多余"}""");
+        if (c6.Err is null || c6.Err.ExitCode != ExitCodes.BadRequest)
+        { fail++; Console.WriteLine("!! push 带 body 应报未知字段（防静默丢参），exit 10"); }
+
+        var c7 = Build("""{"action":"deploy","repo":"o/r"}""");
+        if (c7.Err is null || c7.Err.ExitCode != ExitCodes.BadRequest)
+        { fail++; Console.WriteLine("!! 未知 action 应报 exit 10"); }
+
+        var c8 = Build("""{"action":"branch_delete","repo":123,"branch":"x"}""");
+        if (c8.Err is null || c8.Err.ExitCode != ExitCodes.BadRequest)
+        { fail++; Console.WriteLine("!! repo 类型错（数字）应报 exit 10 而非当缺省"); }
+
+        Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
+        return fail;
     }
 }

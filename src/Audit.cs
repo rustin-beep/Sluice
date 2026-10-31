@@ -5,6 +5,12 @@ namespace Sluice;
 /// <summary>§10：audit.jsonl 追加写。拒绝也记（理由是协商界面的一部分）。</summary>
 internal static class Audit
 {
+    /// <summary>
+    /// §9.7/§10 via 值域（v2.9）：调用来自哪个前门。MCP server spawn 子进程时注入
+    /// SLUICE_VIA=mcp（§9.7）；纯标签非机密，伪造无增益——标注入口而非权限。
+    /// </summary>
+    private static string Via => Environment.GetEnvironmentVariable("SLUICE_VIA") == "mcp" ? "mcp" : "cli";
+
     private static string PathFor() => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "audit.jsonl");
 
@@ -30,6 +36,7 @@ internal static class Audit
                 w.WriteString("reason_text", reasonText);
                 w.WriteString("consent", consent);
                 w.WriteString("result", result);
+                w.WriteString("via", Via);
                 w.WriteEndObject();
             }
             File.AppendAllBytes(path, ms.ToArray());

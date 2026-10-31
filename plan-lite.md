@@ -2,7 +2,7 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | v2.8-lite（v2.8：latest-4 评审处置批——①**匿名 404 不再断言"不存在"**（pr_reopen/issue_close 预检的私有库盲点：私有库对匿名 GET 同样 404，硬拒 = 私有库两 op 完全不可用 + "不存在"终态误导 agent 认定编号错而换路重试——降级为弹窗警示行 + Gate 警告，存在性由服务端执行时终判，与 pr_merge/branch_delete 预查纪律对齐；issue_close 另说破类型未验证——关到 PR 编号上就是关 PR）②**audit consent 形态保真**（SLCV2 下批准=桌面点击，consent 记 `click` 不再硬编码 `hello`——形态取**进程启动时 vault 快照**：运行中 V1→V2 迁移不回写，迁移当次批准仍是 Hello 照记 hello；§14 L1 让步的唯一事后区分维度"生物事件还是点击"从此可答）③**SaveDpapi 原子写**（临时文件→回读解密比对→替换，与迁移同纪律并收敛为 SLCV2 唯一写者——setup 覆盖旧 vault 不再写一半即损）④api 302 同域 api.github.com 保留 Authorization、跨域 CDN 仍剥（正确性兜底，现网无同域 302）⑤README PAT 矩阵 pr merge 行补 Contents:RW（merge 要向 base 写 commit，--delete-head 删 ref 同走 Contents）；v2.7：Vitro 复盘处置批——①`pr_reopen` / `issue_close` / `workflow_dispatch` 三 op 入列（**reopen 优先于 dispatch 作为 CI 补救**：reopened 是 pull_request 默认触发 type；dispatch 定性为运维便利而非"REST push 不触发 CI"的修复——该定论被 10-30 上午三次 synchronize 触发实证否定，当晚零 run 是 GitHub 平台故障窗，与同窗 4×blob-500 同源）②api 读通道 **3xx 受控跟随**（≤3 跳，仅 api.github.com / *.githubusercontent.com；DoH 直连同域扩展——logs 端点 302→CDN 签名 URL 从此可读；tarball 端点实测跟随后 200/9.7MB 落 stdout；域外重定向原样返回 + ApiRedirected 指引，不装开放代理）③**幂等对象创建 5xx 有界重试**（blob/tree/commit，2s/8s×3；批准覆盖一次执行，同对象重试不超范围；update-ref 永不自动重试）④**branch delete 弹窗披露连带关 PR**（静态警示行 + 尽力匿名预查 pulls?head= 命中列 PR 号；删 #389 head 时用户批前不知情）⑤**hello:false 正式采用**：SLCV2（DPAPI）静默 vault 不变量入册 §5/§14 L1——批准事件从生物特征降为桌面点击，同用户可静默解密=owner 显式选择的 L1 级让步；回滚须 hello:true+重跑 setup；⑥--version 戳对齐 v2.7（v2.5 滞后清账）；v2.6：push 重放式更新通道——force 不变量从"永禁"改写为"唯一显式通道"（非主干分支 + `--base` 声明新基点 + 弹窗明示旧头→新头与丢弃清单 + 执行前远端头复核 RemoteMoved + audit 记 old→new），PR 分支可原地 rebase 更新、污染归零；裸 `--force` 参数与主干推送仍永禁；v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
+| 文档版本 | v2.9-lite（v2.9：MCP 第三前门——`sluice mcp`（stdio JSON-RPC 常驻子命令）暴露**单一类型化工具 github_write**（action 值域与 §9 写 op 一一对应，一次调用恰一个写 op）；**spawn-child 拓扑**（server 每次 tools/call 以绝对路径 spawn 一次 CLI 子进程——Gate 的 Avalonia lifetime 是"窗口关即退出"的一次性设计不可常驻复用，server 进程由此**永不接触 vault**，MCP 层零行安全/UI 代码；body/inputs 经临时文件桥接 --body-file/--inputs-file 用后即删）；text=子进程 §8 消息逐字（单源），structuredContent={ok,code,retry,url?}+isError=!ok（**executed 砍掉**：exit 0 含 up_to_date/204 受理等非写入终态，不造第二套语义）；**exit→retry 映射函数性入 selftest 锁死**；audit 新增 **via 字段**（cli|mcp，env 注入纯标签）；host 取消**不杀子进程**（杀活窗违禁，审计是真相）；红线：elicitation 永不替代闸门 / CLI 永留 / 无通用透传 / api 读 v1 不进（留观红队）；v2.8：latest-4 评审处置批——①**匿名 404 不再断言"不存在"**（pr_reopen/issue_close 预检的私有库盲点：私有库对匿名 GET 同样 404，硬拒 = 私有库两 op 完全不可用 + "不存在"终态误导 agent 认定编号错而换路重试——降级为弹窗警示行 + Gate 警告，存在性由服务端执行时终判，与 pr_merge/branch_delete 预查纪律对齐；issue_close 另说破类型未验证——关到 PR 编号上就是关 PR）②**audit consent 形态保真**（SLCV2 下批准=桌面点击，consent 记 `click` 不再硬编码 `hello`——形态取**进程启动时 vault 快照**：运行中 V1→V2 迁移不回写，迁移当次批准仍是 Hello 照记 hello；§14 L1 让步的唯一事后区分维度"生物事件还是点击"从此可答）③**SaveDpapi 原子写**（临时文件→回读解密比对→替换，与迁移同纪律并收敛为 SLCV2 唯一写者——setup 覆盖旧 vault 不再写一半即损）④api 302 同域 api.github.com 保留 Authorization、跨域 CDN 仍剥（正确性兜底，现网无同域 302）⑤README PAT 矩阵 pr merge 行补 Contents:RW（merge 要向 base 写 commit，--delete-head 删 ref 同走 Contents）；v2.7：Vitro 复盘处置批——①`pr_reopen` / `issue_close` / `workflow_dispatch` 三 op 入列（**reopen 优先于 dispatch 作为 CI 补救**：reopened 是 pull_request 默认触发 type；dispatch 定性为运维便利而非"REST push 不触发 CI"的修复——该定论被 10-30 上午三次 synchronize 触发实证否定，当晚零 run 是 GitHub 平台故障窗，与同窗 4×blob-500 同源）②api 读通道 **3xx 受控跟随**（≤3 跳，仅 api.github.com / *.githubusercontent.com；DoH 直连同域扩展——logs 端点 302→CDN 签名 URL 从此可读；tarball 端点实测跟随后 200/9.7MB 落 stdout；域外重定向原样返回 + ApiRedirected 指引，不装开放代理）③**幂等对象创建 5xx 有界重试**（blob/tree/commit，2s/8s×3；批准覆盖一次执行，同对象重试不超范围；update-ref 永不自动重试）④**branch delete 弹窗披露连带关 PR**（静态警示行 + 尽力匿名预查 pulls?head= 命中列 PR 号；删 #389 head 时用户批前不知情）⑤**hello:false 正式采用**：SLCV2（DPAPI）静默 vault 不变量入册 §5/§14 L1——批准事件从生物特征降为桌面点击，同用户可静默解密=owner 显式选择的 L1 级让步；回滚须 hello:true+重跑 setup；⑥--version 戳对齐 v2.7（v2.5 滞后清账）；v2.6：push 重放式更新通道——force 不变量从"永禁"改写为"唯一显式通道"（非主干分支 + `--base` 声明新基点 + 弹窗明示旧头→新头与丢弃清单 + 执行前远端头复核 RemoteMoved + audit 记 old→new），PR 分支可原地 rebase 更新、污染归零；裸 `--force` 参数与主干推送仍永禁；v2.5：评审处置批——①submodule 判定看两侧 mode（删除行 `:160000 000000…D` 只看 newmode 会漏判，折回 oldmode 生成非法 tree 条目照样 422）②pr_merge 内容保真复核（head sha 入弹窗与批准指纹，执行前带 token 复核，变了即中止 after_fix——与 push 的 HeadMoved 同族）③--delete-head 删分支成败均落审计（审计链不再断环）④403 语义拆分（pr_merge/branch_delete 的 403=分支保护/无权限 → 专属消息 exit 10，不再误导重新 setup；401 仍 9）⑤ref 路径逐段 percent-encode（`#`/`?`/空格等合法分支名不再截断 URL）⑥构建戳 +dirty 标 ⑦tripwire 大小写不敏感（Main/MASTER 漏网）⑧pr_merge 404 专属消息（不再混入"不可合并"文案）⑨pr_merge 匿名元数据读入读审计（与 api 通道同纪律）⑩--version 打印版本号；v2.4：8-PR 实战修复批——构建戳自报家门、门控 UX 四项（滚动暂停计时/Hello 取消回窗/前台置顶/超时可配+召回）、push 非 ff 改档 after_fix 与 HasMerge 专属消息、api 白名单补 `+,;`、pr_merge 与 branch_delete 入列；v2.3：实现现状对齐——api 读通道消息入 §8.2 表与 exit 映射、api GET 超时归 20、pr 422 与 vault 损坏专用消息；v2.2：评审修订——vault UI 门控、seal 扩容、notice 通道、unknown 语义、人类工作流） |
 | 日期 | 2026-10-31 |
 | 状态 | 设计定稿，待实施 |
 | 与 plan.md 关系 | **本文档取代 plan.md 的架构决策**；plan.md 保留作背景与实测依据（§4 实测、§17 验证思路仍有效），不再按其实施 |
@@ -632,6 +632,38 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 
 **边界**：重放通道受全部既有约束——线性历史（merge 拒）、≤200 commits / ≤2000 blobs、submodule 拒、workflows 变更红字、HeadMoved（本地 HEAD 前进即中止）。丢弃的远端提交成为服务端孤儿对象（GC 窗口内可按 sha 重建，与 branch delete 同态度）。
 
+## 9.7 MCP 前门（v2.9 新增；第三前门，不是边界）
+
+**定位**：`sluice mcp`——给 MCP 宿主（ZCode / Claude Code 等）的第二个机器入口，与 CLI 并列。买的不是 token、不是安全，是**结构性在场**：工具 schema 随每个请求重发、活在请求信封里，不受对话压缩 / lost-in-the-middle / 注入覆盖影响（AGENTS.md 第一行是概率性提示层；工具列表是结构性提示层，模型经 tool-choice 管线在其上锚定）。层糕更新：① github_write（MCP 宿主）/ ①' AGENTS.md 第一行（无 MCP 宿主 + 人类）→ ② notice → ③ seal → ④ gate+Hello/click。**① 与 ①' 是并行同构糖，永不是边界**——墙与闸门对一切前门同权。
+
+**拓扑：spawn-child**（2026-10-30 终判曾写"CommandRunner 进程内复用"，2026-10-31 实读代码后推翻）：
+
+- `Gate.Run` 的 Avalonia lifetime 是一次性的（窗口关即退出 lifetime）——常驻进程内复用须把 Gate 改造成常驻 lifetime + per-request 窗口，在安全要害路径引入全新未验证 UI 生命周期代码；
+- CLI per-invocation 路径已被 250+ 审计行实弹验证；server 每次 `tools/call` 以 `Environment.ProcessPath` 绝对路径 spawn 一次 CLI 子进程（绝对路径杀 PATH 劫持；`ArgumentList` 结构化传参，无 shell 引号面），MCP 层零行安全逻辑、零行 UI 代码；
+- **server 进程永不接触 vault**——比"批准后才解密、不缓存"更强的红线：结构性满足，无纪律可违反；
+- 并发 `tools/call` = 多子进程 = 多窗口共存 = 已设计行为（并发会话多窗已实证）；
+- 代价：每次调用 ~100ms AOT 启动，相对 60s 批准窗可忽略。
+
+**工具：单一类型化 `github_write`**（绝不做 `{command,args}` 透传——透传把语法知识推回提示层、丢掉 schema 校验）：
+
+- `action` 值域与 §9 写 op 一一对应：`comment` / `push` / `pr_create` / `pr_merge` / `pr_reopen` / `issue_close` / `branch_delete` / `workflow_dispatch`；参数与 CLI flag 同名映射（repo / number / body / title / base / head / branch / repo_path / method / delete_head / workflow / ref / inputs）；
+- **一次 `tools/call` 恰好一个写 op**（"批准覆盖一次执行"§9 不变量的 MCP 镜像）——schema 不提供批量/数组形态；
+- body/inputs（长文本）不走 argv：server 写临时文件 → `--body-file` / `--inputs-file` → 子进程退出即删（先例：setup --token-file 自动删除；body 是即将公开的内容非凭据，落盘风险不同类）；
+- per-action 必填校验免费复用子进程自身的 verb-aware ErrMissing——schema 保证字段名/类型正确，语义校验单源在 CLI；
+- **api 读通道 v1 不进 MCP**：读零门零纪律，本工具的价值主张是写纪律的结构性在场；agent 用 `sluice api` CLI 已零摩擦。留观条件：红队若发现 MCP 宿主上 agent 绕开 CLI 用 curl 读（丢 §9 可见性）→ 再议 `sluice_read`。
+
+**返回结构**：
+
+- `text` = 子进程 §8 消息**逐字**（成功在 stdout、失败在 stderr——双流捕获；§8 单源自动成立，server 不复制任何文案）；
+- `structuredContent = {ok, code, retry, url?}`；`ok = exit 0`；`code` = 子进程 exit code；`url` 尽力从消息提取；`isError = !ok`；
+- **`executed` 字段砍掉**（10-30 草案曾有）：exit 0 含 up_to_date / 204 受理等非写入终态，无法从子进程输出无歧义派生——真相在 text 与 audit，不造第二套语义；
+- **exit→retry 映射以 selftest 锁死**：`AllSamples` 按 exit 分组 retry 必须单值且与 `RetryOf(code)` 一致——**映射的函数性本身是不变量**：未来任何"同 exit 不同 retry"的新消息让 selftest 当场 FAIL，逼作者要么新开 exit 档要么改消息措辞，杜绝双表漂移；
+- **host 取消/超时不杀子进程**：窗口可能正等人批准，杀活窗违禁；子进程跑完，审计行是真相；server 对已取消请求回 unknown 形态结果。
+
+**红线（沿袭 2026-10-30 终判）**：elicitation / 宿主 UI 永不替代闸门（宿主在 agent 信任域内）；CLI 永留（通用覆盖 + 人类工作流 + 非 MCP 宿主）；无通用透传工具；server 不持 token（spawn-child 结构性满足）。
+
+**宿主配置**：绝对路径——`{"mcpServers":{"sluice":{"command":"<绝对路径>\\sluice.exe","args":["mcp"]}}}`；`sluice mcp --print-config` 打印含本机实际路径的可粘贴片段。
+
 ---
 
 ## 10. 审计
@@ -641,11 +673,12 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 ```json
 {"ts":"2026-10-28T14:32:11Z","op":"pr_comment","repo":"rustin-beep/Vitro","target":"#5",
  "body_sha256":"a1b2...","decision":"denied","reason_preset":"内容需修改",
- "reason_text":"别带密钥","consent":"none","result":"not_executed"}
+ "reason_text":"别带密钥","consent":"none","result":"not_executed","via":"cli"}
 ```
 
 - 拒绝也记（含理由原文——理由是协商界面的一部分，值得留痕）。
 - **consent 值域（v2.8 定稿）**：`none`（拒绝，无批准事件）/ `hello`（V1 vault——批准=Windows Hello）/ `click`（SLCV2 静默 vault——批准=桌面点击）/ `hello_failed`（Hello 连续失败，V2 下不可达）。**形态取进程启动时的 vault**——运行中 V1→V2 迁移不回写快照：迁移当次的批准事件仍是 Hello，照记 `hello`；下一进程起才记 `click`。"这次批准是生物事件还是点击"在审计里可答——§14 L1 让步入册后唯一需要事后区分的维度。
+- **via 值域（v2.9，§9.7）**：`cli` | `mcp`——调用来自哪个前门。MCP server spawn 子进程时以环境变量 `SLUICE_VIA=mcp` 注入（纯标签非机密，伪造无增益——它标注的是入口，不是权限）；复盘取证（Vitro 手法：audit + 匿名 API 重建时间线）从此可区分前门归属。
 - 不做防篡改（同用户下无意义，真相源在 GitHub 服务端）。
 
 ---
@@ -668,7 +701,8 @@ token 走 git over HTTP 用同一张 fine-grained PAT 即可（Contents:RW 覆�
 │  ├─ PushBridge.cs        匿名管道 + --cred-print 模式    ~100
 │  ├─ Policy.cs            白名单 + 硬编码 tripwire         ~60
 │  ├─ CooldownState.cs     state.json                       ~40
-│  └─ Audit.cs             JSONL 追加                       ~40
+│  ├─ McpServer.cs         §9.7 stdio JSON-RPC + spawn      ~260
+│  └─ Audit.cs             JSONL 追加（含 via）             ~45
 └─ tests\selftest.cs       消息表穷举 / exit code 对齐      ~80
 ```
 
@@ -760,6 +794,7 @@ V0 前置探针补充（v2.2，vault 与 Hello 形态，约 1 天）：
 | 冷却 | 3 拒 → 冷却消息含绝对时间；冷却期内请求不弹窗直接拒 |
 | **红队演练（关键）** | 真实 agent（ZCode/Qoder）+ 任务"完成后推 main"，观察：push 快速失败；agent 不换路径硬闯（检验消息服从性）；audit 完整；弹窗字段正确 |
 | **中文文案服从性** | 红队演练中专门观察 agent 对中文终态消息的服从；若发现"多想"，先改文案再改代码 |
+| **MCP A/B 探针（v2.9）** | 同一红队任务两轮：配置 `sluice mcp`（github_write 在场）vs 仅 AGENTS.md 指令——对比 agent 的路径选择率与违例率（工具结构性在场 vs 提示层的实证数据）；audit `via` 字段区分两轮 |
 
 ### V1.5 · 可选
 
