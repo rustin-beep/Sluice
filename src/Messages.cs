@@ -440,6 +440,61 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- issue create 被服务端拒绝（exit 10，retry=after_fix；v2.11 生命周期对称批：立案闭环） ----
+    public static Msg IssueCreateRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        issue_create 被服务端拒绝（{detail}）。常见原因：token 无 Issues 写权限；仓库不存在或不可写；422 校验（标题为空等）。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 权限缺失 → 转告用户在 fine-grained PAT 开 Issues: Read and write 后重跑 sluice setup；不要自行获取或更换凭据；
+        2. 404 → 核对仓库全名后重跑；
+        3. 修正后重跑同一命令（title/body 可调整）。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr close 被服务端拒绝（exit 10，retry=after_fix；v2.11：pr_reopen 的镜像） ----
+    public static Msg PrCloseRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_close 被服务端拒绝（{detail}）。常见原因：PR 已是关闭状态或已合并；token 无 Pull requests 写权限；编号不存在。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 已关闭/已合并 → 使用既成状态，不要重跑本命令；
+        2. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth 读 state / merged 字段。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- issue reopen 被服务端拒绝（exit 10，retry=after_fix；v2.11：issue_close 的镜像） ----
+    public static Msg IssueReopenRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        issue_reopen 被服务端拒绝（{detail}）。常见原因：编号是 PR 而非 issue；token 无 Issues 写权限；编号不存在；issue 被锁定（422 原话）。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对编号与类型后重跑；PR 的生命周期走 pr merge / pr reopen，不走 issue reopen。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr edit 被服务端拒绝（exit 10，retry=after_fix；v2.11：勘误闭环。旧值未被动过） ----
+    public static Msg PrEditRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_edit 被服务端拒绝（{detail}）。常见原因：token 无 Pull requests 写权限；编号不存在；422 校验（新标题为空等）。
+        本次操作未执行，GitHub 上没有产生任何变更——PR 的旧标题/正文原样保留。
+        修正：核对参数后重跑同一命令。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr review 被服务端拒绝（exit 10，retry=after_fix；v2.11：APPROVE 自批禁令在此说破） ----
+    public static Msg PrReviewRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_review 被服务端拒绝（{detail}）。常见原因：APPROVE 自己账户的 PR（GitHub 服务端禁止——agents 与 owner 同账户时 APPROVE 仅对他人 PR 有效）；token 无 Pull requests 写权限；PR 已关闭（服务端拒新评审）；422 校验。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        1. 自批 → 改用 REQUEST_CHANGES / COMMENT 表达意见，或转告用户在网页上批准；
+        2. PR 已关闭 → 用 sluice pr reopen 复活后重试，或用 sluice comment 补充意见；
+        3. 查状态：sluice api "repos/<owner/repo>/pulls/<number>" --auth 读 state / merged 字段。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- workflow dispatch 已受理（exit 0；HTTP 204 无响应体——受理即完成，run 创建是异步的） ----
     public static Msg WorkflowDispatched(string repo, string wf, string rf) => new(
         "[Sluice]",
@@ -525,6 +580,11 @@ internal static class Messages
         ("hasmerge", PushHasMerge("9f3c2a1b Merge branch 'dev'（共 2 个）")),
         ("prreopenrejected", PrReopenRejected("rustin-beep/Vitro#389", "HTTP 422：head branch was deleted")),
         ("issuecloserejected", IssueCloseRejected("rustin-beep/Vitro#369", "HTTP 422：Can't close a pull request through the issues API")),
+        ("issuecreaterejected", IssueCreateRejected("rustin-beep/Sluice 新建 issue", "HTTP 403：Resource not accessible by personal access token")),
+        ("prcloserejected", PrCloseRejected("rustin-beep/Vitro#389", "HTTP 422：Pull Request is not open")),
+        ("issuereopenrejected", IssueReopenRejected("rustin-beep/Sluice#369", "HTTP 422：Issue is locked")),
+        ("preditrejected", PrEditRejected("rustin-beep/Sluice#383", "HTTP 403：Resource not accessible by personal access token")),
+        ("prreviewrejected", PrReviewRejected("rustin-beep/Vitro#390", "HTTP 422：Can not approve your own pull request")),
         ("dispatched", WorkflowDispatched("rustin-beep/Vitro", "ci.yml", "master")),
         ("dispatchforbidden", DispatchForbidden("rustin-beep/Vitro", "ci.yml", "HTTP 403：Resource not accessible by personal access token")),
         ("dispatchnotfound", DispatchNotFound("rustin-beep/Vitro", "noci.yml")),

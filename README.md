@@ -34,9 +34,9 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 
 | 动词 | Repository permissions |
 |---|---|
-| `comment` / `issue close` | **Issues: Read and write** |
+| `comment` / `issue create` / `issue close` / `issue reopen` | **Issues: Read and write** |
 | `push` | **Contents: Read and write** |
-| `pr create` / `pr reopen` | **Pull requests: Read and write** |
+| `pr create` / `pr reopen` / `pr close` / `pr edit` / `review` | **Pull requests: Read and write** |
 | `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
 | `workflow dispatch` | **Actions: Read and write** |
 | `api --auth` 读 CI（runs/jobs/logs） | **Actions: Read**（actions 端点对匿名一律 403） |
@@ -56,7 +56,12 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice pr create --repo O/R --base B --head H --title T --body-file F` | 建 PR | |
 | `sluice pr merge --repo O/R --number N [--method merge\|squash\|rebase] [--delete-head]` | 合并 PR | 服务端 merge，天然尊重分支保护与 required checks |
 | `sluice pr reopen --repo O/R --number N` | 重开已关 PR | `reopened` 会再触发 pull_request 类 CI——CI 卡死时的首选补救 |
+| `sluice pr close --repo O/R --number N` | 关闭 PR | pr reopen 的对偶件；讨论保留、可随时重开 |
+| `sluice pr edit --repo O/R --number N [--title T] [--body-file F]` | 勘误 PR 标题/描述 | 弹窗披露旧值→新值（写覆盖纪律）；`--title`/`--body-file` 至少一项 |
+| `sluice review --repo O/R --number N --event COMMENT\|APPROVE\|REQUEST_CHANGES [--body-file F]` | 在 PR 上落评审 | commit_id 锚定「所见即所评」；APPROVE 不能批自己账户的 PR（服务端 422） |
 | `sluice issue close --repo O/R --number N` | 关闭 issue | PR 编号会被预检拦下 |
+| `sluice issue create --repo O/R --title T --body-file F` | 新建 issue | issue close 的对偶件（立案闭环）；正文全文入窗 |
+| `sluice issue reopen --repo O/R --number N` | 重开已关 issue | issue close 的对偶件；PR 编号同样会被预检拦下 |
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |
 | `sluice branch delete --repo O/R --branch B` | 删远端分支 ref | 弹窗会披露「将连带关闭其上的开放 PR」；commits 保留可重建 |
 | `sluice api <api-path> [--auth]` | GET 只读 | 公开数据匿名零交互；`--auth` 走 vault；logs 等端点 302→CDN 自动跟随（仅 GitHub 域 ≤3 跳）；每次调用入读审计 |

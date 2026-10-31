@@ -37,6 +37,11 @@ internal static class Selftest
         ("hasmerge",    ExitCodes.BadRequest,     "after_fix"),  // rebase 成线性后重跑（列问题提交）
         ("prreopenrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：403/404/422 透传，含"分支已删先重建"正解
         ("issuecloserejected", ExitCodes.BadRequest, "after_fix"), // v2.7：PR 误用/权限/不存在
+        ("issuecreaterejected", ExitCodes.BadRequest, "after_fix"), // v2.11：权限缺失转告 setup / 404 核对 / 422 校验
+        ("prcloserejected",   ExitCodes.BadRequest, "after_fix"), // v2.11：已关/已合并用既成状态，勿重跑
+        ("issuereopenrejected", ExitCodes.BadRequest, "after_fix"), // v2.11：PR 误用/权限/锁定透传
+        ("preditrejected",    ExitCodes.BadRequest, "after_fix"), // v2.11：旧值未动，核对后重跑
+        ("prreviewrejected",  ExitCodes.BadRequest, "after_fix"), // v2.11：APPROVE 自批 422 说破 → 改 RQC/COMMENT
         ("dispatched",        ExitCodes.Success,     "—"),         // v2.7：204 受理即完成，无需重发
         ("dispatchforbidden", ExitCodes.BadRequest, "after_fix"), // v2.7：PAT 缺 Actions:RW——用户动作，非 agent 可修
         ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
@@ -53,7 +58,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -82,6 +87,7 @@ internal static class Selftest
             if (name is "denied" or "timeout" or "policy" or "cooldown" or "consent" or "seal" or "internal1"
                     or "prmergerejected" or "prmergeforbidden" or "prmergenotfound" or "branchdeleteforbidden"
                     or "prreopenrejected" or "issuecloserejected" or "dispatchforbidden" or "dispatchnotfound" or "dispatchrejected"
+                    or "issuecreaterejected" or "prcloserejected" or "issuereopenrejected" or "preditrejected" or "prreviewrejected"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
@@ -105,6 +111,7 @@ internal static class Selftest
         { Console.WriteLine($"!! 样例缺失：{missing.Name}"); fail++; }
 
         fail += McpChecks();
+        fail += SurfaceLock();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -149,15 +156,15 @@ internal static class Selftest
             if (!Equals(a, e)) { fail++; Console.WriteLine($"!! {what}：{a} ≠ 期望 {e}"); }
         }
 
-        var c1 = Build("""{"action":"comment","repo":"o/r","number":5,"body":"中文正文"}""");
-        Eq("comment argv", c1.Argv, new[] { "comment", "--repo", "o/r", "--number", "5", "--body-file", "BODY" });
-        Eq("comment body", c1.Body, "中文正文"); Eq("comment err", c1.Err, null);
+        var c1 = Build("""{"action":"pr_comment","repo":"o/r","number":5,"body":"中文正文"}""");
+        Eq("pr_comment argv", c1.Argv, new[] { "comment", "--repo", "o/r", "--number", "5", "--body-file", "BODY" });
+        Eq("pr_comment body", c1.Body, "中文正文"); Eq("pr_comment err", c1.Err, null);
 
         var c2 = Build("""{"action":"push","repo":"o/r","branch":"feat/x","base":"origin/master","repo_path":"D:/x"}""");
         Eq("push argv", c2.Argv, new[] { "push", "--repo", "o/r", "--branch", "feat/x", "--repo-path", "D:/x", "--base", "origin/master" });
 
         // 必填缺省不在 MCP 层拦——省略 flag 交子进程 verb-aware ErrMissing（单源，文案带示例）
-        var c3 = Build("""{"action":"comment"}""");
+        var c3 = Build("""{"action":"pr_comment"}""");
         Eq("缺省透传 argv", c3.Argv, new[] { "comment" }); Eq("缺省透传 err", c3.Err, null);
 
         var c4 = Build("""{"action":"pr_merge","repo":"o/r","number":"383","method":"squash","delete_head":true}""");
@@ -180,7 +187,101 @@ internal static class Selftest
         if (c8.Err is null || c8.Err.ExitCode != ExitCodes.BadRequest)
         { fail++; Console.WriteLine("!! repo 类型错（数字）应报 exit 10 而非当缺省"); }
 
+        // v2.11 新 action 抽查
+        var c9 = Build("""{"action":"issue_create","repo":"o/r","title":"新缺口","body":"正文"}""");
+        Eq("issue_create argv", c9.Argv, new[] { "issue", "create", "--repo", "o/r", "--title", "新缺口", "--body-file", "BODY" });
+        Eq("issue_create body", c9.Body, "正文"); Eq("issue_create err", c9.Err, null);
+
+        var c10 = Build("""{"action":"pr_edit","repo":"o/r","number":"383","title":"勘误"}""");
+        Eq("pr_edit argv", c10.Argv, new[] { "pr", "edit", "--repo", "o/r", "--number", "383", "--title", "勘误" });
+
+        var c11 = Build("""{"action":"pr_review","repo":"o/r","number":7,"event":"APPROVE"}""");
+        Eq("pr_review argv", c11.Argv, new[] { "review", "--repo", "o/r", "--number", "7", "--event", "APPROVE" });
+
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
         return fail;
+    }
+
+    // ---------- 面一致锁（v2.11） ----------
+
+    /// <summary>§9 op 白名单内置快照（与 plan-lite §9 首列一致；改 §9 必须同步本表——selftest 会红）。</summary>
+    private static readonly string[] ExpectedOps =
+    [
+        "pr_comment", "pr_create", "pr_review", "push", "api", "pr_merge", "branch_delete",
+        "pr_reopen", "issue_close", "workflow_dispatch",
+        "issue_create", "pr_close", "issue_reopen", "pr_edit",
+    ];
+
+    /// <summary>§9 内的只读 op（不进 CLI 写动词表与 MCP Actions；新增读 op 须在此登记）。</summary>
+    private static readonly string[] ReadOps = ["api"];
+
+    /// <summary>
+    /// 面一致锁：plan-lite §9 op 列 ↔ CLI 写动词表（Program.WriteVerbs）↔ MCP Actions（含 AllowedFields）
+    /// 三方对账。缘起：§9 自 v2.0 承诺 pr_review 而实现全无——漂移靠人眼评审才抓到，本锁让"表格说谎"变
+    /// selftest FAIL。plan-lite.md 在运行目录向上 ≤4 级内 → 按文档实文核对；找不到（发布件单飞）→
+    /// 按内置快照核对代码内部一致性。
+    /// </summary>
+    private static int SurfaceLock()
+    {
+        Console.WriteLine("--- 面一致锁（v2.11：§9 ↔ CLI 写动词表 ↔ MCP actions）---");
+        int fail = 0;
+
+        var ops = new HashSet<string>(ExpectedOps);
+        var src = "内置 §9 快照（未找到 plan-lite.md，发布件场景）";
+        for (var i = 0; i <= 4; i++)
+        {
+            var p = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+                string.Concat(Enumerable.Repeat(".." + Path.DirectorySeparatorChar, i)), "plan-lite.md"));
+            if (!File.Exists(p)) continue;
+            var docOps = ParseSection9Ops(File.ReadAllLines(p));
+            if (docOps.Count > 0) { ops = docOps; src = p; }
+            else { fail++; Console.WriteLine($"!! 找到 {p} 但 §9 op 列解析为空——文档结构异常"); }
+            break; // 找到文件就用它（无论解析结果——空=异常，上面已红）
+        }
+        Console.WriteLine($"来源：{src}");
+        foreach (var ro in ReadOps) ops.Remove(ro);
+
+        var cli = Program.WriteVerbs.Select(v => v.Op).ToHashSet();
+        var mcp = McpServer.Actions.ToHashSet();
+        var fields = McpServer.AllowedFields.Keys.ToHashSet();
+
+        foreach (var miss in ops.Except(cli).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! §9 承诺而 CLI 写动词表没有：{miss}——文档与实现漂移（v2.11 锁定的缺陷类）"); }
+        foreach (var extra in cli.Except(ops).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! CLI 写动词表有而 §9 没有：{extra}——补 §9 行或撤动词"); }
+        foreach (var miss in ops.Except(mcp).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! §9 承诺而 MCP action 没有：{miss}"); }
+        foreach (var extra in mcp.Except(ops).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! MCP action 有而 §9 没有：{extra}"); }
+        foreach (var miss in mcp.Except(fields).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! AllowedFields 缺 action：{miss}"); }
+        foreach (var extra in fields.Except(mcp).OrderBy(x => x))
+        { fail++; Console.WriteLine($"!! AllowedFields 多出 action：{extra}"); }
+
+        Console.WriteLine(fail == 0
+            ? $"面一致：§9 {ops.Count} 个写 op = CLI 写动词表 = MCP actions = AllowedFields。"
+            : "面不一致（见上）。");
+        return fail;
+    }
+
+    /// <summary>解析 plan-lite §9 表首列的 op 名（每行 "| `op` …" 的首个反引号段）。</summary>
+    private static HashSet<string> ParseSection9Ops(string[] lines)
+    {
+        var ops = new HashSet<string>();
+        var inSec = false;
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("## ", StringComparison.Ordinal))
+            {
+                if (inSec) break;
+                inSec = line.StartsWith("## 9. op", StringComparison.Ordinal);
+                continue;
+            }
+            if (!inSec || !line.StartsWith("| `", StringComparison.Ordinal)) continue;
+            var s = line.IndexOf('`');
+            var e = line.IndexOf('`', s + 1);
+            if (e > s + 1) ops.Add(line[(s + 1)..e]);
+        }
+        return ops;
     }
 }

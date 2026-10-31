@@ -453,6 +453,17 @@ internal static class GitHubApi
         return new ApiResult(OutcomeKind.Created, 201, Url: url);
     }
 
+    /// <summary>响应体里的 html_url（issue/PR/review 等创建类响应）——手刮子串，只取这一个字段
+    /// （同 ReadCreatedAsync 的手法；v2.11 供 SendRawAsync 路径的新 op 复用）。找不到给 null。</summary>
+    internal static string? HtmlUrlOf(string body)
+    {
+        const string key = "\"html_url\":\"";
+        var i = body.IndexOf(key, StringComparison.Ordinal);
+        if (i < 0) return null;
+        var j = body.IndexOf('"', i + key.Length);
+        return j > i + key.Length ? body[(i + key.Length)..j] : null;
+    }
+
     public static string JsonEscape(string s)
     {
         var sb = new StringBuilder("\"");

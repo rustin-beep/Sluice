@@ -36,21 +36,29 @@ internal static class McpServer
         _ => "wait_user", // 表外 code = 契约破裂，fail-safe 交回用户
     };
 
-    private static readonly string[] Actions =
+    /// <summary>§9 写 op 的 action 值域（v2.11 起与 plan-lite §9 / CLI 写动词表三方对账，selftest 面一致锁；
+    /// v2.11 将 comment 更名 pr_comment——§9.7"与 §9 写 op 一一对应"的字面承诺自此零例外）。</summary>
+    internal static readonly string[] Actions =
     [
-        "comment", "push", "pr_create", "pr_merge", "pr_reopen",
-        "issue_close", "branch_delete", "workflow_dispatch",
+        "pr_comment", "push", "pr_create", "pr_merge", "pr_reopen", "pr_close", "pr_edit",
+        "issue_create", "issue_close", "issue_reopen", "pr_review",
+        "branch_delete", "workflow_dispatch",
     ];
 
     /// <summary>各 action 允许的参数名（与 CLI flag 同名映射；表外字段报错——防"传了被静默忽略"的误会）。</summary>
-    private static readonly Dictionary<string, string[]> AllowedFields = new()
+    internal static readonly Dictionary<string, string[]> AllowedFields = new()
     {
-        ["comment"]           = ["repo", "number", "body"],
+        ["pr_comment"]        = ["repo", "number", "body"],
         ["push"]              = ["repo", "branch", "repo_path", "base"],
         ["pr_create"]         = ["repo", "base", "head", "title", "body"],
         ["pr_merge"]          = ["repo", "number", "method", "delete_head"],
         ["pr_reopen"]         = ["repo", "number"],
+        ["pr_close"]          = ["repo", "number"],
+        ["pr_edit"]           = ["repo", "number", "title", "body"],
+        ["issue_create"]      = ["repo", "title", "body"],
         ["issue_close"]       = ["repo", "number"],
+        ["issue_reopen"]      = ["repo", "number"],
+        ["pr_review"]         = ["repo", "number", "event", "body"],
         ["branch_delete"]     = ["repo", "branch"],
         ["workflow_dispatch"] = ["repo", "workflow", "ref", "inputs"],
     };
@@ -61,10 +69,10 @@ internal static class McpServer
     /// </summary>
     private const string ToolDescription =
         """
-        GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论、推送、创建 PR、合并 PR、重开 PR、
-        关闭 issue、删除分支、触发 workflow——必须且只能经此工具执行；环境内无其他可用凭据，
-        直接 git push / gh / GitHub API 调用必然失败且违反纪律。调用会弹出本机批准窗口，由用户人工
-        批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，请按其指引行动；structuredContent.retry
+        GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论、推送、创建/合并/重开/关闭/编辑 PR、
+        评审 PR、创建/关闭/重开 issue、删除分支、触发 workflow——必须且只能经此工具执行；环境内无其他
+        可用凭据，直接 git push / gh / GitHub API 调用必然失败且违反纪律。调用会弹出本机批准窗口，由用户
+        人工批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，请按其指引行动；structuredContent.retry
         是机器可读的下一步：never=禁止重试 / after_fix=修正参数后可重试 / retry_ok=可直接重试 /
         wait_user=等待用户指示 / wait_until=等待到点 / change_approach=改换方案。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
@@ -76,17 +84,18 @@ internal static class McpServer
           "type": "object",
           "required": ["action", "repo"],
           "properties": {
-            "action":       { "type": "string", "enum": ["comment","push","pr_create","pr_merge","pr_reopen","issue_close","branch_delete","workflow_dispatch"], "description": "写操作类型" },
+            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","branch_delete","workflow_dispatch"], "description": "写操作类型" },
             "repo":         { "type": "string", "description": "目标仓库 owner/name" },
-            "number":       { "type": "integer", "description": "issue/PR 编号（comment/pr_merge/pr_reopen/issue_close 必填）" },
-            "body":         { "type": "string", "description": "正文全文（comment/pr_create 必填）" },
-            "title":        { "type": "string", "description": "PR 标题（pr_create 必填）" },
+            "number":       { "type": "integer", "description": "issue/PR 编号（pr_comment/pr_merge/pr_reopen/pr_close/pr_edit/issue_close/issue_reopen/pr_review 必填）" },
+            "body":         { "type": "string", "description": "正文全文（pr_comment/pr_create/issue_create 必填；pr_edit/pr_review 可选）" },
+            "title":        { "type": "string", "description": "标题（pr_create/issue_create 必填；pr_edit 可选——勘误）" },
             "base":         { "type": "string", "description": "pr_create：base 分支名；push：增量基点/重放式更新基点（如 origin/master）" },
             "head":         { "type": "string", "description": "PR head 分支（pr_create 必填）" },
             "branch":       { "type": "string", "description": "目标分支（push/branch_delete 必填）" },
             "repo_path":    { "type": "string", "description": "本地 git 仓库路径（push 可选，默认当前目录）" },
             "method":       { "type": "string", "enum": ["merge","squash","rebase"], "description": "合并方式（pr_merge 可选）" },
             "delete_head":  { "type": "boolean", "description": "合并后删除 head 分支（pr_merge 可选）" },
+            "event":        { "type": "string", "enum": ["COMMENT","APPROVE","REQUEST_CHANGES"], "description": "评审动作（pr_review 必填；APPROVE 不能用于自己账户的 PR——服务端 422）" },
             "workflow":     { "type": "string", "description": "workflow id 或 .yml 文件名（workflow_dispatch 必填）" },
             "ref":          { "type": "string", "description": "dispatch 目标分支/标签（workflow_dispatch 必填）" },
             "inputs":       { "type": "object", "description": "workflow inputs 键值对（workflow_dispatch 可选）" }
@@ -271,7 +280,7 @@ internal static class McpServer
 
         switch (action)
         {
-            case "comment":
+            case "pr_comment":
                 list.Add("comment");
                 Opt("--repo", Str("repo")); Opt("--number", Num("number"));
                 if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
@@ -301,9 +310,32 @@ internal static class McpServer
                 list.AddRange(["pr", "reopen"]);
                 Opt("--repo", Str("repo")); Opt("--number", Num("number"));
                 break;
+            case "pr_close":
+                list.AddRange(["pr", "close"]);
+                Opt("--repo", Str("repo")); Opt("--number", Num("number"));
+                break;
+            case "pr_edit":
+                list.AddRange(["pr", "edit"]);
+                Opt("--repo", Str("repo")); Opt("--number", Num("number")); Opt("--title", Str("title"));
+                if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
+                break;
+            case "issue_create":
+                list.AddRange(["issue", "create"]);
+                Opt("--repo", Str("repo")); Opt("--title", Str("title"));
+                if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
+                break;
             case "issue_close":
                 list.AddRange(["issue", "close"]);
                 Opt("--repo", Str("repo")); Opt("--number", Num("number"));
+                break;
+            case "issue_reopen":
+                list.AddRange(["issue", "reopen"]);
+                Opt("--repo", Str("repo")); Opt("--number", Num("number"));
+                break;
+            case "pr_review":
+                list.Add("review");
+                Opt("--repo", Str("repo")); Opt("--number", Num("number")); Opt("--event", Str("event"));
+                if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
                 break;
             case "branch_delete":
                 list.AddRange(["branch", "delete"]);
