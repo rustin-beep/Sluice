@@ -57,6 +57,10 @@ internal static class Selftest
         ("replayunresolved",ExitCodes.BadRequest,   "after_fix"),  // v2.10：--base+远端已存在+无本地引用 → fetch 后原命令重跑
         ("apirateanon",     ExitCodes.BadRequest,   "after_fix"),  // v2.10：匿名配额耗尽 ≠ 私有，加 --auth 走独立配额
         ("apiratewait",     ExitCodes.RateLimitWait, "wait_until"), // v2.10：限流等待 ≠ 凭据失效（exit 22 新档——wait_until 不寄生 20/retry_ok，函数性）
+        ("writeratelimited",ExitCodes.RateLimitWait, "wait_until"), // v2.16：写通道 403/429 同档（api 读通道 v2.10 的对偶面——POST/PATCH 密集面恰是 secondary 高发处）
+        ("pushratelimited", ExitCodes.RateLimitWait, "wait_until"), // v2.16：push 序列限流——分支未动、已传 blob 幂等（事实句措辞异于"未执行"族，不进该检查表）
+        ("writeforbidden",  ExitCodes.BadRequest,    "after_fix"),  // v2.16：comment/pr_create 403 自 credential_expired 拆出（v2.5 漏网）
+        ("commentrejected", ExitCodes.BadRequest,    "after_fix"),  // v2.16：服务端 404/422 拒绝 ≠ internal（原经 InternalPost 谎记）
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -64,7 +68,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14 push 逻辑锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -94,7 +98,7 @@ internal static class Selftest
                     or "prmergerejected" or "prmergeforbidden" or "prmergenotfound" or "branchdeleteforbidden"
                     or "prreopenrejected" or "issuecloserejected" or "dispatchforbidden" or "dispatchnotfound" or "dispatchrejected"
                     or "issuecreaterejected" or "prcloserejected" or "issuereopenrejected" or "preditrejected" or "prreviewrejected"
-                    or "tagrejected" or "releaserejected"
+                    or "tagrejected" or "releaserejected" or "writeforbidden" or "commentrejected" or "writeratelimited"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
@@ -213,17 +217,29 @@ internal static class Selftest
         Eq("release_create argv", c13.Argv, new[] { "release", "create", "--repo", "o/r", "--tag", "v1.2.3", "--target", "master", "--prerelease", "--body-file", "BODY" });
         Eq("release_create body", c13.Body, "注记");
 
+        // v2.16：prerelease 布尔白名单（原 `||` 条件使字符串值必拒、字符串 true 接受分支不可达）
+        var c14 = Build("""{"action":"release_create","repo":"o/r","tag":"v1","prerelease":"true"}""");
+        Eq("prerelease 字符串 true→flag", c14.Argv, new[] { "release", "create", "--repo", "o/r", "--tag", "v1", "--prerelease" });
+        var c15 = Build("""{"action":"release_create","repo":"o/r","tag":"v1","prerelease":"yes"}""");
+        if (c15.Err is null || c15.Err.ExitCode != ExitCodes.BadRequest)
+        { fail++; Console.WriteLine("!! prerelease 非法字符串应报 exit 10"); }
+        var c16 = Build("""{"action":"release_create","repo":"o/r","tag":"v1","prerelease":{}}""");
+        if (c16.Err is null || c16.Err.ExitCode != ExitCodes.BadRequest)
+        { fail++; Console.WriteLine("!! prerelease 对象类型应显式拒（防静默丢参）而非漏放"); }
+
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
         return fail;
     }
 
     // ---------- push 逻辑锁（v2.14） ----------
 
-    /// <summary>卡慢/平行链事故处置批的三个 pure 决策入锁：闸门⑦ 裸名消歧 / blob 去重分区 / CI 聋哑判定。
-    /// 与 git、网络解耦——决策表本身就是不变量（同名两侧异 sha 必拒绝；null 集必全传；聋哑只在单向缺失时响）。</summary>
+    /// <summary>卡慢/平行链事故处置批的 pure 决策入锁（v2.14 三项；v2.16 加限流嗅探/消歧适用面）：
+    /// 闸门⑦ 消歧 / blob 去重分区 / CI 聋哑判定 / RateLimitWhat 嗅探 / NeedsDisambig 适用面。
+    /// 与 git、网络解耦——决策表本身就是不变量（同名两侧异 sha 必拒绝；null 集必全传；聋哑只在单向缺失时响；
+    /// 非限流 403 必 null；429 无论 body 必归档）。</summary>
     private static int PushLogicChecks()
     {
-        Console.WriteLine("--- push 逻辑锁（v2.14：基点消歧 / blob 去重分区 / CI 聋哑判定）---");
+        Console.WriteLine("--- push 逻辑锁（v2.14/v2.16：基点消歧 / blob 去重 / CI 聋哑 / 限流嗅探 / 消歧适用面）---");
         int fail = 0;
         void Eq<T>(string what, T actual, T expected)
         {
@@ -250,6 +266,26 @@ internal static class Selftest
         Eq("两侧都有", RestPush.CiDeafNeeded(true, true), false);
         Eq("两侧都无(仓本无CI)", RestPush.CiDeafNeeded(false, false), false);
         Eq("头有主干无", RestPush.CiDeafNeeded(true, false), false);
+
+        // (4) 限流嗅探（v2.16）：非限流 403 必 null（权限语义交各 op 专属文案）；429 无论 body 必归档；
+        //     兼容 raw JSON body 与 ApiResult.Reason（"HTTP {st}：{message}" 纯文本）两种入参形态
+        Eq("403 primary→非空", GitHubApi.RateLimitWhat(403, """{"message":"API rate limit exceeded for 1.2.3.4"}""") is not null, true);
+        Eq("403 secondary 带分钟数", GitHubApi.RateLimitWhat(403, """{"message":"You have exceeded a secondary rate limit; wait 3 minutes and try again"}"""),
+           "secondary rate limit，服务端要求等待约 3 分钟");
+        Eq("403 abuse→非空", GitHubApi.RateLimitWhat(403, """{"message":"You have triggered an abuse detection mechanism"}""") is not null, true);
+        Eq("403 权限拒→null", GitHubApi.RateLimitWhat(403, """{"message":"Resource not accessible by personal access token"}"""), null);
+        Eq("404→null", GitHubApi.RateLimitWhat(404, "anything") is null, true);
+        Eq("500→null", GitHubApi.RateLimitWhat(500, "anything") is null, true);
+        Eq("429 空 body→归档", GitHubApi.RateLimitWhat(429, "") is not null, true);
+        Eq("Reason 纯文本可嗅探", GitHubApi.RateLimitWhat(403, "HTTP 403：You have exceeded a secondary rate limit and have been temporarily blocked") is not null, true);
+
+        // (5) 消歧适用面（v2.16）：v2.14 只盖裸名——斜杠名 feature/x 同吃 DWIM refs/heads/ 优先坑
+        Eq("裸名入消歧", RestPush.NeedsDisambig("master"), true);
+        Eq("斜杠名入消歧", RestPush.NeedsDisambig("feature/x"), true);
+        Eq("origin/ 前缀豁免", RestPush.NeedsDisambig("origin/master"), false);
+        Eq("refs/ 前缀豁免", RestPush.NeedsDisambig("refs/tags/v1.2.3"), false);
+        Eq("40 位 sha 豁免", RestPush.NeedsDisambig(new string('a', 40)), false);
+        Eq("64 位 sha 豁免", RestPush.NeedsDisambig(new string('b', 64)), false);
 
         Console.WriteLine(fail == 0 ? "push 逻辑锁通过。" : "push 逻辑锁有不符项（见上）。");
         return fail;

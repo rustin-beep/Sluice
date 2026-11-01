@@ -18,7 +18,7 @@ internal static class RestPush
         bool TouchesWorkflows, int CommitCount, int BlobCount, string? Base = null,
         string? ReplacingSha = null); // ReplacingSha：重放入窗的 origin/{branch} 旧头（非 null 即重放模式，§9.6）
 
-    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved, BaseMissing, TooLarge, BlobMismatch }
+    public enum PushResult { Done, UpToDate, NeedFetch, NonFF, Submodule, HasMerge, Unauthorized, NotSent, Unclear, Other, HeadMoved, RemoteMoved, ReplayUnresolved, BaseMissing, TooLarge, BlobMismatch, RateLimited }
 
     public sealed record Result(PushResult Kind, string? NewSha = null, string? Reason = null, int SkippedBlobs = 0);
 
@@ -36,13 +36,16 @@ internal static class RestPush
         var baseDesc = baseRef ?? ""; // v2.14：基点来源披露——消歧后标注解析到了哪个引用（弹窗基点行）
         if (baseRef is not null)
         {
-            // 闸门⑦（v2.14，2026-10-31 三连坑定案）：git 裸名 DWIM 优先 refs/heads/、永不尝试
-            // refs/remotes/origin/*——worktree 场景本地分支常年陈旧（主仓 checkout 别的分支），
-            // --base master 静默吃到影子引用（实测落后 17 笔：2 笔增量被放大成 19 笔重放/276 blob）。
+            // 闸门⑦（v2.14，2026-10-31 三连坑定案；v2.16 扩斜杠名）：git 裸名 DWIM 优先
+            // refs/heads/、永不尝试 refs/remotes/origin/*——worktree 场景本地分支常年陈旧
+            // （主仓 checkout 别的分支），--base master 静默吃到影子引用（实测落后 17 笔：2 笔增量
+            // 被放大成 19 笔重放/276 blob）。v2.16：feature/x 等斜杠名同吃此坑（DWIM 同样先试
+            // refs/heads/feature/x），且实战多为裸名主干只是幸运——适用面统一为 NeedsDisambig。
             // 同名两侧并存且异 sha ⇒ fail-closed 点名二选一（与闸门⑤同型：静默误路由才是缺陷，
             // 重跑一次 << 冗余重传）；仅一侧存在 ⇒ 采用并披露来源（仅远端存在是新增可解形态——
-            // 原裸名 rev-parse 直接失败）。副作用：裸名自此为分支命名空间语义，tag 须写 refs/tags/<name>。
-            if (!baseRef.Contains('/') && baseRef.Length is not (40 or 64))
+            // 原裸名 rev-parse 直接失败）。副作用：分支名自此为分支命名空间语义（含斜杠名），
+            // tag 须写 refs/tags/<name>。
+            if (NeedsDisambig(baseRef))
             {
                 var localRef = $"refs/heads/{baseRef}";
                 var remoteRef = $"refs/remotes/origin/{baseRef}";
@@ -54,7 +57,7 @@ internal static class RestPush
                     case BaseResolution.Ambiguous:
                         throw new LocalPlanException(
                             $"""
-                            --base 裸名 {baseRef} 有歧义：本地分支与远端跟踪引用同名，但指向不同提交——
+                            --base {baseRef}（分支名）有歧义：本地分支与远端跟踪引用同名，但指向不同提交——
                               {localRef}  → {localSha![..8]}（{BaseMeta(repoPath, localSha!)}）
                               {remoteRef} → {remoteSha![..8]}（{BaseMeta(repoPath, remoteSha!)}）
                             worktree 场景本地分支常陈旧（主仓 checkout 别的分支时不更新），增量基点通常应取远端跟踪引用。
@@ -74,6 +77,8 @@ internal static class RestPush
             else if (baseRef.Length is 40 or 64)
                 baseDesc = "显式 sha";
             baseSha ??= Git(repoPath, $"rev-parse {baseRef}^{{commit}}").Trim();
+            // （ NeedsDisambig 为 false 的形态：sha / refs/* / origin/* ——显式引用无歧义，
+            //   rev-parse 直解；两侧皆无的裸名/斜杠名也落到这里（tag 等其它引用形态兜底） ）
             if (baseSha is not { Length: 40 or 64 } || !GitIsAncestor(repoPath, baseSha, head))
             {
                 // v2.10（2026-10-31 实战）：泛化提示逼 agent 自诊——两次踩的是同一个真实原因
@@ -181,6 +186,14 @@ internal static class RestPush
             (false, true) => BaseResolution.RemoteOnly,
             (true, true) => sameSha ? BaseResolution.BothSame : BaseResolution.Ambiguous,
         };
+
+    /// <summary>闸门⑦ 适用面（v2.16 纯函数，selftest 锁）：非 sha（40/64 位）、非 refs/ 与 origin/
+    /// 显式前缀的名一律做 refs/heads/N ↔ refs/remotes/origin/N 两侧消歧——v2.14 只盖裸名，
+    /// feature/x 等斜杠名同样吃 DWIM 的 refs/heads/ 优先坑（worktree 陈旧本地同名分支静默误路由）。</summary>
+    public static bool NeedsDisambig(string baseRef) =>
+        baseRef.Length is not (40 or 64)
+        && !baseRef.StartsWith("refs/", StringComparison.Ordinal)
+        && !baseRef.StartsWith("origin/", StringComparison.Ordinal);
 
     /// <summary>blob 去重分区（纯函数，selftest 锁）：remote 为 null = 去重不可用 → 全传。
     /// 返回（待传列表, 跳过数）；命中集只减不改（保序遍历入列表）。</summary>
@@ -327,6 +340,10 @@ internal static class RestPush
         // 远端现状（读 API，免批准路径与 §9 api 同类）
         var (st, body) = await GitHubApi.SendRawAsync(HttpMethod.Get,
             $"repos/{plan.Repo}/git/ref/heads/{GitHubApi.RefPath(plan.Branch)}", token, null);
+        // v2.16：403 先过限流嗅探——push 是 blob POST 密集面（secondary 最高发处），误报
+        // credential_expired 会开出"重新 setup"死方子；非限流 403（SAML/越权）仍走 Unauthorized
+        // （api 通道 v2.10 同纪律：带 token 的 403 才归凭据档）
+        if (GitHubApi.RateLimitWhat(st, body) is { } what) return new(PushResult.RateLimited, Reason: what);
         if (st is 401 or 403) return new(PushResult.Unauthorized);
         if (st == 409)
         {
@@ -341,13 +358,17 @@ internal static class RestPush
             };
             var (sst, sbody) = await GitHubApi.SendRawAsync(HttpMethod.Put,
                 $"repos/{plan.Repo}/contents/README.md", token, seed.ToJsonString());
-            if (sst is not (200 or 201)) return Net(sst, $"空仓库初始化(README) {Why(sst, sbody)}");
+            if (sst is not (200 or 201)) return Net(sst, sbody, "空仓库初始化(README)");
             (st, body) = await GitHubApi.SendRawAsync(HttpMethod.Get,
                 $"repos/{plan.Repo}/git/ref/heads/{GitHubApi.RefPath(plan.Branch)}", token, null);
+            // v2.16：403 先过限流嗅探——push 是 blob POST 密集面（secondary 最高发处），误报
+            // credential_expired 会开出"重新 setup"死方子；非限流 403（SAML/越权）仍走 Unauthorized
+            // （api 通道 v2.10 同纪律：带 token 的 403 才归凭据档）
+            if (GitHubApi.RateLimitWhat(st, body) is { } what2) return new(PushResult.RateLimited, Reason: what2);
             if (st is 401 or 403) return new(PushResult.Unauthorized);
         }
         if (st == 409) { /* 播种后仍空(竞态)按 404 处理 */ st = 404; body = ""; }
-        if (st != 200 && st != 404) return Net(st, $"查询远端分支 {Why(st, body)}");
+        if (st != 200 && st != 404) return Net(st, body, "查询远端分支");
 
         string remoteSha;
         bool isNew;
@@ -472,7 +493,7 @@ internal static class RestPush
             var blobBody = new JsonObject { ["content"] = content, ["encoding"] = "base64" };
             var (bst, bbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                 $"repos/{plan.Repo}/git/blobs", token, blobBody.ToJsonString());
-            if (bst is not (200 or 201)) return Net(bst, $"blob 上传 {Why(bst, bbody)}");
+            if (bst is not (200 or 201)) return Net(bst, bbody, "blob 上传");
             var gotSha = JsonNode.Parse(bbody)?["sha"]?.GetValue<string>();
             if (gotSha != sha)
                 // v2.12：内容寻址对象同内容必同 sha——不符属服务端异常窗（Vitro 4×blob-500 同族）；
@@ -515,7 +536,7 @@ internal static class RestPush
                 if (prevTree.Length > 0) treeBody["base_tree"] = prevTree;
                 var (tst, tbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                     $"repos/{plan.Repo}/git/trees", token, treeBody.ToJsonString());
-                if (tst is not (200 or 201)) return Net(tst, $"tree 创建 {Why(tst, tbody)}");
+                if (tst is not (200 or 201)) return Net(tst, tbody, "tree 创建");
                 treeSha = JsonNode.Parse(tbody)?["sha"]?.GetValue<string>() ?? "";
             }
 
@@ -539,7 +560,7 @@ internal static class RestPush
             }
             var (cst, cbody) = await GitHubApi.SendIdempotentAsync(HttpMethod.Post,
                 $"repos/{plan.Repo}/git/commits", token, commitBody.ToJsonString());
-            if (cst != 201) return Net(cst, $"commit 创建 {Why(cst, cbody)}");
+            if (cst != 201) return Net(cst, cbody, "commit 创建");
             lastSha = JsonNode.Parse(cbody)?["sha"]?.GetValue<string>() ?? "";
             prevCommit = lastSha;
             prevTree = treeSha;
@@ -553,13 +574,22 @@ internal static class RestPush
                 new JsonObject { ["ref"] = $"refs/heads/{plan.Branch}", ["sha"] = lastSha }.ToJsonString())
             : await GitHubApi.SendRawAsync(HttpMethod.Patch, $"repos/{plan.Repo}/git/refs/heads/{GitHubApi.RefPath(plan.Branch)}", token,
                 new JsonObject { ["sha"] = lastSha, ["force"] = replay }.ToJsonString());
-        if (rst is not (200 or 201)) return Net(rst, $"update-ref {Why(rst, rbody)}");
+        if (rst is not (200 or 201)) return Net(rst, rbody, "update-ref");
         return new(PushResult.Done, NewSha: lastSha, SkippedBlobs: skipped);
     }
 
-    private static Result Net(int status, string detail) => status >= 500
-        ? new Result(PushResult.Unclear, Reason: detail)   // 序列中断：分支未动，重试安全，按 unknown 诚实分类
-        : new Result(PushResult.Other, Reason: detail);
+    private static Result Net(int status, string body, string step)
+    {
+        // v2.16：序列中段（blob/tree/commit/update-ref/空仓播种）撞 403 secondary/429 → RateLimited
+        // （22/wait_until）——"分支未动"是事实，但缺 wait 语义会让 agent 立即重跑、延长封锁窗；
+        // 5xx 维持 Unclear（结果不明），与 §9.6 幂等重试不变量不冲突（429 本就不自动重试）
+        if (GitHubApi.RateLimitWhat(status, body) is { } what)
+            return new Result(PushResult.RateLimited, Reason: what);
+        var detail = $"{step} {Why(status, body)}";
+        return status >= 500
+            ? new Result(PushResult.Unclear, Reason: detail)   // 序列中断：分支未动，重试安全，按 unknown 诚实分类
+            : new Result(PushResult.Other, Reason: detail);
+    }
 
     /// <summary>HTTP 状态 + GitHub 响应 message（权限类错误直接显示服务端原话）。</summary>
     private static string Why(int st, string body)

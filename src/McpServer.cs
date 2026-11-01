@@ -352,12 +352,18 @@ internal static class McpServer
             case "release_create":
                 list.AddRange(["release", "create"]);
                 Opt("--repo", Str("repo")); Opt("--tag", Str("tag")); Opt("--target", Str("target")); Opt("--name", Str("name"));
-                if (a.TryGetProperty("prerelease", out var pr)
-                    && (pr.ValueKind is not (JsonValueKind.True or JsonValueKind.False)
-                        || (pr.ValueKind == JsonValueKind.String && pr.GetString() != "true" && pr.GetString() != "false")))
-                { error = Messages.BadRequest("prerelease 应为布尔值——本次未产生任何副作用"); return false; }
-                if (pr.ValueKind == JsonValueKind.True || (pr.ValueKind == JsonValueKind.String && pr.GetString() == "true"))
-                    list.Add("--prerelease");
+                if (a.TryGetProperty("prerelease", out var pr))
+                {
+                    // v2.16 白名单化：原 `not(True|False) || (String && ≠true/false)` 使字符串值必被首支
+                    // 拒绝、"字符串 true"接受分支不可达（死代码）；直接改 && 又会漏放 object/array
+                    // （静默丢参）。白名单 = 真布尔或字符串 "true"/"false"（宿主 JSON 化常见形态），其余显式拒。
+                    bool okBool = pr.ValueKind is JsonValueKind.True or JsonValueKind.False;
+                    bool okStr = pr.ValueKind == JsonValueKind.String && pr.GetString() is "true" or "false";
+                    if (!okBool && !okStr)
+                    { error = Messages.BadRequest("prerelease 应为布尔值——本次未产生任何副作用"); return false; }
+                    if (pr.ValueKind == JsonValueKind.True || (okStr && pr.GetString() == "true"))
+                        list.Add("--prerelease");
+                }
                 if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
                 break;
             case "branch_delete":

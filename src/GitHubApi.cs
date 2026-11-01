@@ -192,11 +192,15 @@ internal static class GitHubApi
             return (int)resp.StatusCode switch
             {
                 201 => await ReadCreatedAsync(resp),
-                401 or 403 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                // v2.16：403 自 Unauthorized 拆出（v2.5 为 merge 拆过、comment 漏网）——权限拒与
+                // 限流都不是凭据失效；Reason 带 message 供 Program 层嗅探/透传
+                401 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                403 => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}：{await MessageOfAsync(resp)}"),
                 >= 500 => new ApiResult(OutcomeKind.UnknownOutcome, (int)resp.StatusCode,
                     $"HTTP {(int)resp.StatusCode}"),
                 _ => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
-                    $"HTTP {(int)resp.StatusCode}"),
+                    $"HTTP {(int)resp.StatusCode}：{await MessageOfAsync(resp)}"),
             };
         }
         catch (HttpRequestException ex)
@@ -225,7 +229,10 @@ internal static class GitHubApi
             return (int)resp.StatusCode switch
             {
                 201 => await ReadCreatedAsync(resp),
-                401 or 403 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                // v2.16：403 自 Unauthorized 拆出（镜像 MergePrAsync v2.5 先例）
+                401 => new ApiResult(OutcomeKind.Unauthorized, (int)resp.StatusCode),
+                403 => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
+                    $"HTTP {(int)resp.StatusCode}：{await MessageOfAsync(resp)}"),
                 >= 500 => new ApiResult(OutcomeKind.UnknownOutcome, (int)resp.StatusCode,
                     $"HTTP {(int)resp.StatusCode}"),
                 _ => new ApiResult(OutcomeKind.Other, (int)resp.StatusCode,
@@ -312,15 +319,47 @@ internal static class GitHubApi
     internal static (bool Primary, int? WaitMinutes)? ParseRateLimit(string? body)
     {
         if (string.IsNullOrEmpty(body)) return null;
-        var msg = MessageOfBody(body);
-        if (msg.Length == 0) return null;
+        var msg = RateLimitText(body);
         var primary = msg.Contains("API rate limit exceeded", StringComparison.OrdinalIgnoreCase);
         var secondary = msg.Contains("secondary rate limit", StringComparison.OrdinalIgnoreCase)
                      || msg.Contains("abuse detection mechanism", StringComparison.OrdinalIgnoreCase);
         if (!primary && !secondary) return null;
+        return (primary, WaitMinutesOf(msg));
+    }
+
+    /// <summary>限流特征文本归一（v2.16）：raw JSON body 走 message 字段提取；提取不出（空/非 JSON）
+    /// 按原文本处理——兼容 ApiResult.Reason 路径（已是"HTTP {st}：{message}"拼好的纯文本，
+    /// MessageOfBody 对非 JSON 恒空串会漏嗅探）。</summary>
+    private static string RateLimitText(string? text)
+    {
+        var msg = MessageOfBody(text ?? "");
+        return msg.Length > 0 ? msg : text ?? "";
+    }
+
+    private static int? WaitMinutesOf(string msg)
+    {
         var m = System.Text.RegularExpressions.Regex.Match(msg, @"wait (\d+) minutes?",
             System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return (primary, m.Success ? int.Parse(m.Groups[1].Value) : null);
+        return m.Success ? int.Parse(m.Groups[1].Value) : null;
+    }
+
+    /// <summary>写通道 403/429 限流嗅探的统一文案（v2.16）：api 读通道 v2.10 修掉的死方子在写通道
+    /// 原样存在——POST/PATCH 密集创建恰是 secondary 高发面，被诊成"无写权限/凭据失效"会引向
+    /// 改参立即重试或重发 PAT（密集重试延长封锁窗）。非限流返回 null（403 的权限/保护语义交各
+    /// op 专属文案）；429 本身即限流，无特征文本也归等待档。text 兼容 raw body 与已提取 message。</summary>
+    internal static string? RateLimitWhat(int st, string? text)
+    {
+        if (st is not (403 or 429)) return null;
+        var msg = RateLimitText(text);
+        var primary = msg.Contains("API rate limit exceeded", StringComparison.OrdinalIgnoreCase);
+        var secondary = msg.Contains("secondary rate limit", StringComparison.OrdinalIgnoreCase)
+                     || msg.Contains("abuse detection mechanism", StringComparison.OrdinalIgnoreCase);
+        if (st != 429 && !primary && !secondary) return null;
+        if (primary) return "API 配额（rate limit）耗尽，等待当前配额窗重置（约 1 小时内）";
+        if (secondary)
+            return WaitMinutesOf(msg) is int m ? $"secondary rate limit，服务端要求等待约 {m} 分钟"
+                : "secondary rate limit / 滥用检测拦截，等待数分钟";
+        return "服务端限流（HTTP 429）——通常 1 分钟内解封，稍候重试";
     }
 
     /// <summary>分支名 → refs URL 路径段（逐段 percent-encode）。分支名是自由字符（git 引用语法

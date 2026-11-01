@@ -248,6 +248,54 @@ internal static class Messages
         """,
         ExitCodes.RateLimitWait, "wait_until", true);
 
+    // ---- 写通道 403/429 限流（exit 22，retry=wait_until；v2.16：api 读通道 v2.10 同族扩到写通道
+    //      ——POST/PATCH 密集创建恰是 secondary 高发面，被诊成"无写权限/凭据失效"会引向改参
+    //      立即重试或重发 PAT，密集重试反而延长封锁窗） ----
+    public static Msg WriteRateLimited(string op, string target, int st, string what) => new(
+        "[Sluice·终态]",
+        $"""
+        {op} → {target} 被限流拦截（HTTP {st}）：{what}——凭据与权限均无问题，不要重新 setup、不要改参数立即重试。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：按上述窗口等待后重新运行同一命令；期间不要密集重试（会延长拦截）。
+        """,
+        ExitCodes.RateLimitWait, "wait_until", true);
+
+    // ---- push 序列限流（exit 22，retry=wait_until；v2.16：ref 预查/序列中段撞 403 secondary/429
+    //      ——原 ref 预查 403 一律 credential_expired 死方子。不谎称零副作用：已传 blob 是服务端
+    //      内容寻址对象，但分支未动、无可见变更、重传自动去重） ----
+    public static Msg PushRateLimited(string repo, string branch, string what) => new(
+        "[Sluice·终态]",
+        $"""
+        push → {repo}@{branch} 被限流拦截：{what}——凭据与权限均无问题，不要重新 setup。
+        分支未动（update-ref 是唯一写点，未到达或已被拒）；已上传的 blob/tree 是内容寻址幂等对象，无引用不可见，重传自动去重。
+        修正：按上述窗口等待后重新运行同一命令；期间不要密集重试（会延长拦截）。
+        """,
+        ExitCodes.RateLimitWait, "wait_until", true);
+
+    // ---- 写 op 403 通用禁止档（exit 10，retry=after_fix；v2.16：pr_comment/pr_create 的 403 原与
+    //      401 在 GitHubApi 层混归 Unauthorized→credential_expired 死路；v2.5 已为 pr_merge/
+    //      branch_delete 拆过同款，本批补齐） ----
+    public static Msg WriteForbidden(string op, string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        {op} → {target} 被服务端拒绝（HTTP 403）：{detail}。
+        403 = 权限/策略拒（PAT 缺对应写权限、分支保护、组织策略），不是凭据失效——重新 setup 是死路。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：对照 README 的 PAT 权限矩阵核对后重跑同一命令；若属分支保护/组织策略，需用户调整设置。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- pr_comment 被拒（exit 10，retry=after_fix；v2.16：原经 InternalPost 谎记 internal——
+    //      服务端 404/422 拒绝不是 sluice 内部错误） ----
+    public static Msg CommentRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        pr_comment → {target} 被服务端拒绝：{detail}。常见：编号不存在（404）/ 422 校验拒。
+        本次操作未执行，GitHub 上没有产生任何变更。
+        修正：核对 --repo 与 --number（issues API 对 PR 编号同样应答，两者都可评论）后重跑。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // 其余非 2xx（404/429/…）：HTTP 层面已应答，事实在响应体
     public static Msg ApiHttpError(string path, int st, int bytes) => new(
         "[Sluice]",
@@ -665,6 +713,10 @@ internal static class Messages
         ("replayunresolved", PushReplayUnresolved("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2")),
         ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
         ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
+        ("writeratelimited", WriteRateLimited("pr_close", "rustin-beep/Vitro#390", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
+        ("pushratelimited", PushRateLimited("rustin-beep/Vitro", "feat/x", "secondary rate limit，服务端要求等待约 2 分钟")),
+        ("writeforbidden", WriteForbidden("pr_create", "rustin-beep/Vitro", "HTTP 403：Resource not accessible by personal access token")),
+        ("commentrejected", CommentRejected("rustin-beep/Vitro#52", "HTTP 404：Not Found")),
     ];
 
     public static void Write(Msg m)

@@ -53,8 +53,9 @@ jobs:
           echo "$out" | grep -q "git $sha" || { echo "!! 戳 sha 不符：期望 git $sha"; exit 1; }
           if echo "$out" | grep -q '+dirty'; then echo "!! 干净 checkout 构出脏戳"; exit 1; fi
           # 版本对齐：--version 自报的 plan-lite 版本须与文档版本行一致
-          # （v2.5 滞后 v2.6 曾靠人眼评审抓到——从此 CI 断言）
-          docv="$(grep -m1 -oE 'v2\.[0-9]+-lite' plan-lite.md | sed 's/-lite//')"
+          # （v2.5 滞后 v2.6 曾靠人眼评审抓到——从此 CI 断言；v2.16 正则泛化 v[0-9]+——
+          #   原 v2\. 在 plan-lite 升 v3 当天会先红正则再红版本，红得莫名其妙）
+          docv="$(grep -m1 -oE 'v[0-9]+\.[0-9]+-lite' plan-lite.md | sed 's/-lite//')"
           [ -n "$docv" ] || { echo "!! plan-lite.md 版本行解析失败"; exit 1; }
           echo "$out" | grep -q "plan-lite $docv" || { echo "!! --version 版本滞后：文档已是 $docv"; exit 1; }
           "$exe" selftest

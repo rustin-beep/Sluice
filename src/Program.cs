@@ -162,7 +162,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.15");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.16");
         return 0;
     }
 
@@ -286,7 +286,7 @@ internal static class Program
                     Audit.Append("api_read", "api.github.com", $"repos/{repo}/git/commits/{baseSha}", null,
                         $"http_{bst}", result: $"{bbody.Length}B anon");
                 if (!bNotSent && bst == 404)
-                    baseWarn = $"--base 基点 {baseSha[..8]} 未见於远端匿名读：公开库 = 确不在远端（执行将拒绝、零上传零副作用）；私有库匿名不可见属正常——由执行时带 token 终判";
+                    baseWarn = $"--base 基点 {baseSha[..8]} 未见于远端匿名读：公开库 = 确不在远端（执行将拒绝、零上传零副作用）；私有库匿名不可见属正常——由执行时带 token 终判";
             }
             catch { /* 预检尽力而为，不阻塞 */ }
         }
@@ -386,6 +386,10 @@ internal static class Program
             RestPush.PushResult.Done => Done(r, plan),
             RestPush.PushResult.UpToDate => UpToDate(plan),
             RestPush.PushResult.Unauthorized => PushFail(plan, "credential_expired", Messages.CredentialExpired("HTTP 401/403"), ExitCodes.CredentialExpired, r.Reason),
+            // v2.16：推送序列/ref 预查撞限流（403 secondary/429）——原 ref 预查 403 一律 Unauthorized
+            // （credential_expired 死方子）、序列中段落 Other（缺 wait 语义）。分支未动；已传 blob 幂等
+            RestPush.PushResult.RateLimited => PushFail(plan, "rate_limited",
+                Messages.PushRateLimited(plan.Repo, plan.Branch, r.Reason ?? "限流拦截"), ExitCodes.RateLimitWait, r.Reason),
             RestPush.PushResult.NeedFetch => PushFail(plan, "need_fetch", Messages.BadRequest(r.Reason ?? "需先同步远端"), ExitCodes.BadRequest, r.Reason),
             // 非 ff 改档 after_fix（2026-10-30 实战）：rebase 后可重推同一分支，agent 可自行修复——
             // 原 policy_reject（"策略永禁"）定性不准，且缺 rebase 正解。裸 force 仍永禁（tripwire 不动）；
@@ -573,6 +577,8 @@ internal static class Program
     /// 的审计细分由闭包落笔）；≥500 与超时→21 unknown——非幂等写下服务端 5xx 同样结果不明
     /// （v2.11 不变量，对齐 comment/pr_create 的 create 族先例；v2.7 PATCH 族原归 10 的
     /// pr_reopen/issue_close 已同批改齐）；未发出→20。
+    /// v2.16：default 臂前置 403/429 限流嗅探（RateLimitWhat）→22 wait_until——api 读通道
+    /// v2.10 修掉的死方子在写通道原样存在，POST/PATCH 密集创建恰是 secondary 高发面。
     /// </summary>
     private static int ExecuteGated(Gate.Outcome.Approved a, string op, string repo, string auditTarget,
         string msgTarget, string sha, HttpMethod method, string path, string jsonBody,
@@ -605,6 +611,13 @@ internal static class Program
                     Messages.Write(Messages.Unknown($"HTTP {st}"));
                     return ExitCodes.Unknown;
                 default:
+                    if (GitHubApi.RateLimitWhat(st, body) is { } what)
+                    {
+                        Audit.Append(op, repo, auditTarget, sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                            result: $"http_{st}");
+                        Messages.Write(Messages.WriteRateLimited(op, msgTarget, st, what));
+                        return ExitCodes.RateLimitWait;
+                    }
                     writeRejected(st, HttpDetail(st, body));
                     return ExitCodes.BadRequest;
             }
@@ -660,11 +673,8 @@ internal static class Program
                 "pr_comment 缺少 --repo / --number / --body-file（示例：sluice comment --repo owner/repo --number 5 --body-file x.md）"));
             return ExitCodes.BadRequest;
         }
-        if (!System.Text.RegularExpressions.Regex.IsMatch(repo, @"^[\w.-]+/[\w.-]+$"))
-        {
-            Messages.Write(Messages.BadRequest($"--repo 应为 owner/name 形式，收到：{repo}"));
-            return ExitCodes.BadRequest;
-        }
+        if (!IsRepoName(repo)) // v2.16：收敛单源（v2.11 收敛时漏了旧 op 的内联副本）
+            return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
         if (!File.Exists(bodyFile))
         {
             Messages.Write(Messages.BadRequest($"--body-file 不存在：{bodyFile}"));
@@ -693,7 +703,7 @@ internal static class Program
             Messages.Write(Messages.BadRequest($"无法读取 --body-file：{ex.Message}"));
             return ExitCodes.BadRequest;
         }
-        var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(body)))[..8].ToLowerInvariant();
+        var sha = Sha8(body); // v2.16：收敛单源（与 v2.11 指纹公式族同式）
         var target = $"{repo}#{number}";
 
         Gate.Outcome outcome;
@@ -757,8 +767,33 @@ internal static class Program
             GitHubApi.OutcomeKind.Unauthorized => Expired(result, repo, number, sha),
             GitHubApi.OutcomeKind.NotSent => NotSent(result, repo, number, sha),
             GitHubApi.OutcomeKind.UnknownOutcome => UnknownOutcome(result, repo, number, sha),
-            _ => InternalPost(result, repo, number, sha),
+            // v2.16：服务端 4xx 拒绝原经 InternalPost 谎记 internal——403/404/422 不是 sluice
+            // 内部错误（GitHubApi 层 403 也已自 Unauthorized 拆出入此臂）
+            _ => CommentOutcome(result, repo, number, sha),
         };
+    }
+
+    /// <summary>pr_comment 的 Other 分类（v2.16）：限流嗅探→22；403→forbidden（WriteForbidden）；
+    /// 404/422 等→pr_comment_rejected；2xx 但响应畸形（缺 html_url）仍归 internal（真·内部语义）。</summary>
+    private static int CommentOutcome(GitHubApi.ApiResult r, string repo, int number, string sha)
+    {
+        if (r.Status is 200 or 201)
+            return InternalPost(r, repo, number, sha);
+        var target = $"{repo}#{number}";
+        if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
+        {
+            Audit.Append("pr_comment", repo, $"#{number}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                result: $"http_{r.Status}");
+            Messages.Write(Messages.WriteRateLimited("pr_comment", target, r.Status, what));
+            return ExitCodes.RateLimitWait;
+        }
+        Audit.Append("pr_comment", repo, $"#{number}", sha,
+            r.Status == 403 ? "forbidden" : r.Status == 404 ? "not_found" : "pr_comment_rejected",
+            consent: TokenStore.ConsentChannel, result: r.Reason ?? $"http_{r.Status}");
+        Messages.Write(r.Status == 403
+            ? Messages.WriteForbidden("pr_comment", target, r.Reason ?? "HTTP 403")
+            : Messages.CommentRejected(target, r.Reason ?? $"HTTP {r.Status}"));
+        return ExitCodes.BadRequest;
     }
 
     // ---------- sluice api（§9 v2.2 读通道：GET-only，默认匿名，读审计落行） ----------
@@ -888,6 +923,11 @@ internal static class Program
                 }
                 Messages.Write(Messages.CredentialExpired($"HTTP {st}（api GET {path}）"));
                 return ExitCodes.CredentialExpired;
+            case 429:
+                // v2.16：429 本身即限流（原落 default 报"其余非 2xx"——读通道的分类对偶补面）
+                Messages.Write(Messages.ApiRateLimitedWait(path, st,
+                    GitHubApi.RateLimitWhat(st, body) ?? "服务端限流（HTTP 429）"));
+                return ExitCodes.RateLimitWait;
             default:
                 Messages.Write(Messages.ApiHttpError(path, st, body.Length));
                 return ExitCodes.BadRequest;
@@ -1052,13 +1092,35 @@ internal static class Program
                 Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
                 return ExitCodes.Unknown;
             default:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "internal", consent: TokenStore.ConsentChannel,
-                    result: r.Reason ?? $"http_{r.Status}");
+                // v2.16：服务端拒绝不再记 internal（同批 CommentOutcome 清账）；403 已自 GitHubApi 层
+                // Unauthorized 拆出——原 credential_expired 死方子；限流嗅探（403 secondary/429）→22
+                if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
+                {
+                    Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "rate_limited",
+                        consent: TokenStore.ConsentChannel, result: $"http_{r.Status}");
+                    Messages.Write(Messages.WriteRateLimited("pr_create", target, r.Status, what));
+                    return ExitCodes.RateLimitWait;
+                }
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha,
+                    r.Status == 403 ? "forbidden" : r.Status == 404 ? "not_found" : "pr_create_rejected",
+                    consent: TokenStore.ConsentChannel, result: r.Reason ?? $"http_{r.Status}");
                 // 422（PR 已存在/分支无差异）：服务端明确拒绝，原样重跑必再 422——专用消息指引查已有 PR；
+                // 403 = 写权限/分支保护（WriteForbidden）；404 = 仓库不存在或 head 未推远端；
                 // 其余非 2xx（如 400 真·用法错）仍走通用 bad_request 模板
                 if (r.Status == 422)
                 {
                     Messages.Write(Messages.PrRejected(repo, head, r.Reason ?? "HTTP 422"));
+                    return ExitCodes.BadRequest;
+                }
+                if (r.Status == 403)
+                {
+                    Messages.Write(Messages.WriteForbidden("pr_create", target, r.Reason ?? "HTTP 403"));
+                    return ExitCodes.BadRequest;
+                }
+                if (r.Status == 404)
+                {
+                    Messages.Write(Messages.BadRequest(
+                        $"pr_create 被服务端拒绝（404）：仓库 {repo} 不存在或无权访问，或 head 分支 {head} 未推到远端（{r.Reason}）。本次未产生任何副作用，核对后重跑"));
                     return ExitCodes.BadRequest;
                 }
                 Messages.Write(Messages.BadRequest($"pr_create 被服务端拒绝：{r.Reason}"));
@@ -1298,11 +1360,20 @@ internal static class Program
                     result: $"unknown:{r.Reason}");
                 Messages.Write(Messages.Unknown(r.Reason ?? "结果不明"));
                 return ExitCodes.Unknown;
-            default:
-                // 405（不可合并）/ 409（冲突）/ 422（校验拒）：服务端明确拒绝；403 与 404 各配专属
-                // 文案（2026-10-30 评审：403 归"不可合并"是误导——它是保护/权限；404 是"不存在"，
-                // 与 mergeability 无关）
-                Audit.Append("pr_merge", repo, $"#{number}", sha,
+                default:
+                    // v2.16：限流嗅探先行——pr_merge 的 403 若是 secondary/abuse 或 429，
+                    // PrMergeForbidden 的"重发 PAT"指引就是死方子（v2.10 api 通道同族）
+                    if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
+                    {
+                        Audit.Append("pr_merge", repo, $"#{number}", sha, "rate_limited",
+                            consent: TokenStore.ConsentChannel, result: $"http_{r.Status}");
+                        Messages.Write(Messages.WriteRateLimited("pr_merge", target, r.Status, what));
+                        return ExitCodes.RateLimitWait;
+                    }
+                    // 405（不可合并）/ 409（冲突）/ 422（校验拒）：服务端明确拒绝；403 与 404 各配专属
+                    // 文案（2026-10-30 评审：403 归"不可合并"是误导——它是保护/权限；404 是"不存在"，
+                    // 与 mergeability 无关）
+                    Audit.Append("pr_merge", repo, $"#{number}", sha,
                     r.Status == 403 ? "forbidden" : r.Status == 404 ? "not_found" : "pr_merge_rejected",
                     consent: TokenStore.ConsentChannel, result: r.Reason ?? $"http_{r.Status}");
                 Messages.Write(r.Status switch
@@ -1465,6 +1536,19 @@ internal static class Program
                         result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
+                // v2.16：限流嗅探先行（403 secondary/429 ≠ 保护/权限拒）；429 落下方 default 同查
+                case 403 when GitHubApi.RateLimitWhat(st, body) is { } what:
+                    Audit.Append("branch_delete", repo, branch, sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                        result: $"http_{st}");
+                    Messages.Write(Messages.WriteRateLimited("branch_delete", target, st, what));
+                    return ExitCodes.RateLimitWait;
+                case >= 500:
+                    // v2.16（v2.7"留下批评审统一"清账，对齐 v2.11 PATCH 族）：DELETE 5xx 同样结果不明
+                    // （可能已删）——原落 default 谎称"未产生任何副作用"；查证 refs/heads 即知（与超时同纪律）
+                    Audit.Append("branch_delete", repo, branch, sha, "unknown", consent: TokenStore.ConsentChannel,
+                        result: $"http_{st}");
+                    Messages.Write(Messages.Unknown($"HTTP {st}"));
+                    return ExitCodes.Unknown;
                 case 403:
                     Audit.Append("branch_delete", repo, branch, sha, "forbidden", consent: TokenStore.ConsentChannel,
                         result: HttpDetail(st, body));
@@ -1476,6 +1560,13 @@ internal static class Program
                     Messages.Write(Messages.BadRequest($"分支不存在（可能已被删除）：{repo}@{branch}。本次未产生任何副作用"));
                     return ExitCodes.BadRequest;
                 default:
+                    if (GitHubApi.RateLimitWhat(st, body) is { } what2)
+                    {
+                        Audit.Append("branch_delete", repo, branch, sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                            result: $"http_{st}");
+                        Messages.Write(Messages.WriteRateLimited("branch_delete", target, st, what2));
+                        return ExitCodes.RateLimitWait;
+                    }
                     Audit.Append("branch_delete", repo, branch, sha, "bad_request", consent: TokenStore.ConsentChannel,
                         result: $"http_{st}");
                     Messages.Write(Messages.BadRequest($"branch_delete 被服务端拒绝：{HttpDetail(st, body)}。本次未产生任何副作用"));
@@ -1660,6 +1751,14 @@ internal static class Program
                     Messages.Write(Messages.Unknown($"HTTP {st}"));
                     return ExitCodes.Unknown;
                 default:
+                    // v2.16：限流嗅探先行（403 secondary/429 ≠ 权限拒——after_fix"核对权限"是死方子）
+                    if (GitHubApi.RateLimitWhat(st, body) is { } what)
+                    {
+                        Audit.Append("pr_reopen", repo, $"#{number}", sha, "rate_limited",
+                            consent: TokenStore.ConsentChannel, result: $"http_{st}");
+                        Messages.Write(Messages.WriteRateLimited("pr_reopen", target, st, what));
+                        return ExitCodes.RateLimitWait;
+                    }
                     // 403（无 Pull requests 写权限）/ 404（批准期间被删）/ 422（已开放/已合并/head 已删）——透传服务端原话
                     Audit.Append("pr_reopen", repo, $"#{number}", sha,
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "pr_reopen_rejected",
@@ -1841,6 +1940,14 @@ internal static class Program
                     Messages.Write(Messages.Unknown($"HTTP {st}"));
                     return ExitCodes.Unknown;
                 default:
+                    // v2.16：限流嗅探先行（同 pr_reopen）
+                    if (GitHubApi.RateLimitWhat(st, body) is { } what)
+                    {
+                        Audit.Append("issue_close", repo, $"#{number}", sha, "rate_limited",
+                            consent: TokenStore.ConsentChannel, result: $"http_{st}");
+                        Messages.Write(Messages.WriteRateLimited("issue_close", target, st, what));
+                        return ExitCodes.RateLimitWait;
+                    }
                     // 403（无 Issues 写权限）/ 404（批准期间被删）/ 422（含 PR 编号误用透传）——服务端原话
                     Audit.Append("issue_close", repo, $"#{number}", sha,
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "issue_close_rejected",
@@ -1967,10 +2074,12 @@ internal static class Program
         var warn404 = metaSt == 404
             ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——两者不可区分，存在性由服务端执行时判定"
             : "";
+        // v2.16（评审 B1）：merged ⇒ state 必为 closed——先判 closed 会把已合并 PR 也开进
+        // "pr reopen 恢复"死方子（合并是终态，服务端 reopen 422）；RunReview 同款检查次序本正确
+        if (prMerged is not null)
+            return ErrBad($"PR #{number} 已合并——合并是终态（讨论保留），close 与 reopen 均无意义，服务端同样会拒；本次未产生任何副作用");
         if (prState == "closed")
             return ErrBad($"PR #{number} 已处于关闭状态，无需 close；本次未产生任何副作用。若是误关想恢复：sluice pr reopen --repo {repo} --number {number}");
-        if (prMerged is not null)
-            return ErrBad($"PR #{number} 已合并——合并是终态（讨论保留），close 无意义，服务端同样会拒；本次未产生任何副作用");
 
         var target = $"{repo}#{number}";
         // 指纹混入 head sha（镜像 pr_reopen）：编号不变内容可变——锚定"所见版本"
@@ -2584,6 +2693,12 @@ internal static class Program
                     Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "credential_expired", consent: TokenStore.ConsentChannel, result: "http_401");
                     Messages.Write(Messages.CredentialExpired("HTTP 401"));
                     return ExitCodes.CredentialExpired;
+                case 403 when GitHubApi.RateLimitWhat(st, rbody) is { } what:
+                    // v2.16：限流嗅探先行——DispatchForbidden 的"重发 PAT"指引对限流是死方子；429 落 default 同查
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                        result: $"http_{st}");
+                    Messages.Write(Messages.WriteRateLimited("workflow_dispatch", $"{repo}@{workflow}", st, what));
+                    return ExitCodes.RateLimitWait;
                 case 403:
                     // fine-grained PAT 缺 Actions: Read and write——用户动作可修，专属指引（勿归凭据过期死路）
                     Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "forbidden", consent: TokenStore.ConsentChannel,
@@ -2595,7 +2710,21 @@ internal static class Program
                         result: "http_404");
                     Messages.Write(Messages.DispatchNotFound(repo, workflow));
                     return ExitCodes.BadRequest;
+                case >= 500:
+                    // v2.16（v2.7"留下批评审统一"清账，对齐 v2.11）：POST 非幂等（5xx 下可能已受理——
+                    // 重发=重复 run）——原落 DispatchRejected 谎称"本次操作未执行"；先查 runs 再决定
+                    Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "unknown", consent: TokenStore.ConsentChannel,
+                        result: $"http_{st}");
+                    Messages.Write(Messages.Unknown($"HTTP {st}"));
+                    return ExitCodes.Unknown;
                 default:
+                    if (GitHubApi.RateLimitWhat(st, rbody) is { } what2)
+                    {
+                        Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
+                            result: $"http_{st}");
+                        Messages.Write(Messages.WriteRateLimited("workflow_dispatch", $"{repo}@{workflow}", st, what2));
+                        return ExitCodes.RateLimitWait;
+                    }
                     Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "workflow_dispatch_rejected",
                         consent: TokenStore.ConsentChannel, result: HttpDetail(st, rbody));
                     Messages.Write(Messages.DispatchRejected(HttpDetail(st, rbody)));
