@@ -40,6 +40,7 @@ internal static class Selftest
         ("issuecreaterejected", ExitCodes.BadRequest, "after_fix"), // v2.11：权限缺失转告 setup / 404 核对 / 422 校验
         ("prcloserejected",   ExitCodes.BadRequest, "after_fix"), // v2.11：已关/已合并用既成状态，勿重跑
         ("issuereopenrejected", ExitCodes.BadRequest, "after_fix"), // v2.11：PR 误用/权限/锁定透传
+        ("issuelabelrejected", ExitCodes.BadRequest, "after_fix"), // v2.17：未知名 404/编号不存在/权限——当前标签原样保留
         ("preditrejected",    ExitCodes.BadRequest, "after_fix"), // v2.11：旧值未动，核对后重跑
         ("prreviewrejected",  ExitCodes.BadRequest, "after_fix"), // v2.11：APPROVE 自批 422 说破 → 改 RQC/COMMENT
         ("tagrejected",       ExitCodes.BadRequest, "after_fix"), // v2.13：Reference already exists → 用既有 tag 勿重试
@@ -68,7 +69,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -98,6 +99,7 @@ internal static class Selftest
                     or "prmergerejected" or "prmergeforbidden" or "prmergenotfound" or "branchdeleteforbidden"
                     or "prreopenrejected" or "issuecloserejected" or "dispatchforbidden" or "dispatchnotfound" or "dispatchrejected"
                     or "issuecreaterejected" or "prcloserejected" or "issuereopenrejected" or "preditrejected" or "prreviewrejected"
+                    or "issuelabelrejected"
                     or "tagrejected" or "releaserejected" or "writeforbidden" or "commentrejected" or "writeratelimited"
                 && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! 缺事实前置句\"本次操作未执行\""); }
@@ -124,6 +126,7 @@ internal static class Selftest
         fail += McpChecks();
         fail += SurfaceLock();
         fail += PushLogicChecks();
+        fail += LabelChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -291,6 +294,37 @@ internal static class Selftest
         return fail;
     }
 
+    /// <summary>v2.17 标签面批的 pure 决策入锁：--labels 解析（trim / 空段拒 / 重复拒——
+    /// OrdinalIgnoreCase，GitHub 标签唯一性大小写不敏感）与整组替换摘除清单（当前减新）。
+    /// 与网络解耦——决策表本身即不变量。</summary>
+    private static int LabelChecks()
+    {
+        Console.WriteLine("--- 标签锁（v2.17：--labels 解析 / 摘除清单）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) 解析：trim 合法；空串/空段/重复（含大小写变体）必拒
+        Eq("解析 trim+分段", string.Join("|", Program.LabelsParse(" a , b ,c ")!), "a|b|c");
+        Eq("解析 单名", string.Join("|", Program.LabelsParse("bug")!), "bug");
+        Eq("空串拒（清空全部本批不做）", Program.LabelsParse("   "), null);
+        Eq("空段拒", Program.LabelsParse("a,,b"), null);
+        Eq("重复拒", Program.LabelsParse("a,b,a"), null);
+        Eq("大小写重复拒（GitHub 唯一性不敏感）", Program.LabelsParse("Bug,bug"), null);
+        Eq("仅空白段拒", Program.LabelsParse(" , "), null);
+
+        // (2) 摘除清单：整组替换语义下"当前有而新清单没有"的必须被算出（弹窗披露的数据源）
+        Eq("摘除=当前减新", string.Join("|", Program.LabelRemovals(["a", "b"], ["b", "c"])), "a");
+        Eq("无摘除", Program.LabelRemovals(["a"], ["a", "b"]).Length, 0);
+        Eq("摘除大小写不敏感", string.Join("|", Program.LabelRemovals(["Bug", "x"], ["bug"])), "x");
+        Eq("当前空无摘除", Program.LabelRemovals([], ["bug"]).Length, 0);
+
+        Console.WriteLine(fail == 0 ? "标签锁通过。" : "标签锁有不符项（见上）。");
+        return fail;
+    }
+
     // ---------- 面一致锁（v2.11） ----------
 
     /// <summary>§9 op 白名单内置快照（与 plan-lite §9 首列一致；改 §9 必须同步本表——selftest 会红）。</summary>
@@ -299,6 +333,7 @@ internal static class Selftest
         "pr_comment", "pr_create", "pr_review", "push", "api", "pr_merge", "branch_delete",
         "pr_reopen", "issue_close", "workflow_dispatch",
         "issue_create", "pr_close", "issue_reopen", "pr_edit", "tag_create", "release_create",
+        "issue_label",
     ];
 
     /// <summary>§9 内的只读 op（不进 CLI 写动词表与 MCP Actions；新增读 op 须在此登记）。</summary>

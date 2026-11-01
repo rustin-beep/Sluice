@@ -62,6 +62,7 @@ internal static class Program
         ("issue create",     "issue_create",     RunIssueCreate),
         ("issue close",      "issue_close",      RunIssueClose),
         ("issue reopen",     "issue_reopen",     RunIssueReopen),
+        ("issue label",      "issue_label",      RunIssueLabel),
         ("review",           "pr_review",        RunReview),
         ("tag create",       "tag_create",       RunTagCreate),
         ("release create",   "release_create",   RunReleaseCreate),
@@ -118,11 +119,18 @@ internal static class Program
                                                         pull_request 类 CI——也是 CI 卡死时的首选补救）
               sluice issue close --repo O/R --number N
                                                         关闭 issue（经批准；销案闭环。PR 编号会被预检拦下）
-              sluice issue create --repo O/R --title T --body-file F
-                                                        新建 issue（经批准；立案闭环——issue_close 的对偶件）
+              sluice issue create --repo O/R --title T --body-file F [--labels a,b,c]
+                                                        新建 issue（经批准；立案闭环——issue_close 的对偶件；
+                                                        --labels 可选：单请求携带标签，未知标签名预检拦下
+                                                        ——先建标签再挂）
               sluice issue reopen --repo O/R --number N
                                                         重开已关 issue（经批准；issue_close 的对偶件，
                                                         PR 编号同样会被预检拦下）
+              sluice issue label --repo O/R --number N --labels a,b,c
+                                                        设置标签，整组替换（经批准；弹窗披露当前标签→
+                                                        新标签→摘除清单；PR 编号同样有效——PR 与 issue
+                                                        共用标签端点；未知标签名预检拦下；空清单清空
+                                                        全部标签本批不支持）
               sluice pr close --repo O/R --number N
                                                         关闭 PR（经批准；pr reopen 的对偶件。讨论保留，
                                                         可随时 reopen）
@@ -162,7 +170,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.16");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.17");
         return 0;
     }
 
@@ -488,6 +496,77 @@ internal static class Program
     /// <summary>SHA256 前 8 位小写（指纹公式族共用）。</summary>
     private static string Sha8(string s) =>
         Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s)))[..8].ToLowerInvariant();
+
+    /// <summary>v2.17 --labels 解析（逗号分隔）：trim；空段/重复拒——GitHub 标签唯一性大小写不敏感，
+    /// 重复判定同 OrdinalIgnoreCase。null = 非法。名字含逗号者本批不支持（§9 已注明）。</summary>
+    internal static string[]? LabelsParse(string raw)
+    {
+        if (raw.Trim().Length == 0) return null;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var names = new List<string>();
+        foreach (var seg in raw.Split(','))
+        {
+            var n = seg.Trim();
+            if (n.Length == 0 || !seen.Add(n)) return null;
+            names.Add(n);
+        }
+        return names.ToArray();
+    }
+
+    /// <summary>v2.17 整组替换语义下的摘除清单：当前有而新清单没有的（OrdinalIgnoreCase——
+    /// "将摘除"必须被弹窗看见，pr_edit 写覆盖披露同族）。</summary>
+    internal static string[] LabelRemovals(string[] current, string[] next)
+    {
+        var set = new HashSet<string>(next, StringComparer.OrdinalIgnoreCase);
+        return current.Where(c => !set.Contains(c)).ToArray();
+    }
+
+    /// <summary>v2.17 仓库标签清单尽力匿名预读（issue_create --labels / issue_label 未知名
+    /// fail-closed 校验的数据源）：分页 ≤5×100，末页不足 100 才算完备（超 500 标签不硬拒，
+    /// 退化为弹窗警示——v2.8 纪律）。读落审计（TryReadMeta 单源）。</summary>
+    private static (bool Complete, HashSet<string> Known) TryFetchRepoLabels(string repo)
+    {
+        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var page = 1; page <= 5; page++)
+        {
+            var (st, json) = TryReadMeta($"repos/{repo}/labels?per_page=100&page={page}");
+            if (st != 200 || json is not System.Text.Json.Nodes.JsonArray arr)
+                return (false, known);
+            foreach (var item in arr)
+            {
+                var n = item?["name"]?.GetValue<string>();
+                if (n is { Length: > 0 }) known.Add(n);
+            }
+            if (arr.Count < 100) return (true, known);
+        }
+        return (false, known);
+    }
+
+    /// <summary>v2.17 未知名 fail-closed：清单完备且含仓库不存在的名字 → ErrBad 落终态并返回 false
+    /// （调用方直接 return——GitHub 对未知名的处置未文档化且路径不一致：add-labels 据报 404、
+    /// create 带标签据报静默自动建标签随机色＝窗外实体创建，都不该被静默放行）；预检不可用
+    /// （私有库 404/超 500/网络）→ true + out note 降级警示行（进弹窗，v2.8 纪律）；
+    /// 全部在场 → true、note=null。</summary>
+    private static bool TryValidateLabels(string[] labels, string repo, out string? note, out int exitCode)
+    {
+        note = null;
+        exitCode = 0;
+        var (complete, known) = TryFetchRepoLabels(repo);
+        if (!complete)
+        {
+            note = "\n⚠ 标签清单预检不可用（匿名读失败或私有库不可见或仓库标签超 500 未读全）：名字若不存在，"
+                 + "服务端将拒绝或自动新建标签（GitHub 对未知名行为未文档化）——以本窗批准为准";
+            return true;
+        }
+        var unknown = labels.Where(l => !known.Contains(l)).ToArray();
+        if (unknown.Length > 0)
+        {
+            exitCode = ErrBad($"--labels 含仓库不存在的标签：{string.Join("、", unknown)}"
+                + $"（仓库现有 {known.Count} 个标签）——先建标签（网页/gh label create）或修正拼写后重跑；本次未产生任何副作用");
+            return false;
+        }
+        return true;
+    }
 
     /// <summary>写 op 前置（v2.11 收敛单源）：vault 存在性 + 承重墙侧门自查。
     /// false = 已写终态消息，out exitCode 直接返回。</summary>
@@ -1977,7 +2056,7 @@ internal static class Program
 
     private static int RunIssueCreate(string[] args)
     {
-        string? repo = null, title = null, bodyFile = null;
+        string? repo = null, title = null, bodyFile = null, labelsRaw = null;
         for (int i = 0; i < args.Length; i++)
         {
             string? Next() => i + 1 < args.Length ? args[++i] : null;
@@ -1986,6 +2065,10 @@ internal static class Program
                 case "--repo":
                     repo = Next();
                     if (repo is null) return ErrMissing("issue_create", "--repo");
+                    break;
+                case "--labels":
+                    labelsRaw = Next();
+                    if (labelsRaw is null) return ErrMissing("issue_create", "--labels");
                     break;
                 case "--title":
                     title = Next();
@@ -2011,19 +2094,45 @@ internal static class Program
         try { body = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
         catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
 
-        // 指纹公式与 pr_create 同款（title+body）——create 族单源
-        var sha = Sha8(title + "\n\n" + body);
+        // v2.17：--labels 可选——单请求携带（原子：消除"issue 建成而标签被拒"的半成品态）；
+        // 未知名 fail-closed 预检，预检不可用降级为弹窗警示行（v2.8 纪律）
+        string[]? labels = null;
+        string? labelsNote = null;
+        if (labelsRaw is not null)
+        {
+            labels = LabelsParse(labelsRaw);
+            if (labels is null)
+                return ErrBad("--labels 解析失败：逗号分隔的标签名清单，名字不能为空或重复（大小写视为同名）；"
+                    + "名字含逗号者本批不支持；空清单无意义（不带 --labels 即可）");
+            if (!TryValidateLabels(labels, repo, out labelsNote, out var lex)) return lex;
+        }
+
+        // 指纹公式与 pr_create 同款（title+body）——create 族单源；带 --labels 时追加标签段
+        // （无 labels 的指纹与 v2.11 完全一致——既有审计行仍可复现）
+        var sha = Sha8(title + "\n\n" + body + (labels is null ? "" : "\n\n标签：" + string.Join("、", labels)));
         var target = $"{repo} 新建 issue";
         var window = $"""
             新建 issue：{repo}
             标题：{title}
             正文（{body.Length} 字符）：
             {body}
+            {(labels is null ? "" : $"标签：{string.Join("、", labels)}{labelsNote}")}
             """;
+        var payload = new System.Text.Json.Nodes.JsonObject { ["title"] = title, ["body"] = body };
+        if (labels is not null)
+        {
+            var arr = new System.Text.Json.Nodes.JsonArray();
+            foreach (var l in labels)
+            {
+                System.Text.Json.Nodes.JsonNode? v = l; // 显式 JsonNode → 非泛型 Add，AOT 安全（RestPush parents 同款）
+                arr.Add(v);
+            }
+            payload["labels"] = arr;
+        }
         return RunGatedOp("issue_create", repo, auditTarget, target, sha, window, null,
             a => ExecuteGated(a, "issue_create", repo, auditTarget, target, sha,
                 HttpMethod.Post, $"repos/{repo}/issues",
-                new System.Text.Json.Nodes.JsonObject { ["title"] = title, ["body"] = body }.ToJsonString(),
+                payload.ToJsonString(),
                 b => GitHubApi.HtmlUrlOf(b) ?? $"https://github.com/{repo}/issues",
                 (st, detail) =>
                 {
@@ -2168,6 +2277,113 @@ internal static class Program
                         st == 403 ? "forbidden" : st == 404 ? "not_found" : "issue_reopen_rejected",
                         consent: TokenStore.ConsentChannel, result: detail);
                     Messages.Write(Messages.IssueReopenRejected(target, detail));
+                }));
+    }
+
+    // ---------- sluice issue label（V1.9 · v2.17 标签面批：动词面第七缺口——源码零 label 能力，
+    //             #409/#410 挂账无标签可挂。整组替换 + 摘除清单披露（pr_edit 写覆盖披露同族——
+    //             set 语义的静默摘牌面必须被看见才执行）；PR 编号放行+说破（挂标签无"错对象"可言，
+    //             PR 与 issue 共用 issues 端点，拦了即堵死 PR 挂标签——与 issue_close 的拦截相反）；
+    //             匿名 404 降级同 v2.8：当前标签不可读 → 摘除清单无法预生成，警示行说破） ----------
+
+    private static int RunIssueLabel(string[] args)
+    {
+        string? repo = null, labelsRaw = null;
+        int number = 0;
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = i + 1 < args.Length ? args[++i] : null;
+                    if (repo is null) return ErrMissing("issue_label", "--repo");
+                    break;
+                case "--number":
+                    var v = i + 1 < args.Length ? args[++i] : null;
+                    if (v is null || !int.TryParse(v, out number) || number <= 0)
+                        return ErrBad("--number 需要正整数");
+                    break;
+                case "--labels":
+                    labelsRaw = i + 1 < args.Length ? args[++i] : null;
+                    if (labelsRaw is null) return ErrMissing("issue_label", "--labels");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || number <= 0 || labelsRaw is null)
+            return ErrBad("issue_label 缺少 --repo / --number / --labels（示例：sluice issue label --repo owner/repo --number 409 --labels bug,arm）");
+        if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        var labels = LabelsParse(labelsRaw);
+        if (labels is null)
+            return ErrBad("--labels 解析失败：逗号分隔的标签名清单，名字不能为空或重复（大小写视为同名）；"
+                + "名字含逗号者本批不支持；空清单（清空全部标签）本批不支持——至少保留/设置一个标签");
+        var auditTarget = $"#{number}";
+        if (!TryPreflight("issue_label", repo, auditTarget, out var pre)) return pre;
+
+        // 未知名 fail-closed（预检不可用 → 降级警示行进弹窗，v2.8 纪律）
+        if (!TryValidateLabels(labels, repo, out var labelsNote, out var lex)) return lex;
+
+        // 尽力匿名预读：类型（issue/PR 均有效，弹窗说破）+ 当前标签（摘除清单数据源）
+        string? issueTitle = null;
+        string[] currentLabels = [];
+        var (mst, mjson) = TryReadMeta($"repos/{repo}/issues/{number}");
+        var metaOk = mst == 200 && mjson is not null;
+        if (metaOk)
+        {
+            issueTitle = mjson!["title"]?.GetValue<string>();
+            if (mjson!["labels"] is System.Text.Json.Nodes.JsonArray larr)
+            {
+                var cl = new List<string>();
+                foreach (var item in larr)
+                {
+                    var n = item?["name"]?.GetValue<string>();
+                    if (!string.IsNullOrEmpty(n)) cl.Add(n!);
+                }
+                currentLabels = [.. cl];
+            }
+        }
+        var isPr = metaOk && mjson!["pull_request"] is not null;
+        var removals = LabelRemovals(currentLabels, labels);
+
+        // 指纹锚定"所见 + 所写"：编号 + 当前标签 + 新标签（issue_close 标题指纹同族——
+        // 编号不变而当前标签可变，指纹锚定的是批准窗所见与将写入的两侧）
+        var sha = Sha8($"{repo}#{number}:{(metaOk ? string.Join(",", currentLabels) : "?")}:{string.Join(",", labels)}");
+        var target = $"{repo}#{number}";
+        var typeLine = !metaOk
+            ? "类型：不可读（匿名预读失败或私有库不可见）——编号可为 issue 或 PR，两者都可挂标签"
+            : isPr
+                ? $"类型：PR（标题：{issueTitle ?? "?"}——PR 与 issue 共用标签端点，本操作对两者同样有效）"
+                : $"类型：issue（标题：{issueTitle ?? "?"}）";
+        var warnMeta = mst == 404
+            ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——当前标签不可读，摘除清单无法预生成（现有标签凡不在新清单者都将被摘除）；存在性由服务端执行时判定"
+            : !metaOk ? "\n⚠ 匿名预读不可用（网络/超时）：当前标签不可读，摘除清单无法预生成（现有标签凡不在新清单者都将被摘除）" : "";
+        var window = $"""
+            设置标签（整组替换）：{target}
+            {typeLine}
+            当前标签：{(metaOk ? (currentLabels.Length > 0 ? string.Join("、", currentLabels) : "（无）") : "不可读")}
+            新标签：{string.Join("、", labels)}
+            将摘除：{(!metaOk ? "未知（当前不可读）" : removals.Length == 0 ? "无" : string.Join("、", removals))}{labelsNote}{warnMeta}
+            """;
+        var payload = new System.Text.Json.Nodes.JsonObject();
+        var newArr = new System.Text.Json.Nodes.JsonArray();
+        foreach (var l in labels)
+        {
+            System.Text.Json.Nodes.JsonNode? v = l; // 显式 JsonNode → 非泛型 Add，AOT 安全（RestPush parents 同款）
+            newArr.Add(v);
+        }
+        payload["labels"] = newArr;
+        return RunGatedOp("issue_label", repo, auditTarget, target, sha, window, null,
+            a => ExecuteGated(a, "issue_label", repo, auditTarget, target, sha,
+                HttpMethod.Patch, $"repos/{repo}/issues/{number}",
+                payload.ToJsonString(),
+                b => GitHubApi.HtmlUrlOf(b) ?? $"https://github.com/{repo}/issues/{number}",
+                (st, detail) =>
+                {
+                    Audit.Append("issue_label", repo, auditTarget, sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "issue_label_rejected",
+                        consent: TokenStore.ConsentChannel, result: detail);
+                    Messages.Write(Messages.IssueLabelRejected(target, detail));
                 }));
     }
 

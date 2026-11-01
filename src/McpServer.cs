@@ -42,7 +42,7 @@ internal static class McpServer
     [
         "pr_comment", "push", "pr_create", "pr_merge", "pr_reopen", "pr_close", "pr_edit",
         "issue_create", "issue_close", "issue_reopen", "pr_review",
-        "tag_create", "release_create", "branch_delete", "workflow_dispatch",
+        "tag_create", "release_create", "branch_delete", "workflow_dispatch", "issue_label",
     ];
 
     /// <summary>各 action 允许的参数名（与 CLI flag 同名映射；表外字段报错——防"传了被静默忽略"的误会）。</summary>
@@ -55,9 +55,10 @@ internal static class McpServer
         ["pr_reopen"]         = ["repo", "number"],
         ["pr_close"]          = ["repo", "number"],
         ["pr_edit"]           = ["repo", "number", "title", "body"],
-        ["issue_create"]      = ["repo", "title", "body"],
+        ["issue_create"]      = ["repo", "title", "body", "labels"],
         ["issue_close"]       = ["repo", "number"],
         ["issue_reopen"]      = ["repo", "number"],
+        ["issue_label"]       = ["repo", "number", "labels"],
         ["pr_review"]         = ["repo", "number", "event", "body"],
         ["tag_create"]        = ["repo", "tag", "at"],
         ["release_create"]    = ["repo", "tag", "target", "name", "body", "prerelease"],
@@ -72,7 +73,7 @@ internal static class McpServer
     private const string ToolDescription =
         """
         GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论、推送、创建/合并/重开/关闭/编辑 PR、
-        评审 PR、创建/关闭/重开 issue、打 tag、发布 release、删除分支、触发 workflow——必须且只能经此
+        评审 PR、创建/关闭/重开 issue、设置标签、打 tag、发布 release、删除分支、触发 workflow——必须且只能经此
         工具执行；环境内无其他可用凭据，直接 git push / gh / GitHub API 调用必然失败且违反纪律。
         调用会弹出本机批准窗口，由用户人工批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，
         请按其指引行动；structuredContent.retry 是机器可读的下一步：never=禁止重试 /
@@ -87,11 +88,12 @@ internal static class McpServer
           "type": "object",
           "required": ["action", "repo"],
           "properties": {
-            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","tag_create","release_create","branch_delete","workflow_dispatch"], "description": "写操作类型" },
+            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","tag_create","release_create","branch_delete","workflow_dispatch","issue_label"], "description": "写操作类型" },
             "repo":         { "type": "string", "description": "目标仓库 owner/name" },
-            "number":       { "type": "integer", "description": "issue/PR 编号（pr_comment/pr_merge/pr_reopen/pr_close/pr_edit/issue_close/issue_reopen/pr_review 必填）" },
+            "number":       { "type": "integer", "description": "issue/PR 编号（pr_comment/pr_merge/pr_reopen/pr_close/pr_edit/issue_close/issue_reopen/pr_review/issue_label 必填）" },
             "body":         { "type": "string", "description": "正文全文（pr_comment/pr_create/issue_create/release_create 必填；pr_edit/pr_review 可选）" },
             "title":        { "type": "string", "description": "标题（pr_create/issue_create 必填；pr_edit 可选——勘误）" },
+            "labels":       { "type": "array", "items": { "type": "string" }, "description": "标签名清单（issue_create 可选：创建时携带；issue_label 必填：整组替换——现有标签凡不在清单者都将被摘除，批准窗会列摘除清单；名字须为仓库已有标签，未知名预检拦下）" },
             "base":         { "type": "string", "description": "pr_create：base 分支名；push：增量基点/重放式更新基点（如 origin/master）" },
             "head":         { "type": "string", "description": "PR head 分支（pr_create 必填）" },
             "branch":       { "type": "string", "description": "目标分支（push/branch_delete 必填）" },
@@ -282,6 +284,20 @@ internal static class McpServer
             return Wrong;
         }
         bool Has(string name) => a.TryGetProperty(name, out _);
+        // labels：字符串数组 → 逗号拼接（名字含逗号者 CLI 侧 LabelsParse 必拒，与 CLI 同源语义）；
+        // 元素非字符串/非数组 = 类型错（Wrong 哨兵同 Str/Num 纪律）
+        string? Labels()
+        {
+            if (!a.TryGetProperty("labels", out var v)) return null;
+            if (v.ValueKind != JsonValueKind.Array) return Wrong;
+            var names = new List<string>();
+            foreach (var e in v.EnumerateArray())
+            {
+                if (e.ValueKind != JsonValueKind.String) return Wrong;
+                names.Add(e.GetString()!);
+            }
+            return string.Join(',', names);
+        }
 
         var list = new List<string>();
         void Opt(string flag, string? value) { if (value is not null) { list.Add(flag); list.Add(value); } }
@@ -330,6 +346,7 @@ internal static class McpServer
             case "issue_create":
                 list.AddRange(["issue", "create"]);
                 Opt("--repo", Str("repo")); Opt("--title", Str("title"));
+                Opt("--labels", Labels());
                 if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
                 break;
             case "issue_close":
@@ -339,6 +356,10 @@ internal static class McpServer
             case "issue_reopen":
                 list.AddRange(["issue", "reopen"]);
                 Opt("--repo", Str("repo")); Opt("--number", Num("number"));
+                break;
+            case "issue_label":
+                list.AddRange(["issue", "label"]);
+                Opt("--repo", Str("repo")); Opt("--number", Num("number")); Opt("--labels", Labels());
                 break;
             case "pr_review":
                 list.Add("review");

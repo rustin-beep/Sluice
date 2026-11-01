@@ -34,7 +34,7 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 
 | 动词 | Repository permissions |
 |---|---|
-| `comment` / `issue create` / `issue close` / `issue reopen` | **Issues: Read and write** |
+| `comment` / `issue create` / `issue close` / `issue reopen` / `issue label` | **Issues: Read and write** |
 | `push` / `tag create` / `release create` | **Contents: Read and write**（tag 走 git/refs、release 走 releases 端点，同 Contents 面） |
 | `pr create` / `pr reopen` / `pr close` / `pr edit` / `review` | **Pull requests: Read and write** |
 | `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
@@ -60,8 +60,9 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice pr edit --repo O/R --number N [--title T] [--body-file F]` | 勘误 PR 标题/描述 | 弹窗披露旧值→新值（写覆盖纪律）；`--title`/`--body-file` 至少一项 |
 | `sluice review --repo O/R --number N --event COMMENT\|APPROVE\|REQUEST_CHANGES [--body-file F]` | 在 PR 上落评审 | commit_id 锚定「所见即所评」；APPROVE 不能批自己账户的 PR（服务端 422） |
 | `sluice issue close --repo O/R --number N` | 关闭 issue | PR 编号会被预检拦下 |
-| `sluice issue create --repo O/R --title T --body-file F` | 新建 issue | issue close 的对偶件（立案闭环）；正文全文入窗 |
+| `sluice issue create --repo O/R --title T --body-file F [--labels a,b,c]` | 新建 issue | issue close 的对偶件（立案闭环）；正文全文入窗；`--labels` 单请求携带标签，未知标签名预检拦下 |
 | `sluice issue reopen --repo O/R --number N` | 重开已关 issue | issue close 的对偶件；PR 编号同样会被预检拦下 |
+| `sluice issue label --repo O/R --number N --labels a,b,c` | 设置标签（整组替换） | 弹窗披露当前标签→新标签→**摘除清单**；PR 编号同样有效（端点共用）；未知标签名预检拦下；清空全部标签本批不支持 |
 | `sluice tag create --repo O/R --tag V --at <分支\|完整sha>` | 新建远端轻量 tag | create-or-fail 不覆盖；私有库 --at 解析失败时给完整 40 位 sha |
 | `sluice release create --repo O/R --tag V --body-file F [--target <分支\|sha>] [--name N] [--prerelease]` | 发布 release | target 以批准期解析的 sha 锚定（杜绝隐式建 tag 的 TOCTOU）；发布即通知 watchers |
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |

@@ -566,6 +566,19 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- issue label 被服务端拒绝（exit 10，retry=after_fix；v2.17 标签面批：整组替换被拒，
+    //      既有标签原样保留——set 语义的对称事实句） ----
+    public static Msg IssueLabelRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        issue_label 被服务端拒绝（{detail}）。常见原因：标签名在仓库不存在（据报 404）；编号不存在；token 无 Issues 写权限。
+        本次操作未执行，GitHub 上没有产生任何变更——目标当前标签原样保留。
+        1. 未知名 → 先建标签（网页/gh label create，sluice 本批不做标签实体管理）或修正拼写后重跑；
+        2. PR 编号同样可挂标签（端点共用）——被拒时先核对权限而非类型；
+        3. 查现状：sluice api "repos/<owner/repo>/issues/<number>" --auth 读 labels 字段。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- pr edit 被服务端拒绝（exit 10，retry=after_fix；v2.11：勘误闭环。旧值未被动过） ----
     public static Msg PrEditRejected(string target, string detail) => new(
         "[Sluice·终态]",
@@ -700,6 +713,7 @@ internal static class Messages
         ("issuecreaterejected", IssueCreateRejected("rustin-beep/Sluice 新建 issue", "HTTP 403：Resource not accessible by personal access token")),
         ("prcloserejected", PrCloseRejected("rustin-beep/Vitro#389", "HTTP 422：Pull Request is not open")),
         ("issuereopenrejected", IssueReopenRejected("rustin-beep/Sluice#369", "HTTP 422：Issue is locked")),
+        ("issuelabelrejected", IssueLabelRejected("rustin-beep/Sluice#409", "HTTP 404：Label does not exist")),
         ("preditrejected", PrEditRejected("rustin-beep/Sluice#383", "HTTP 403：Resource not accessible by personal access token")),
         ("prreviewrejected", PrReviewRejected("rustin-beep/Vitro#390", "HTTP 422：Can not approve your own pull request")),
         ("tagrejected", TagRejected("rustin-beep/Sluice·v0.6.0", "HTTP 422：Reference already exists")),
