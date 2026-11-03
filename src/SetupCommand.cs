@@ -225,8 +225,7 @@ internal static class SetupCommand
         return 0;
     }
 
-    private static int Git(params string[] args)
-    {
+    private static int Git(params string[] args)    {
         try
         {
             // 空串参数必须显式成 ""（join 后消失会让 git 误把 key 当 value）；
@@ -255,4 +254,96 @@ internal static class SetupCommand
         }
         catch { return ""; }
     }
+
+    // ---------- sluice sentinel-install（v2.20，§6 哨兵） ----------
+
+    /// <summary>
+    /// 建 5 分钟间隔计划任务跑 seal 预检（SealCheck.Run 同一套轻量检查，非深扫），违规弹 Windows
+    /// 通知。作用（§6）：封 device flow 的"当场成功"时间窗——agent 走 gh auth login 拿新 token 后
+    /// 用 gh 直连，全程不经 sluice，最迟 5 分钟被看见。是检测不是阻止（N4 本地不可阻止）。
+    /// 复用映射定案（§11.5）：schtasks + PowerShell + toast，C# 侧零检测代码——本方法只写 .ps1
+    /// 与注册任务；检查逻辑单源在 sluice seal（预检 = 与写路径 50ms 自查同一套）。
+    /// </summary>
+    public static int SentinelInstall()
+    {
+        var exe = Environment.ProcessPath;
+        if (exe is null || !File.Exists(exe))
+        {
+            Console.Error.WriteLine("[Sluice] 无法定位自身 exe，安装中止（未产生任何变更）。");
+            return ExitCodes.Internal;
+        }
+
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice");
+        Directory.CreateDirectory(dir);
+        var ps1 = Path.Combine(dir, "sentinel.ps1");
+        // UTF-8 带 BOM：PS 5.1 对无 BOM 文件按 ANSI 解码，脚本里的中文与 ✗ 字面量会乱码
+        File.WriteAllText(ps1, SentinelScript.Replace("__EXE__", exe.Replace('\\', '/')),
+            new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+        Console.WriteLine($"[Sluice] 已写入哨兵脚本：{ps1}");
+
+        // 计划任务：每 5 分钟，当前用户交互会话（默认 /RU 调用者）。路径无空格（LOCALAPPDATA
+        // 与 exe 路径均校验过不含空格），/TR 无需内层引号。
+        var tr = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {ps1}";
+        var psi = new System.Diagnostics.ProcessStartInfo("schtasks",
+            $"/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"{tr}\"")
+        { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+        using (var p = System.Diagnostics.Process.Start(psi)!)
+        {
+            p.WaitForExit(20000);
+            var err = p.StandardError.ReadToEnd().Trim();
+            if (p.ExitCode != 0)
+            {
+                Console.Error.WriteLine($"[Sluice] 计划任务注册失败（exit {p.ExitCode}）：{err}");
+                Console.Error.WriteLine("[Sluice] 安装中止（脚本已写好，可手动注册，见上 ps1 路径）。");
+                return ExitCodes.Internal;
+            }
+        }
+
+        Console.WriteLine("""
+            [Sluice] 已注册计划任务 "Sluice Sentinel"（每 5 分钟，登录会话内运行）。
+            违规时弹 Windows 通知并写 sentinel.log；处理：sluice seal --fix。
+            移除：schtasks /Delete /TN "Sluice Sentinel" /F
+            注意：哨兵是检测不是阻止——最迟 5 分钟看见（§6 device flow 时间窗）。
+            """);
+        return 0;
+    }
+
+    /// <summary>哨兵脚本（__EXE__ 由安装器替换为绝对路径）。UTF-8 控制台先设好否则 ✗ 行匹配乱码；
+    /// toast 双路：BurntToast 模块（装了就用）→ WinRT 原生（PowerShell AUMID，零依赖兜底）。</summary>
+    private const string SentinelScript = """
+        # Sluice 哨兵（§6）——由 sluice sentinel-install 生成；检测逻辑单源在 sluice seal（轻量预检）
+        $ErrorActionPreference = 'SilentlyContinue'
+        try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+        $exe = '__EXE__'
+        $dir = Join-Path $env:LOCALAPPDATA 'Sluice'
+        $log = Join-Path $dir 'sentinel.log'
+        $out = & $exe seal 2>&1
+        if ($LASTEXITCODE -ne 7) { exit 0 }
+        $viol = ($out | Where-Object { "$_" -match '✗' }) -join "`n"
+        if (-not $viol) { $viol = '检测到未封堵的 GitHub 凭据（详见 sentinel.log）' }
+        Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) seal violations:`n$out`n"
+        $title = 'Sluice 哨兵：检测到未封堵的 GitHub 凭据'
+        $body = "运行 sluice seal --fix 处理。$($viol.Replace("`n", ' | '))"
+        $shown = $false
+        try {
+            if (Get-Module -ListAvailable BurntToast) {
+                Import-Module BurntToast
+                New-BurntToastNotification -Text $title, $body
+                $shown = $true
+            }
+        } catch {}
+        if (-not $shown) {
+            try {
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+                [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
+                $esc = [System.Security.SecurityElement]::Escape($body)
+                $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+                [void]$xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$esc</text></binding></visual></toast>")
+                $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+                [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
+                $shown = $true
+            } catch { Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) toast 失败：$($_.Exception.Message)" }
+        }
+        exit 7
+        """;
 }

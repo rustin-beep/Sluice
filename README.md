@@ -27,6 +27,7 @@ dotnet publish -c Release -r win-x64     # 产物在 bin/Release/net10.0-windows
 sluice.exe setup                          # 粘贴 PAT → 校验 → Windows Hello 建 vault
 sluice.exe seal --fix                     # 封堵侧门：凭据管理器 / gh / git-credentials / SSH / 环境变量
 sluice.exe setup --install                # 装 notice credential helper（git 直推 GitHub 得到指引进 sluice 的消息，而非裸错/GCM 登录窗）
+sluice.exe sentinel-install               # 哨兵：每 5 分钟 seal 预检，违规弹 Windows 通知（封 device flow"当场成功"窗）
 sluice.exe selftest                       # 消息表与 exit code 自检
 sluice.exe --version                      # 构建戳（时间 + git sha[+dirty] + plan-lite 版本）——排障先看这个
 ```
@@ -69,7 +70,7 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |
 | `sluice branch delete --repo O/R --branch B` | 删远端分支 ref | 弹窗会披露「将连带关闭其上的开放 PR」；commits 保留可重建 |
 | `sluice api <api-path> [--auth]` | GET 只读 | 公开数据匿名零交互；`--auth` 走 vault；logs 等端点 302→CDN 自动跟随（仅 GitHub 域 ≤3 跳）；每次调用入读审计 |
-| `sluice seal [--fix]` / `sluice setup --install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice） |
+| `sluice seal [--fix]` / `sluice setup --install` / `sluice sentinel-install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 装哨兵 / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice）；哨兵移除 `schtasks /Delete /TN "Sluice Sentinel" /F` |
 
 推送序列的 5xx（blob/tree/commit，内容寻址幂等）自动退避重试（2s/8s×3）；update-ref 永不自动重试。
 步骤被服务端拒绝会**原样透传服务端 message**（exit 10，分支未动）；`--base` 基点不在远端在**一切上传之前**拦截（exit 10，零副作用）；blob sha 与内容寻址不符归 20（平台异常，重传安全）。
