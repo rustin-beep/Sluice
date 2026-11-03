@@ -132,6 +132,23 @@ internal static class SetupCommand
     {
         Console.WriteLine("Sluice seal —— 侧门自查（检测 agent 可静默取用的 GitHub 写凭据）");
         Console.WriteLine();
+
+        // 自愈（v2.22）：state.json 有已过期的暂停窗口 → 先执行恢复（重装 notice + seal --fix）
+        // 再呈现真实状态——人跑 seal 或哨兵 tick 都会走到这里，到期恢复不依赖人记得
+        if (SealCheck.SealPause.Until() is { } expired && expired <= DateTime.UtcNow)
+        {
+            Console.WriteLine($"[Sluice] 暂停窗口已过期（{expired.ToLocalTime():HH:mm} 到期）——自动执行恢复：");
+            SealResume();
+            Console.WriteLine();
+        }
+        if (SealCheck.SealPause.Active)
+        {
+            var until = SealCheck.SealPause.Until()!.Value.ToLocalTime();
+            Console.WriteLine($"⏸ 封堵暂停中（至 {until:HH:mm}）——期内直推能力开放、写操作 seal 门放行。");
+            Console.WriteLine("结束暂停立即恢复：sluice seal --resume（或等哨兵在到期后 5 分钟内自动恢复）。");
+            return 0;
+        }
+
         var v = SealCheck.Run();
         if (v.Count == 0)
         {
@@ -169,6 +186,166 @@ internal static class SetupCommand
         return ExitCodes.SealViolation;
     }
 
+    // ---------- seal --pause / --resume / unseal（v2.22，§6 + §9.5 人类工作流） ----------
+
+    /// <summary>非 GitHub 动作复用写动作闸门（§6：与一切写动作同待遇——agent 也能发起，同样要过批准窗）。
+    /// 拒绝/超时/Hello 失败/vault 损坏/崩溃的收敛与写路径同形；批准 → onApproved()。</summary>
+    private static int RunLocalGated(string op, string target, string body, string? warning, Func<int> onApproved)
+    {
+        byte[] challenge;
+        try { challenge = TokenStore.PeekChallenge(); }
+        catch { challenge = []; }
+        var outcome = Gate.Run(new Gate.Request(op, "(本机)", target, body, "—", challenge, warning));
+        switch (outcome)
+        {
+            case Gate.Outcome.Denied d:
+                Audit.Append(op, null, target, null, "denied", d.Preset, d.FreeText, consent: "none");
+                Messages.Write(Messages.Denied(op, target, d.Preset, d.FreeText));
+                return ExitCodes.Denied;
+            case Gate.Outcome.TimedOut:
+                Audit.Append(op, null, target, null, "timeout");
+                Messages.Write(Messages.Timeout(op, target, Gate.TimeoutSeconds));
+                return ExitCodes.Timeout;
+            case Gate.Outcome.ConsentFailed:
+                Audit.Append(op, null, target, null, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed(op, target));
+                return ExitCodes.ConsentFailed;
+            case Gate.Outcome.VaultKeyMissing vk:
+                Audit.Append(op, null, target, null, "vault_broken");
+                Messages.Write(Messages.VaultBroken(vk.Detail));
+                return ExitCodes.NotInitialized;
+            case Gate.Outcome.Crashed c:
+                Audit.Append(op, null, target, null, "internal_gate_crash", result: c.Error);
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+            case Gate.Outcome.Approved:
+                return onApproved();
+            default:
+                Messages.Write(Messages.Internal(afterExecutionStarted: false));
+                return ExitCodes.Internal;
+        }
+    }
+
+    /// <summary>§6 显式暂停窗口：批准后摘 notice helper + SSH 屏蔽块，state.json 记 pause_until；
+    /// 到期自愈 = seal no-args 检测过期先 resume + 哨兵 ps1 检测过期跑 seal --resume（最迟 5 分钟）。</summary>
+    public static int SealPauseCmd(string minutesArg)
+    {
+        if (!int.TryParse(minutesArg, out var minutes) || minutes is < 1 or > 480)
+        {
+            Console.Error.WriteLine("[Sluice] 用法：sluice seal --pause <分钟>（范围 1–480）");
+            return ExitCodes.BadRequest;
+        }
+        if (!TokenStore.Exists) { Messages.Write(Messages.NotInitialized()); return ExitCodes.NotInitialized; }
+        if (SealCheck.SealPause.Active)
+        {
+            var u = SealCheck.SealPause.Until()!.Value.ToLocalTime();
+            Console.Error.WriteLine($"[Sluice] 已在暂停窗口内（至 {u:HH:mm}）——如需延长，先 seal --resume 再重新暂停。");
+            return ExitCodes.BadRequest;
+        }
+        var until = DateTime.UtcNow.AddMinutes(minutes);
+        var body = $"""
+            暂停侧门封堵 {minutes} 分钟（至本地 {until.ToLocalTime():HH:mm}）。
+            期内：git/gh 直推能力恢复（notice helper 摘除、SSH 屏蔽块摘除）；sluice 写操作的 seal 门同步放行。
+            到期：最迟 5 分钟内自动重新封堵（重装 notice + 清理期内新登录的凭据）；提前结束用 sluice seal --resume。
+            这是有意的防护降级窗口——期内你重新提供的任何 GitHub 凭据，同用户进程（含 agent）都可静默使用。
+            """;
+        return RunLocalGated("seal_pause", $"暂停 {minutes} 分钟", body,
+            "暂停 = 防护降级窗口：期内 agent 可静默使用你重新提供的任何 GitHub 凭据",
+            () =>
+        {
+            SealCheck.SealPause.Begin(minutes);
+            Git("config", "--global", "--unset-all", "credential.https://github.com.helper"); // 失败=本就不在位
+            var acts = new List<string>
+            {
+                $"状态：state.json 已记 pause_until（至 {until.ToLocalTime():HH:mm}）",
+                "notice helper：已摘除（github.com 凭据链回到既有继承）",
+            };
+            acts.AddRange(SealCheck.StripSshBlock());
+            Audit.Append("seal_pause", null, $"{minutes} 分钟", null, "approved",
+                result: $"pause_until {until:yyyy-MM-dd'T'HH:mm:ss'Z'}");
+            Console.WriteLine($"✓ 封堵已暂停（至 {until.ToLocalTime():HH:mm}）：");
+            foreach (var a in acts) Console.WriteLine($"  - {a}");
+            Console.WriteLine("到期后最迟 5 分钟自动恢复（哨兵）；手动立即恢复：sluice seal --resume。");
+            return 0;
+        });
+    }
+
+    /// <summary>结束暂停、立即重新封堵。恢复防护是安全侧动作——不过闸门（开门才要批准，关门不用）。</summary>
+    public static int SealResume()
+    {
+        Console.WriteLine("Sluice seal --resume —— 结束暂停窗口，立即重新封堵");
+        var acts = new List<string>();
+        var wasActive = SealCheck.SealPause.Active;
+        SealCheck.SealPause.Clear();
+        acts.Add(wasActive ? "状态：暂停窗口已清除（提前结束）" : "状态：暂停窗口已清除（到期自愈）");
+
+        var n = InstallNotice(quiet: true);
+        acts.Add(n == 0 ? "notice helper：已确认在位/重装（github.com 链 = [空串断继承, notice]）"
+                        : "notice helper：重装失败——请手动 sluice setup --install");
+
+        var viol = SealCheck.Run();
+        if (viol.Count > 0)
+        {
+            foreach (var item in viol) Console.WriteLine($"  ✗ 暂停期内引入：{item}");
+            acts.AddRange(SealCheck.Fix(viol));
+        }
+        else acts.Add("seal 预检：无违规（暂停期内未引入新凭据）");
+
+        var after = SealCheck.Run();
+        Audit.Append("seal_resume", null, null, null, after.Count == 0 ? "approved" : "seal_violation",
+            result: string.Join("；", after));
+        Console.WriteLine();
+        foreach (var a in acts) Console.WriteLine($"  - {a}");
+        Console.WriteLine(after.Count == 0
+            ? "✓ 环境已重新封堵。"
+            : $"仍有 {after.Count} 处需人工处理（见上 ✗）。");
+        return after.Count == 0 ? 0 : ExitCodes.SealViolation;
+    }
+
+    /// <summary>§6 卸载路径（红线：卸载后环境不得静默回到"全权 token 躺 keyring"状态）。
+    /// 与 pause/unseal 同过闸门——它是摘除防护的动作。vault/config 不自动删（含加密 token，删除由人决定）。</summary>
+    public static int Unseal()
+    {
+        if (!TokenStore.Exists) { Messages.Write(Messages.NotInitialized()); return ExitCodes.NotInitialized; }
+        var body = """
+            卸载 Sluice 的环境侧安装件：
+            · 摘除 notice credential helper（github.com 凭据链回到系统默认）
+            · 删除哨兵计划任务 "Sluice Sentinel"
+            · 摘除 ~/.ssh/config 的 github.com 屏蔽块
+            · 清除暂停状态（如有）
+            vault（token.bin）与 config.json 保留，不自动删除。
+            卸载后本机回到无闸门状态——重新登录 gh / 存凭据前请想清楚爆炸半径（建议只读 fine-grained PAT）。
+            """;
+        return RunLocalGated("unseal", "卸载侧门封堵", body,
+            "卸载 = 移除闸门与封堵：此后 agent 直推是否发生不再有批准层与检测层",
+            () =>
+        {
+            Git("config", "--global", "--unset-all", "credential.https://github.com.helper");
+            var acts = new List<string> { "notice helper：已摘除" };
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/Delete /TN \"Sluice Sentinel\" /F")
+                { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                using (var p = System.Diagnostics.Process.Start(psi)!) p.WaitForExit(15000);
+                acts.Add("哨兵：计划任务已删除");
+            }
+            catch { acts.Add("哨兵：任务删除失败——请手动 schtasks /Delete /TN \"Sluice Sentinel\" /F"); }
+            acts.AddRange(SealCheck.StripSshBlock());
+            SealCheck.SealPause.Clear();
+            acts.Add("暂停状态：已清除（如有）");
+            Audit.Append("unseal", null, null, null, "approved");
+            Console.WriteLine("✓ 卸载完成：");
+            foreach (var a in acts) Console.WriteLine($"  - {a}");
+            Console.WriteLine($"""
+                善后清单（§6 红线：卸载不得静默回到"全权 token 躺 keyring"）：
+                · vault 与配置仍在 {Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice")}（含加密 token）——彻底清除请手动删除该目录；
+                · 工作区 AGENTS.md 的 Sluice 规则片段（如有）请手动移除标记块；
+                · 重新引入直推凭据时自觉最小化：fine-grained、只读优先、短有效期。
+                """);
+            return 0;
+        });
+    }
+
     // ---------- sluice setup --install（v2.19，§9 notice 安装器） ----------
 
     /// <summary>
@@ -178,7 +355,7 @@ internal static class SetupCommand
     /// 再 add 本 exe notice。git 直推 github.com 将看到 §8 指引文案而非凭据 UI/静默凭据。
     /// 边界：`git -c credential.helper=…` 显式覆盖可绕过（T2 形状，§9 原文照录，不防）。
     /// </summary>
-    public static int InstallNotice()
+    public static int InstallNotice(bool quiet = false)
     {
         var exe = Environment.ProcessPath;
         if (exe is null || !File.Exists(exe))
@@ -200,7 +377,7 @@ internal static class SetupCommand
         if (existing.Contains($"\"{fwd} notice\"", StringComparison.Ordinal) ||
             existing.Contains($"{fwd} notice", StringComparison.Ordinal))
         {
-            Console.WriteLine($"[Sluice] notice helper 已在位：{key} 含 {fwd} notice，无需重复安装。");
+            if (!quiet) Console.WriteLine($"[Sluice] notice helper 已在位：{key} 含 {fwd} notice，无需重复安装。");
             return 0;
         }
 
@@ -216,12 +393,13 @@ internal static class SetupCommand
             return ExitCodes.Internal;
         }
 
-        Console.WriteLine("[Sluice] 已安装 notice credential helper（仅作用 github.com；其他 host 的既有 helper 不受影响）。");
-        Console.WriteLine($"""
-            验证：printf 'protocol=https\nhost=github.com\n\n' | git credential fill
-            → stderr 应出现 [Sluice·终态] 指引，且输出无 password= 行。
-            卸载：git config --global --unset-all {key}
-            """);
+        if (!quiet) Console.WriteLine("[Sluice] 已安装 notice credential helper（仅作用 github.com；其他 host 的既有 helper 不受影响）。");
+        if (!quiet)
+            Console.WriteLine($"""
+                验证：printf 'protocol=https\nhost=github.com\n\n' | git credential fill
+                → stderr 应出现 [Sluice·终态] 指引，且输出无 password= 行。
+                卸载：git config --global --unset-all {key}
+                """);
         return 0;
     }
 
@@ -436,7 +614,8 @@ internal static class SetupCommand
     }
 
     /// <summary>哨兵脚本（__EXE__ 由安装器替换为绝对路径）。UTF-8 控制台先设好否则 ✗ 行匹配乱码；
-    /// toast 双路：BurntToast 模块（装了就用）→ WinRT 原生（PowerShell AUMID，零依赖兜底）。</summary>
+    /// toast 双路：BurntToast 模块（装了就用）→ WinRT 原生（PowerShell AUMID，零依赖兜底）。
+    /// v2.22 暂停感知：state.json 未到期 → 静默；已过期 → seal --resume 自愈 + toast（到期恢复不靠人记得）。</summary>
     private const string SentinelScript = """
         # Sluice 哨兵（§6）——由 sluice sentinel-install 生成；检测逻辑单源在 sluice seal（轻量预检）
         $ErrorActionPreference = 'SilentlyContinue'
@@ -444,33 +623,49 @@ internal static class SetupCommand
         $exe = '__EXE__'
         $dir = Join-Path $env:LOCALAPPDATA 'Sluice'
         $log = Join-Path $dir 'sentinel.log'
+
+        function Show-Toast($title, $body) {
+            $shown = $false
+            try {
+                if (Get-Module -ListAvailable BurntToast) {
+                    Import-Module BurntToast
+                    New-BurntToastNotification -Text $title, $body
+                    $shown = $true
+                }
+            } catch {}
+            if (-not $shown) {
+                try {
+                    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+                    [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
+                    $esc = [System.Security.SecurityElement]::Escape($body)
+                    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+                    [void]$xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$esc</text></binding></visual></toast>")
+                    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+                    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
+                } catch { Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) toast 失败：$($_.Exception.Message)" }
+            }
+        }
+
+        # 暂停窗口（v2.22 seal --pause）：未到期 → 静默放行；已过期 → seal --resume 自愈（重装 notice + seal --fix）+ toast
+        $state = Join-Path $dir 'state.json'
+        if (Test-Path $state) {
+            try {
+                $j = Get-Content -Raw -Encoding UTF8 $state | ConvertFrom-Json
+                $until = [DateTime]::Parse($j.pause_until, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
+                if ($until -gt [DateTime]::UtcNow) { exit 0 }
+                $r = & $exe seal --resume 2>&1
+                Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) 暂停到期，自动恢复：`n$r`n"
+                Show-Toast 'Sluice：暂停窗口结束' '已自动重新封堵（notice 重装 + seal --fix）。残留请看 sentinel.log。'
+                exit 0
+            } catch { Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) state.json 解析异常（按正常预检继续）：$($_.Exception.Message)" }
+        }
+
         $out = & $exe seal 2>&1
         if ($LASTEXITCODE -ne 7) { exit 0 }
         $viol = ($out | Where-Object { "$_" -match '✗' }) -join "`n"
         if (-not $viol) { $viol = '检测到未封堵的 GitHub 凭据（详见 sentinel.log）' }
         Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) seal violations:`n$out`n"
-        $title = 'Sluice 哨兵：检测到未封堵的 GitHub 凭据'
-        $body = "运行 sluice seal --fix 处理。$($viol.Replace("`n", ' | '))"
-        $shown = $false
-        try {
-            if (Get-Module -ListAvailable BurntToast) {
-                Import-Module BurntToast
-                New-BurntToastNotification -Text $title, $body
-                $shown = $true
-            }
-        } catch {}
-        if (-not $shown) {
-            try {
-                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
-                [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
-                $esc = [System.Security.SecurityElement]::Escape($body)
-                $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
-                [void]$xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$esc</text></binding></visual></toast>")
-                $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
-                [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)
-                $shown = $true
-            } catch { Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) toast 失败：$($_.Exception.Message)" }
-        }
+        Show-Toast 'Sluice 哨兵：检测到未封堵的 GitHub 凭据' "运行 sluice seal --fix 处理。$($viol.Replace("`n", ' | '))"
         exit 7
         """;
 }

@@ -30,6 +30,8 @@ sluice.exe setup --install                # 装 notice credential helper（git �
 sluice.exe sentinel-install               # 哨兵：每 5 分钟 seal 预检，违规弹 Windows 通知（封 device flow"当场成功"窗）
 sluice.exe setup --install-snippet        # 把 §8.4 规则片段写进工作区 AGENTS.md（标记块幂等）
 sluice.exe doctor                         # 六项只读健康检查（vault/seal/notice/哨兵…）
+sluice.exe seal --pause N / --resume      # 暂停封堵 N 分钟（批准窗门控，期内直推开放）/ 立即恢复
+sluice.exe unseal                         # 卸载环境侧安装件（notice/哨兵/SSH 块；善后清单打印）
 sluice.exe selftest                       # 消息表与 exit code 自检
 sluice.exe --version                      # 构建戳（时间 + git sha[+dirty] + plan-lite 版本）——排障先看这个
 ```

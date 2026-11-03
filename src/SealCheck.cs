@@ -14,10 +14,61 @@ internal static partial class SealCheck
 {
     public const string SshMarker = "sluice-seal-block";
 
+    // ---------- 暂停窗口（v2.22，§6 seal --pause；状态文件 %LOCALAPPDATA%\Sluice\state.json） ----------
+
+    /// <summary>
+    /// 封堵暂停状态。Active = state.json 的 pause_until 尚未到点。到期后不主动清文件——
+    /// 自愈收敛在 seal（no-args 检测过期即执行 resume）与哨兵（过期即跑 seal --resume + toast），
+    /// 写路径的 Run() 只把过期当"未暂停"（fail-closed：封堵先行恢复，重装 notice 随后补上）。
+    /// </summary>
+    internal static class SealPause
+    {
+        private static string StatePath => Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "state.json");
+
+        public static bool Active
+        {
+            get
+            {
+                var until = Until();
+                return until is { } t && t > DateTime.UtcNow;
+            }
+        }
+
+        /// <summary>未到点的截止时刻（null = 无暂停或已过期）。过期文件不在此清——见类注释。</summary>
+        public static DateTime? Until()
+        {
+            try
+            {
+                if (!File.Exists(StatePath)) return null;
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(StatePath));
+                return doc.RootElement.TryGetProperty("pause_until", out var v)
+                    && DateTime.TryParse(v.GetString(), System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                        out var t)
+                    ? t : null;
+            }
+            catch { return null; }
+        }
+
+        public static void Begin(int minutes)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
+            File.WriteAllText(StatePath,
+                $$"""{"pause_until":"{{DateTime.UtcNow.AddMinutes(minutes).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture)}}"}""");
+        }
+
+        public static void Clear()
+        {
+            try { if (File.Exists(StatePath)) File.Delete(StatePath); } catch { }
+        }
+    }
+
     // ---------- 预检（§6：凭据管理器 / gh hosts.yml / .git-credentials / 环境变量 / SSH / gitconfig） ----------
 
     public static List<string> Run()
     {
+        if (SealPause.Active) return []; // 暂停窗口内：封堵解除（§6 seal --pause）；到期由 seal 自愈/哨兵恢复
         var v = new List<string>();
 
         foreach (var (target, _) in CredEnum())
@@ -203,5 +254,28 @@ internal static partial class SealCheck
 
             """);
         return ["SSH：已向 ~/.ssh/config 写入 github.com 屏蔽块（PubkeyAuthentication no）"];
+    }
+
+    /// <summary>摘除 SSH 屏蔽块（seal --pause / unseal）。只删标记块内的行，用户自有配置不动；
+    /// resume 走 seal --fix 的违规检测重建（有私钥且无标记 → 重写块）。</summary>
+    public static List<string> StripSshBlock()
+    {
+        var cfg = Path.Combine(SshDir, "config");
+        if (!File.Exists(cfg)) return ["SSH：无 config，无需摘除"];
+        var lines = File.ReadAllLines(cfg);
+        if (!lines.Any(l => l.Contains(SshMarker, StringComparison.Ordinal)))
+            return ["SSH：屏蔽块不在位，无需摘除"];
+        var outLines = new List<string>();
+        bool inBlock = false;
+        foreach (var l in lines)
+        {
+            if (l.Contains($">>> {SshMarker}", StringComparison.Ordinal)) { inBlock = true; continue; }
+            if (l.Contains($"<<< {SshMarker}", StringComparison.Ordinal)) { inBlock = false; continue; }
+            if (!inBlock) outLines.Add(l);
+        }
+        // 去掉块前后的空行堆积（块自带首尾空行）
+        while (outLines.Count > 0 && string.IsNullOrWhiteSpace(outLines[^1])) outLines.RemoveAt(outLines.Count - 1);
+        File.WriteAllLines(cfg, outLines);
+        return ["SSH：已摘除 github.com 屏蔽块（直推能力恢复）"];
     }
 }
