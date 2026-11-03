@@ -137,14 +137,13 @@ internal static class SetupCommand
         // 再呈现真实状态——人跑 seal 或哨兵 tick 都会走到这里，到期恢复不依赖人记得
         if (SealCheck.SealPause.Until() is { } expired && expired <= DateTime.UtcNow)
         {
-            Console.WriteLine($"[Sluice] 暂停窗口已过期（{expired.ToLocalTime():HH:mm} 到期）——自动执行恢复：");
+            Console.WriteLine($"[Sluice] 暂停窗口已过期（{UntilLabel(expired)} 到期）——自动执行恢复：");
             SealResume();
             Console.WriteLine();
         }
         if (SealCheck.SealPause.Active)
         {
-            var until = SealCheck.SealPause.Until()!.Value.ToLocalTime();
-            Console.WriteLine($"⏸ 封堵暂停中（至 {until:HH:mm}）——期内直推能力开放、写操作 seal 门放行。");
+            Console.WriteLine($"⏸ 封堵暂停中（至 {UntilLabel(SealCheck.SealPause.Until()!.Value)}）——期内直推能力开放、写操作 seal 门放行。");
             Console.WriteLine("结束暂停立即恢复：sluice seal --resume（或等哨兵在到期后 5 分钟内自动恢复）。");
             return 0;
         }
@@ -187,6 +186,16 @@ internal static class SetupCommand
     }
 
     // ---------- seal --pause / --resume / unseal（v2.22，§6 + §9.5 人类工作流） ----------
+
+    /// <summary>暂停截止时刻的本地显示（v2.23 审阅修复）：跨午夜必须带日期——窗口最长 8 小时，
+    /// 只写 HH:mm 会把"明天 03:00"读成"今天 03:00"；同日只写 HH:mm 保持简洁。</summary>
+    internal static string UntilLabel(DateTime untilUtc)
+    {
+        var local = untilUtc.ToLocalTime();
+        return local.Date == DateTime.Now.Date
+            ? local.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture)
+            : local.ToString("MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture);
+    }
 
     /// <summary>非 GitHub 动作复用写动作闸门（§6：与一切写动作同待遇——agent 也能发起，同样要过批准窗）。
     /// 拒绝/超时/Hello 失败/vault 损坏/崩溃的收敛与写路径同形；批准 → onApproved()。</summary>
@@ -238,13 +247,13 @@ internal static class SetupCommand
         if (!TokenStore.Exists) { Messages.Write(Messages.NotInitialized()); return ExitCodes.NotInitialized; }
         if (SealCheck.SealPause.Active)
         {
-            var u = SealCheck.SealPause.Until()!.Value.ToLocalTime();
-            Console.Error.WriteLine($"[Sluice] 已在暂停窗口内（至 {u:HH:mm}）——如需延长，先 seal --resume 再重新暂停。");
+            Console.Error.WriteLine($"[Sluice] 已在暂停窗口内（至 {UntilLabel(SealCheck.SealPause.Until()!.Value)}）——如需延长，先 seal --resume 再重新暂停。");
             return ExitCodes.BadRequest;
         }
-        var until = DateTime.UtcNow.AddMinutes(minutes);
+        var until = DateTime.UtcNow.AddMinutes(minutes); // 弹窗正文用的预估（v2.23：批准拖延时实际值偏后，
+                                                          // 批准后以 Begin 返回的实际值为准）
         var body = $"""
-            暂停侧门封堵 {minutes} 分钟（至本地 {until.ToLocalTime():HH:mm}）。
+            暂停侧门封堵 {minutes} 分钟（至本地约 {UntilLabel(until)}）。
             期内：git/gh 直推能力恢复（notice helper 摘除、SSH 屏蔽块摘除）；sluice 写操作的 seal 门同步放行。
             到期：最迟 5 分钟内自动重新封堵（重装 notice + 清理期内新登录的凭据）；提前结束用 sluice seal --resume。
             这是有意的防护降级窗口——期内你重新提供的任何 GitHub 凭据，同用户进程（含 agent）都可静默使用。
@@ -253,17 +262,18 @@ internal static class SetupCommand
             "暂停 = 防护降级窗口：期内 agent 可静默使用你重新提供的任何 GitHub 凭据",
             () =>
         {
-            SealCheck.SealPause.Begin(minutes);
+            var actual = SealCheck.SealPause.Begin(minutes);
             Git("config", "--global", "--unset-all", "credential.https://github.com.helper"); // 失败=本就不在位
             var acts = new List<string>
             {
-                $"状态：state.json 已记 pause_until（至 {until.ToLocalTime():HH:mm}）",
+                $"状态：state.json 已记 pause_until（至 {UntilLabel(actual)}）",
                 "notice helper：已摘除（github.com 凭据链回到既有继承）",
             };
             acts.AddRange(SealCheck.StripSshBlock());
+            // 审计 result 与 state.json 值逐字同形态（ToStateString）——哨兵/doctor 的伪造核对靠它对上
             Audit.Append("seal_pause", null, $"{minutes} 分钟", null, "approved",
-                result: $"pause_until {until:yyyy-MM-dd'T'HH:mm:ss'Z'}");
-            Console.WriteLine($"✓ 封堵已暂停（至 {until.ToLocalTime():HH:mm}）：");
+                result: $"pause_until {SealCheck.SealPause.ToStateString(actual)}");
+            Console.WriteLine($"✓ 封堵已暂停（至 {UntilLabel(actual)}）：");
             foreach (var a in acts) Console.WriteLine($"  - {a}");
             Console.WriteLine("到期后最迟 5 分钟自动恢复（哨兵）；手动立即恢复：sluice seal --resume。");
             return 0;
@@ -374,8 +384,7 @@ internal static class SetupCommand
         const string key = "credential.https://github.com.helper";
 
         var existing = GitOut("--get-all", key);
-        if (existing.Contains($"\"{fwd} notice\"", StringComparison.Ordinal) ||
-            existing.Contains($"{fwd} notice", StringComparison.Ordinal))
+        if (NoticeValuePresent(existing, fwd))
         {
             if (!quiet) Console.WriteLine($"[Sluice] notice helper 已在位：{key} 含 {fwd} notice，无需重复安装。");
             return 0;
@@ -389,7 +398,11 @@ internal static class SetupCommand
         if (Git("config", "--global", "--add", key, "") != 0 ||
             Git("config", "--global", "--add", key, $"{fwd} notice") != 0)
         {
-            Console.Error.WriteLine("[Sluice] git config 写入失败（git 不在 PATH？），安装中止（未产生任何变更）。");
+            // 照实说（v2.23 审阅修复）：此刻 --unset-all 已执行、空串 --add 可能已落盘——
+            // github.com helper 链处于半装状态（fail-closed 方向），不是"未产生任何变更"。
+            Console.Error.WriteLine($"[Sluice] git config 写入失败（git 不在 PATH？）。注意：{key} 可能已处于半装状态——");
+            Console.Error.WriteLine("    旧值已清（--unset-all），空串断继承可能已写入而 notice 未加（fail-closed 方向：github.com 直连拿不到凭据）。");
+            Console.Error.WriteLine($"    重跑 sluice setup --install 可完成安装；或 git config --global --unset-all {key} 手动回退。");
             return ExitCodes.Internal;
         }
 
@@ -403,7 +416,15 @@ internal static class SetupCommand
         return 0;
     }
 
-    private static int Git(params string[] args)    {
+    /// <summary>git config --get-all 输出中是否存在指向 <paramref name="forwardSlashExe"/> 的 notice 值。
+    /// v2.23 单源化（幂等检查与 doctor 共用）：子串匹配同时覆盖带引号与不带引号两种存储形态
+    ///（"fwd notice" 是 "\"fwd notice\"" 的子串）；doctor 原来的 Contains("notice") 连指向已删除
+    /// 旧 exe 路径的残留条目都判绿——doctor 的职责恰是发现漂移，必须前缀精确。</summary>
+    internal static bool NoticeValuePresent(string getAllOutput, string forwardSlashExe) =>
+        getAllOutput.Contains($"{forwardSlashExe} notice", StringComparison.Ordinal);
+
+    private static int Git(params string[] args)
+    {
         try
         {
             // 空串参数必须显式成 ""（join 后消失会让 git 误把 key 当 value）；
@@ -449,25 +470,41 @@ internal static class SetupCommand
         <!-- sluice-rules END -->
         """;
 
+    internal const string SnippetBegin = "<!-- sluice-rules BEGIN";
+    internal const string SnippetEnd = "<!-- sluice-rules END -->";
+
+    /// <summary>标记块替换（纯函数，v2.23 入 selftest 锁）：END 只认 BEGIN **之后**的第一个——
+    /// AGENTS.md 前文若引用了标记字符串不得错切（v2.20 原全文搜索会把前文的 END 引用当块尾）。
+    /// 返回 null = 无 BEGIN（调用方走追加分支）或有 BEGIN 而其后无 END（手改损坏，调用方报错）。</summary>
+    internal static string? ReplaceSnippetBlock(string txt, string block)
+    {
+        var s = txt.IndexOf(SnippetBegin, StringComparison.Ordinal);
+        if (s < 0) return null;
+        var e = txt.IndexOf(SnippetEnd, s, StringComparison.Ordinal);
+        if (e < 0) return null;
+        e += SnippetEnd.Length;
+        // 吃掉 END 行尾换行，块自带结尾换行
+        return txt[..s] + block + txt[e..].TrimStart('\r', '\n');
+    }
+
     /// <summary>把 §8.4 片段写进当前工作区 AGENTS.md。标记块幂等（重跑=刷新，手改会被覆盖）；
     /// 无 AGENTS.md 则新建。装完提示用户把文件提交进仓库（§8.4 的可见性对人才有效）。</summary>
     public static int InstallSnippet()
     {
         var path = Path.Combine(Directory.GetCurrentDirectory(), "AGENTS.md");
-        const string begin = "<!-- sluice-rules BEGIN";
-        const string end = "<!-- sluice-rules END -->";
         var block = Snippet + Environment.NewLine;
         if (File.Exists(path))
         {
             var txt = File.ReadAllText(path);
-            var s = txt.IndexOf(begin, StringComparison.Ordinal);
-            if (s >= 0)
+            if (txt.Contains(SnippetBegin, StringComparison.Ordinal))
             {
-                var e = txt.IndexOf(end, StringComparison.Ordinal);
-                if (e < 0) { Console.Error.WriteLine("[Sluice] AGENTS.md 有 BEGIN 无 END 标记（手改损坏），请人工修复后重跑。"); return ExitCodes.Internal; }
-                e += end.Length;
-                // 吃掉 END 行尾换行，块自带结尾换行
-                File.WriteAllText(path, txt[..s] + block + txt[e..].TrimStart('\r', '\n'));
+                var updated = ReplaceSnippetBlock(txt, block);
+                if (updated is null)
+                {
+                    Console.Error.WriteLine("[Sluice] AGENTS.md 标记块损坏（有 BEGIN 而其后无 END），请人工修复后重跑。");
+                    return ExitCodes.Internal;
+                }
+                File.WriteAllText(path, updated);
                 Console.WriteLine($"[Sluice] 已刷新既有片段（{path}）。");
             }
             else
@@ -488,7 +525,10 @@ internal static class SetupCommand
     // ---------- sluice doctor（v2.21，V1.5 项：一次性健康汇总） ----------
 
     /// <summary>六项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / 哨兵任务。
-    /// 全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位（seal --fix / setup --install / sentinel-install）。</summary>
+    /// 全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位（seal --fix / setup --install / sentinel-install）。
+    /// v2.23：暂停窗口内语义翻转——notice 摘除是 pause 的预期效果（原建议 setup --install 与暂停语义
+    /// 直接冲突，照做=把刚摘的 helper 装回去）；seal 预检显示"暂停中"而非误导性的"无违规"；
+    /// 暂停值无对应 seal_pause 审计记录按疑似伪造报红（§14 L11）。</summary>
     public static int Doctor()
     {
         int bad = 0;
@@ -530,18 +570,44 @@ internal static class SetupCommand
         }
         catch (Exception ex) { Item(false, "config", $"解析失败（{ex.Message}）——人工检查"); }
 
-        // seal 预检（写路径同款轻量检查）
-        var viol = SealCheck.Run();
-        Item(viol.Count == 0, "seal 预检", viol.Count == 0 ? "无违规" : $"{viol.Count} 处违规——sluice seal --fix");
+        // seal 预检——暂停窗口内/过期未愈/正常三态（v2.23），正常态才跑写路径同款轻量检查
+        var pauseUntil = SealCheck.SealPause.Until();
+        var paused = pauseUntil > DateTime.UtcNow;                       // null（无暂停）→ false
+        var expiring = pauseUntil is not null && !paused;               // 过期未愈：哨兵 ≤5 分钟自愈
+        if (paused)
+        {
+            var auditOk = SealCheck.SealPause.HasAuditRecord(pauseUntil!.Value);
+            Item(auditOk, "seal 预检", auditOk
+                ? $"暂停中（至 {UntilLabel(pauseUntil.Value)}）——期内检测放行（seal --pause），resume 后自动恢复"
+                : $"暂停中（至 {UntilLabel(pauseUntil.Value)}）但 state.json 无对应 seal_pause 审计记录——疑似伪造（§14 L11），sluice seal --resume 立即恢复封堵");
+        }
+        else if (expiring)
+        {
+            Item(true, "seal 预检", $"暂停已过期（{UntilLabel(pauseUntil!.Value)} 到期）——自动恢复中：哨兵最迟 5 分钟 / 手动 seal --resume 立即");
+        }
+        else
+        {
+            var viol = SealCheck.Run();
+            Item(viol.Count == 0, "seal 预检", viol.Count == 0 ? "无违规" : $"{viol.Count} 处违规——sluice seal --fix");
+        }
 
-        // notice helper
+        // notice helper——ProcessPath 前缀精确匹配（v2.23：原 Contains("notice") 连指向已删除旧 exe
+        // 的残留条目都判绿）；暂停期内"不在位"是预期（pause 摘除了它），不得建议重装
         const string key = "credential.https://github.com.helper";
         var helpers = GitOut("--get-all", key);
-        var noticeIn = helpers.Contains("notice", StringComparison.Ordinal);
+        var fwd = Environment.ProcessPath?.Replace('\\', '/');
+        var noticeIn = fwd is not null && NoticeValuePresent(helpers, fwd);
         var ghBridge = helpers.Contains("!gh", StringComparison.Ordinal);
-        Item(noticeIn && !ghBridge, "notice helper", noticeIn
-            ? (ghBridge ? "在位但 gh 桥接条目重现——重跑 setup --install" : "在位（仅作用 github.com）")
-            : "不在位——sluice setup --install");
+        if (paused)
+            Item(!noticeIn, "notice helper", noticeIn
+                ? "暂停期内在位——直推将被它拦下（与暂停目的冲突），安装与暂停状态不一致，请核对"
+                : "已摘除（暂停窗口内的预期状态——seal --resume 后自动重装）");
+        else if (expiring)
+            Item(true, "notice helper", "摘除中——暂停已过期，resume/哨兵将自动重装（≤5 分钟）");
+        else
+            Item(noticeIn && !ghBridge, "notice helper", noticeIn
+                ? (ghBridge ? "在位但 gh 桥接条目重现——重跑 setup --install" : "在位（仅作用 github.com）")
+                : "不在位——sluice setup --install");
 
         // 哨兵任务
         bool taskOk;
@@ -586,11 +652,13 @@ internal static class SetupCommand
             new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
         Console.WriteLine($"[Sluice] 已写入哨兵脚本：{ps1}");
 
-        // 计划任务：每 5 分钟，当前用户交互会话（默认 /RU 调用者）。路径无空格（LOCALAPPDATA
-        // 与 exe 路径均校验过不含空格），/TR 无需内层引号。
-        var tr = $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File {ps1}";
-        var psi = new System.Diagnostics.ProcessStartInfo("schtasks",
-            $"/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"{tr}\"")
+        // 计划任务：每 5 分钟，当前用户交互会话（默认 /RU 调用者）。
+        // v2.23 修复：-File 路径恒带引号、/TR 内层引号经 \" 转义——LOCALAPPDATA 路径常含空格
+        //（Windows 用户名含空格即中招；v2.20 原版不转义，此类机器上任务每 5 分钟静默失败且
+        // 连 sentinel.log 都不会有——原注释声称"均校验过不含空格"但并无任何校验）。
+        // 转义方案 2026-11-03 实弹：含空格路径注册 → XML 拆分为 Command=powershell.exe +
+        // Arguments=…-File "带空格路径" → /Run 执行成功（marker 落盘）。
+        var psi = new System.Diagnostics.ProcessStartInfo("schtasks", SchtasksCreateArgs(SentinelTr(ps1)))
         { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
         using (var p = System.Diagnostics.Process.Start(psi)!)
         {
@@ -613,9 +681,23 @@ internal static class SetupCommand
         return 0;
     }
 
+    /// <summary>哨兵 /TR 值：-File 路径恒带引号（LOCALAPPDATA 常含空格——Windows 用户名含空格即中招）。
+    /// 形态入 selftest 锁（v2.23：v2.20 缺的正是这层引号，含空格机器上任务静默失败）。</summary>
+    internal static string SentinelTr(string ps1) =>
+        $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{ps1}\"";
+
+    /// <summary>schtasks /Create 参数串：/TR 的内层引号以 \" 转义（schtasks 按 argv 规则解析后
+    /// 存为 Command/Arguments 两个字段，实弹验证见 SentinelInstall 注释）。转义入 selftest 锁。</summary>
+    internal static string SchtasksCreateArgs(string tr) =>
+        $"/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"{tr.Replace("\"", "\\\"")}\"";
+
     /// <summary>哨兵脚本（__EXE__ 由安装器替换为绝对路径）。UTF-8 控制台先设好否则 ✗ 行匹配乱码；
     /// toast 双路：BurntToast 模块（装了就用）→ WinRT 原生（PowerShell AUMID，零依赖兜底）。
-    /// v2.22 暂停感知：state.json 未到期 → 静默；已过期 → seal --resume 自愈 + toast（到期恢复不靠人记得）。</summary>
+    /// v2.22 暂停感知：state.json 未到期 → 静默；已过期 → seal --resume 自愈 + toast（到期恢复不靠人记得）。
+    /// v2.23：sentinel.log 超 1MB 滚动为 .1（违规持续期间每 5 分钟全量追加，无上限会失控）；
+    /// 暂停态伪造核对（§14 L11）——state.json 的 pause_until 无对应 seal_pause 审计记录 → 疑似伪造告警
+    ///（state.json 是同用户可写明文，一行写入未来时间戳即可静音检测层；audit.jsonl 同为可写，
+    /// 本核对抬高门槛而非建立信任——检测层看住检测层）。</summary>
     private const string SentinelScript = """
         # Sluice 哨兵（§6）——由 sluice sentinel-install 生成；检测逻辑单源在 sluice seal（轻量预检）
         $ErrorActionPreference = 'SilentlyContinue'
@@ -623,6 +705,8 @@ internal static class SetupCommand
         $exe = '__EXE__'
         $dir = Join-Path $env:LOCALAPPDATA 'Sluice'
         $log = Join-Path $dir 'sentinel.log'
+        # v2.23：日志滚动（超 1MB 改名 .1，保留一代）——违规持续期间每 5 分钟追加全量输出，无上限会失控
+        if ((Get-Item $log -ErrorAction SilentlyContinue).Length -gt 1MB) { Move-Item -Force $log "$log.1" }
 
         function Show-Toast($title, $body) {
             $shown = $false
@@ -646,13 +730,26 @@ internal static class SetupCommand
             }
         }
 
-        # 暂停窗口（v2.22 seal --pause）：未到期 → 静默放行；已过期 → seal --resume 自愈（重装 notice + seal --fix）+ toast
+        # 暂停窗口（v2.22 seal --pause）：未到期 → 交叉核对审计后静默放行；已过期 → seal --resume 自愈（重装 notice + seal --fix）+ toast
         $state = Join-Path $dir 'state.json'
         if (Test-Path $state) {
             try {
                 $j = Get-Content -Raw -Encoding UTF8 $state | ConvertFrom-Json
                 $until = [DateTime]::Parse($j.pause_until, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal)
-                if ($until -gt [DateTime]::UtcNow) { exit 0 }
+                if ($until -gt [DateTime]::UtcNow) {
+                    # v2.23（§14 L11）：state.json 同用户可写——伪造未来时间戳即可静音哨兵。
+                    # pause_until 值须有逐字同形态的 seal_pause 审计记录（needle 由 C# 侧 ToStateString 生成）；
+                    # 无对应记录 = 疑似伪造 → toast + 日志（audit 也可伪造，本核对是抬门槛不是建信任）
+                    $audit = Join-Path $dir 'audit.jsonl'
+                    $needle = "pause_until $($j.pause_until)"
+                    $hit = $false
+                    if (Test-Path $audit) { $hit = [bool](Select-String -Path $audit -SimpleMatch -Encoding UTF8 -Pattern $needle) }
+                    if (-not $hit) {
+                        Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) 疑似伪造暂停：state.json 记 $($j.pause_until)，audit.jsonl 无对应 seal_pause 审计记录"
+                        Show-Toast 'Sluice 哨兵：暂停状态可疑' 'state.json 的暂停无对应 seal_pause 审计记录——疑似被同用户进程伪造。运行 sluice seal --resume 立即恢复封堵。'
+                    }
+                    exit 0
+                }
                 $r = & $exe seal --resume 2>&1
                 Add-Content -Encoding UTF8 $log "$(Get-Date -Format s) 暂停到期，自动恢复：`n$r`n"
                 Show-Toast 'Sluice：暂停窗口结束' '已自动重新封堵（notice 重装 + seal --fix）。残留请看 sentinel.log。'

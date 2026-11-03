@@ -20,6 +20,9 @@ internal static partial class SealCheck
     /// 封堵暂停状态。Active = state.json 的 pause_until 尚未到点。到期后不主动清文件——
     /// 自愈收敛在 seal（no-args 检测过期即执行 resume）与哨兵（过期即跑 seal --resume + toast），
     /// 写路径的 Run() 只把过期当"未暂停"（fail-closed：封堵先行恢复，重装 notice 随后补上）。
+    /// v2.23（§14 L11）：state.json 是同用户可写明文——伪造未来时间戳可静音检测层（哨兵静默、
+    /// seal 门放行；写操作本身仍需批准窗，token 不因此泄出）。处置=哨兵/doctor 交叉核对
+    /// audit.jsonl 的 seal_pause 记录（HasAuditRecord），无对应记录按疑似伪造告警。
     /// </summary>
     internal static class SealPause
     {
@@ -35,7 +38,8 @@ internal static partial class SealCheck
             }
         }
 
-        /// <summary>未到点的截止时刻（null = 无暂停或已过期）。过期文件不在此清——见类注释。</summary>
+        /// <summary>解析出的截止时刻，不做过期过滤（null = 无文件/无键/不可解析；已过期照样返回，
+        /// 过期自愈与 doctor 的"恢复中"显示都依赖这个值）。过期文件不在此清——见类注释。</summary>
         public static DateTime? Until()
         {
             try
@@ -51,11 +55,33 @@ internal static partial class SealCheck
             catch { return null; }
         }
 
-        public static void Begin(int minutes)
+        /// <summary>state.json 值、seal_pause 审计 result、哨兵 ps1 的 grep needle 三方共用的字符串形态
+        ///（逐字一致是 HasAuditRecord 与哨兵交叉核对能对上的前提——形态入 selftest 锁）。</summary>
+        public static string ToStateString(DateTime untilUtc) =>
+            untilUtc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture);
+
+        /// <summary>v2.23（§14 L11）：该 pause_until 值是否有对应的 seal_pause 审计记录。
+        /// 抬高伪造门槛（一行写 state.json 静音检测层 → 还需照形态伪造审计）而非建立信任——
+        /// audit.jsonl 同为同用户可写（L1/L4），完整方案（vault 同源密钥签名）不做，入册。</summary>
+        public static bool HasAuditRecord(DateTime untilUtc)
         {
+            try
+            {
+                var audit = Path.Combine(Path.GetDirectoryName(StatePath)!, "audit.jsonl");
+                if (!File.Exists(audit)) return false;
+                return File.ReadAllText(audit).Contains($"pause_until {ToStateString(untilUtc)}", StringComparison.Ordinal);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>写入暂停状态并返回实际生效的截止时刻（v2.23：调用方批准窗拖延时，此前算的
+        /// 预估值会早于实际——state/审计/✓ 输出一律以本返回值为准，弹窗正文才用预估值）。</summary>
+        public static DateTime Begin(int minutes)
+        {
+            var until = DateTime.UtcNow.AddMinutes(minutes);
             Directory.CreateDirectory(Path.GetDirectoryName(StatePath)!);
-            File.WriteAllText(StatePath,
-                $$"""{"pause_until":"{{DateTime.UtcNow.AddMinutes(minutes).ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", System.Globalization.CultureInfo.InvariantCulture)}}"}""");
+            File.WriteAllText(StatePath, $$"""{"pause_until":"{{ToStateString(until)}}"}""");
+            return until;
         }
 
         public static void Clear()

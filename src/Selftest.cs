@@ -70,7 +70,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -129,6 +129,7 @@ internal static class Selftest
         fail += PushLogicChecks();
         fail += LabelChecks();
         fail += CrashDetailChecks();
+        fail += ReviewFixChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -353,6 +354,61 @@ internal static class Selftest
         Ok(Gate.DescribeCrash(new Exception(new string('x', 5000))).Length <= 602, "超长未截断（审计行失控）");
 
         Console.WriteLine(fail == 0 ? "崩溃诊断锁通过。" : "崩溃诊断锁有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>v2.23 审阅修复锁（d0f817c–8c3e770 五提交评审处置批）：哨兵 /TR 引号形态
+    /// （P1——含空格路径静默失效的回归防线，实弹定案后锁形态）；notice 在位判定（P2——前缀精确，
+    /// 旧路径残留不再误判绿）；暂停截止显示（P3——跨午夜必须带日期）；AGENTS.md 标记块替换
+    /// （P3——END 限定 BEGIN 之后，前文引用标记字符串不得错切）；state/审计字符串形态
+    /// （P2——哨兵伪造核对与 HasAuditRecord 靠三方逐字一致才对得上）。</summary>
+    private static int ReviewFixChecks()
+    {
+        Console.WriteLine("--- 审阅修复锁（v2.23：/TR 引号 / notice 判定 / 暂停显示 / 标记块替换 / state 字符串形态）---");
+        int fail = 0;
+        void Ok(bool cond, string what)
+        {
+            if (!cond) { fail++; Console.WriteLine($"!! {what}"); }
+        }
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) 哨兵 /TR：-File 路径恒带内层引号，schtasks 参数串里转义为 \"（v2.20 缺的正是这层——
+        //     含空格路径下 powershell 把 "C:\Users\John" 当脚本名，任务每 5 分钟静默失败且无日志）
+        Eq("SentinelTr 含空格路径", SetupCommand.SentinelTr("C:/Users/John Doe/AppData/Local/Sluice/sentinel.ps1"),
+           "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:/Users/John Doe/AppData/Local/Sluice/sentinel.ps1\"");
+        Eq("schtasks 参数串内层转义", SetupCommand.SchtasksCreateArgs("powershell.exe -File \"C:/a b/s.ps1\""),
+           "/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"powershell.exe -File \\\"C:/a b/s.ps1\\\"\"");
+
+        // (2) notice 在位判定：前缀精确匹配——旧 exe 路径残留 / 无关含 notice 子串的条目都不得判绿
+        Ok(SetupCommand.NoticeValuePresent("C:/pub/sluice.exe notice", "C:/pub/sluice.exe"), "在位应判绿");
+        Ok(SetupCommand.NoticeValuePresent("\"C:/pub/sluice.exe notice\"", "C:/pub/sluice.exe"), "带引号存储形态应判绿");
+        Ok(!SetupCommand.NoticeValuePresent("C:/old/deleted-path/sluice.exe notice", "C:/pub/sluice.exe"), "旧路径残留不得判绿");
+        Ok(!SetupCommand.NoticeValuePresent("!gh auth git-credential", "C:/pub/sluice.exe"), "gh 桥接条目不得判绿");
+        Ok(!SetupCommand.NoticeValuePresent("C:/x/my-notice-thing notice", "C:/pub/sluice.exe"), "含 notice 子串的无关条目不得判绿");
+
+        // (3) 暂停截止显示：同日 HH:mm；跨午夜必须带日期（窗口 ≤8h，只写 HH:mm 会把"明天 03:00"读成"今天 03:00"）
+        var noonish = DateTime.Now.Date.AddHours(12);
+        Eq("同日只写时刻", SetupCommand.UntilLabel(noonish.ToUniversalTime()),
+           noonish.ToString("HH:mm", System.Globalization.CultureInfo.InvariantCulture));
+        var tomorrow = DateTime.Now.Date.AddDays(1).AddHours(9);
+        Eq("跨午夜带日期", SetupCommand.UntilLabel(tomorrow.ToUniversalTime()),
+           tomorrow.ToString("MM-dd HH:mm", System.Globalization.CultureInfo.InvariantCulture));
+
+        // (4) 标记块替换：END 只认 BEGIN 之后的——前文引用 END 字符串不得错切；损坏形态返回 null
+        var doc = "前文引用了 <!-- sluice-rules END --> 字样。\n<!-- sluice-rules BEGIN\n旧正文\n<!-- sluice-rules END -->\n尾巴";
+        Eq("前文有 END 引用时正确刷新", SetupCommand.ReplaceSnippetBlock(doc, "NEW\n"),
+           "前文引用了 <!-- sluice-rules END --> 字样。\nNEW\n尾巴");
+        Ok(SetupCommand.ReplaceSnippetBlock("<!-- sluice-rules BEGIN\n无尾", "NEW\n") is null, "有 BEGIN 无 END 应判损坏（null）");
+        Ok(SetupCommand.ReplaceSnippetBlock("只有 <!-- sluice-rules END --> 没有 BEGIN", "NEW\n") is null, "无 BEGIN 走追加分支（null）");
+
+        // (5) state/审计字符串形态：Begin 写入值、seal_pause 审计 result、哨兵 grep needle 三方一致的前提
+        Eq("ToStateString 形态", SealCheck.SealPause.ToStateString(new DateTime(2026, 11, 3, 15, 0, 0, DateTimeKind.Utc)),
+           "2026-11-03T15:00:00Z");
+
+        Console.WriteLine(fail == 0 ? "审阅修复锁通过。" : "审阅修复锁有不符项（见上）。");
         return fail;
     }
 
