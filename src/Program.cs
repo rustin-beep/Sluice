@@ -205,7 +205,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.23");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.24");
         return 0;
     }
 
@@ -564,7 +564,7 @@ internal static class Program
         var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var page = 1; page <= 5; page++)
         {
-            var (st, json) = TryReadMeta($"repos/{repo}/labels?per_page=100&page={page}");
+            var (st, json, _) = TryReadMeta($"repos/{repo}/labels?per_page=100&page={page}");
             if (st != 200 || json is not System.Text.Json.Nodes.JsonArray arr)
                 return (false, known);
             foreach (var item in arr)
@@ -625,24 +625,58 @@ internal static class Program
         return true;
     }
 
-    /// <summary>尽力匿名元数据预读（pr_merge/pr_reopen/issue_close 纪律，v2.11 收敛单源）：
-    /// 读落审计；失败/非 200 不阻塞批准流——弹窗退化为参数展示 + 警示行。
-    /// 返回 (状态码：-1=未发出/0=超时/其它=HTTP 状态，200 时给 JsonNode)。</summary>
-    private static (int St, System.Text.Json.Nodes.JsonNode? Json) TryReadMeta(string path)
+    /// <summary>尽力元数据预读（pr_merge/pr_reopen/issue_close/branch_delete 纪律，v2.11 收敛单源）：
+    /// 读落审计；失败/非 200 不阻塞批准流——弹窗退化为参数展示 + 归因警示行（文案用 MetaUnreadableWhy）。
+    /// 返回 (状态码：-1=未发出/0=超时/其它=HTTP 状态，200 时给 JsonNode，末次尝试是否带凭据)。
+    /// v2.24：匿名 403/404（配额限流 / 私有库匿名不可见）且 vault 为静默格式（hello:false，同
+    /// `api --auth` 的零交互姿态——读无破坏力，不弹批准窗）时以 token 复读一次。此前匿名配额
+    /// 被读操作耗尽后，pr_merge 弹窗直接退化为"方向：? ← ？"且把限流误报成"私有库或网络原因"
+    /// （2026-11-03 Vitro #452 实弹：anon 403 同刻 `api --auth` 200——agent 比弹窗看得还多）。
+    /// Hello vault 不复读：门控前多一道生物事件 = 弹窗疲劳，维持降级 + 准确归因。</summary>
+    private static (int St, System.Text.Json.Nodes.JsonNode? Json, bool Authed) TryReadMeta(string path)
+    {
+        var (st, json) = ReadMetaOnce(path, null);
+        if (json is not null || st is not (403 or 404) || !TokenStore.Exists || !TokenStore.IsDpapiVault)
+            return (st, json, Authed: false);
+        try
+        {
+            var (ast, ajson) = ReadMetaOnce(path, TokenStore.LoadApproved(null));
+            return (ast, ajson, Authed: true);
+        }
+        catch { return (st, json, Authed: false); } // vault 异常不阻塞批准流：退回匿名结果
+    }
+
+    private static (int St, System.Text.Json.Nodes.JsonNode? Json) ReadMetaOnce(string path, string? token)
     {
         try
         {
-            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, path).GetAwaiter().GetResult();
+            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
             if (notSent)
                 Audit.Append("api_read", "api.github.com", path, null, "http_failed", result: "not_sent");
             else if (st == 0)
                 Audit.Append("api_read", "api.github.com", path, null, "timeout", result: "retry_safe_get");
             else
-                Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B anon");
+                Audit.Append("api_read", "api.github.com", path, null, $"http_{st}",
+                    result: $"{body.Length}B{(token is null ? " anon" : " auth")}");
             return notSent ? (-1, null) : st == 200 ? (st, System.Text.Json.Nodes.JsonNode.Parse(body)) : (st, null);
         }
         catch { return (0, null); }
     }
+
+    /// <summary>预读失败归因（弹窗降级文案单源，selftest 锁）：不再猜"私有库"——403 多为匿名
+    /// 配额限流（本机读操作高频，配额 60/h 极易耗尽），404 才是"私有库匿名不可见或编号不存在"；
+    /// authed=true 表示末次已带凭据（静默 vault 回退），403/404 语义随之收窄为"token 无权 /
+    /// 确不存在"——匿名两可的措辞不再适用。</summary>
+    internal static string MetaUnreadableWhy(int st, bool authed) => st switch
+    {
+        403 when authed => "带凭据读被拒（token 无权，或限流）",
+        404 when authed => "带凭据读仍 404：编号不存在，或 token 无权访问",
+        -1 => "网络/代理不可达（请求未发出）",
+        0 => "读取超时",
+        403 => "匿名读被限流或无权（多为配额耗尽，稍后重试或由用户核对）",
+        404 => "私有库对匿名读不可见，或编号不存在（匿名不可区分）",
+        _ => $"HTTP {st}",
+    };
 
     /// <summary>v2.11 新 op 共用的闸门段（与既有 op 的 outcome switch 逐分支同构，收敛单源）。</summary>
     private static int RunGatedOp(string op, string repo, string auditTarget, string msgTarget, string sha,
@@ -1291,35 +1325,24 @@ internal static class Program
             return ExitCodes.SealViolation;
         }
 
-        // 尽力而为的匿名元数据读（公开库可用；私有库/网络失败不阻塞——弹窗退化为参数展示）。
-        // 读无破坏力、无凭据参与，走 api 读通道同款匿名 GET——同通道纪律：读也落审计（2026-10-30 评审）。
+        // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源：匿名 403/404 且静默 vault 时以凭据复读，
+        // 2026-11-03 Vitro #452 实弹——匿名配额耗尽后弹窗"? ← ？"且误报"私有库"）。
+        // 读无破坏力（同 api --auth 姿态，读落审计），失败不阻塞批准流——弹窗退化为参数展示 + 归因警示。
+        var (metaSt, prJson, metaAuthed) = TryReadMeta($"repos/{repo}/pulls/{number}");
         string? prTitle = null, prHead = null, prBase = null, prHeadSha = null;
         int changed = -1, additions = -1, deletions = -1;
-        try
+        if (prJson is not null)
         {
-            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/pulls/{number}")
-                .GetAwaiter().GetResult();
-            if (notSent)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "http_failed", result: "not_sent");
-            else if (st == 0)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "timeout", result: "retry_safe_get");
-            else
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
-            if (st == 200)
-            {
-                var pr = System.Text.Json.Nodes.JsonNode.Parse(body);
-                prTitle = pr?["title"]?.GetValue<string>();
-                prHead = pr?["head"]?["ref"]?.GetValue<string>();
-                prBase = pr?["base"]?["ref"]?.GetValue<string>();
-                prHeadSha = pr?["head"]?["sha"]?.GetValue<string>(); // 保真锚点：批准所见 = 合并所执行
-                changed = pr?["changed_files"]?.GetValue<int>() ?? -1;
-                additions = pr?["additions"]?.GetValue<int>() ?? -1;
-                deletions = pr?["deletions"]?.GetValue<int>() ?? -1;
-            }
+            prTitle = prJson["title"]?.GetValue<string>();
+            prHead = prJson["head"]?["ref"]?.GetValue<string>();
+            prBase = prJson["base"]?["ref"]?.GetValue<string>();
+            prHeadSha = prJson["head"]?["sha"]?.GetValue<string>(); // 保真锚点：批准所见 = 合并所执行
+            changed = prJson["changed_files"]?.GetValue<int>() ?? -1;
+            additions = prJson["additions"]?.GetValue<int>() ?? -1;
+            deletions = prJson["deletions"]?.GetValue<int>() ?? -1;
         }
-        catch { /* 元数据读失败不阻塞批准流 */ }
         if (deleteHead && prHead is null)
-            return ErrBad("--delete-head 需要知道 head 分支名，但 PR 元数据匿名读取失败（私有库？网络？）——请合并后改用 sluice branch delete");
+            return ErrBad($"--delete-head 需要知道 head 分支名，但 PR 元数据读取失败（{MetaUnreadableWhy(metaSt, metaAuthed)}）——请合并后改用 sluice branch delete");
         if (IsTrunkBranch(prHead))
             return ErrBad("head 分支是 main/master，--delete-head 拒绝执行（受保护分支）");
 
@@ -1327,10 +1350,10 @@ internal static class Program
         // 批准指纹混入 head sha（2026-10-30 评审）：编号不变内容可变——指纹锚定"所见内容"，
         // 审计行才能回答"用户批准的是哪一版"
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
-            $"{repo}#{number}:{method ?? "default"}:{prHeadSha ?? "?}"}")))[..8].ToLowerInvariant();
+            $"{repo}#{number}:{method ?? "default"}:{prHeadSha ?? "?"}")))[..8].ToLowerInvariant();
         var window = $"""
             PR：{target}
-            标题：{prTitle ?? "（元数据不可读：私有库或网络原因，合并前请自行核对）"}
+            标题：{prTitle ?? $"（元数据不可读：{MetaUnreadableWhy(metaSt, metaAuthed)}，合并前请自行核对）"}
             方向：{prBase ?? "?"} ← {prHead ?? "?"}{(prHeadSha is { Length: >= 8 } h ? $"（head {h[..8]}）" : "")}
             变更：{(changed >= 0 ? $"{changed} 文件（+{additions}/-{deletions}）" : "（统计不可读）")}
             合并方式：{method ?? "仓库默认"}
@@ -1340,9 +1363,15 @@ internal static class Program
         Gate.Outcome outcome;
         using (InputFilter.Install())
         {
+            // 元数据不可读时披露弱锚定：指纹混的是 "?"，执行前 head 复核也不可用（prHeadSha null
+            // 时 ExecutePrMerge 跳过复核）——用户须知道"所见即所得"保证在此处缺席（v2.24）。
             outcome = Gate.Run(new Gate.Request("pr_merge", repo, $"#{number}", window, sha,
                 TokenStore.PeekChallenge(),
-                deleteHead ? "合并成功后将同时删除 head 分支（commits 仍保留，可用 sha 重建）" : null));
+                prHeadSha is null
+                    ? $"PR 元数据不可读（{MetaUnreadableWhy(metaSt, metaAuthed)}）：合并方向与内容请自行核对；"
+                        + "批准指纹未锚定 head 版本，执行前 head 复核不可用"
+                        + (deleteHead ? "\n合并成功后将同时删除 head 分支（commits 仍保留，可用 sha 重建）" : "")
+                    : deleteHead ? "合并成功后将同时删除 head 分支（commits 仍保留，可用 sha 重建）" : null));
         }
 
         switch (outcome)
@@ -1548,33 +1577,24 @@ internal static class Program
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(target)))[..8].ToLowerInvariant();
 
         // 连带后果披露（2026-10-31 Vitro 复盘 #7：删 #389 的 head 分支，弹窗没说会关 PR，用户批前不知情）：
-        // 尽力而为的匿名预查该分支是否为开放 PR 的 head（公开库可查；私有库/网络失败不阻塞——静态警示行仍生效）。
-        // 读无破坏力，走 api 读通道同款匿名 GET 并落读审计（与 pr_merge 元数据读同纪律）。
+        // 尽力而为的预查该分支是否为开放 PR 的 head（失败不阻塞——静态警示行仍生效）。
+        // v2.24 收敛 TryReadMeta 单源：匿名 403/404（限流/私有库）且静默 vault 时带凭据复读——
+        // 此前匿名配额耗尽会连带丢失 PR 关联警示，恰是最需要披露的时刻。
         var prQuery = $"repos/{repo}/pulls?head={repo[..repo.IndexOf('/')]}:{branch}&state=open";
         var openPrLine = "该分支若是某开放 PR 的 head，删除将连带关闭该 PR（讨论上下文断链；重建同名分支不会恢复已关的 PR）";
-        try
+        var (pst, prArr, _) = TryReadMeta(prQuery);
+        if (pst == 200 && prArr is System.Text.Json.Nodes.JsonArray arr)
         {
-            var (pst, pbody, pNotSent, _) = GitHubApi.ApiGetAsync(null, prQuery).GetAwaiter().GetResult();
-            if (pNotSent)
-                Audit.Append("api_read", "api.github.com", prQuery, null, "http_failed", result: "not_sent");
-            else if (pst == 0)
-                Audit.Append("api_read", "api.github.com", prQuery, null, "timeout", result: "retry_safe_get");
-            else
-                Audit.Append("api_read", "api.github.com", prQuery, null, $"http_{pst}", result: $"{pbody.Length}B anon");
-            if (pst == 200 && System.Text.Json.Nodes.JsonNode.Parse(pbody) is System.Text.Json.Nodes.JsonArray prArr)
+            var prs = new List<string>();
+            foreach (var p in arr)
             {
-                var prs = new List<string>();
-                foreach (var p in prArr)
-                {
-                    var n = p?["number"]?.GetValue<int>();
-                    var t = p?["title"]?.GetValue<string>() ?? "";
-                    if (n is { } nn) prs.Add(nn + " " + (t.Length > 40 ? t[..40] + "…" : t));
-                }
-                if (prs.Count > 0)
-                    openPrLine = $"⚠ 删除将连带关闭该分支上的开放 PR：{string.Join("；", prs)}——讨论上下文断链，重建同名分支不会恢复已关的 PR";
+                var n = p?["number"]?.GetValue<int>();
+                var t = p?["title"]?.GetValue<string>() ?? "";
+                if (n is { } nn) prs.Add(nn + " " + (t.Length > 40 ? t[..40] + "…" : t));
             }
+            if (prs.Count > 0)
+                openPrLine = $"⚠ 删除将连带关闭该分支上的开放 PR：{string.Join("；", prs)}——讨论上下文断链，重建同名分支不会恢复已关的 PR";
         }
-        catch { /* 预查失败不阻塞删除流——静态警示行仍披露规则 */ }
 
         var window = $"""
             删除远端分支：{target}
@@ -1745,37 +1765,26 @@ internal static class Program
             return ExitCodes.SealViolation;
         }
 
-        // 尽力而为的匿名元数据读（同 pr_merge 纪律：读落审计，失败不阻塞，弹窗退化为参数展示）
+        // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源，同 pr_merge 纪律：读落审计，失败不阻塞）
+        var (metaSt, prJson, metaAuthed) = TryReadMeta($"repos/{repo}/pulls/{number}");
         string? prTitle = null, prHead = null, prBase = null, prHeadSha = null, prState = null, prMerged = null;
-        int metaSt = 0;
-        try
+        if (prJson is not null)
         {
-            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/pulls/{number}")
-                .GetAwaiter().GetResult();
-            metaSt = notSent ? -1 : st;
-            if (notSent)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "http_failed", result: "not_sent");
-            else if (st == 0)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, "timeout", result: "retry_safe_get");
-            else
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/pulls/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
-            if (st == 200)
-            {
-                var pr = System.Text.Json.Nodes.JsonNode.Parse(body);
-                prTitle = pr?["title"]?.GetValue<string>();
-                prHead = pr?["head"]?["ref"]?.GetValue<string>();
-                prBase = pr?["base"]?["ref"]?.GetValue<string>();
-                prHeadSha = pr?["head"]?["sha"]?.GetValue<string>();
-                prState = pr?["state"]?.GetValue<string>();
-                prMerged = pr?["merged_at"]?.GetValue<string>();
-            }
+            prTitle = prJson["title"]?.GetValue<string>();
+            prHead = prJson["head"]?["ref"]?.GetValue<string>();
+            prBase = prJson["base"]?["ref"]?.GetValue<string>();
+            prHeadSha = prJson["head"]?["sha"]?.GetValue<string>();
+            prState = prJson["state"]?.GetValue<string>();
+            prMerged = prJson["merged_at"]?.GetValue<string>();
         }
-        catch { /* 元数据读失败不阻塞批准流 */ }
         // v2.8（2026-10-31 评审 A）：匿名 404 不再断言"不存在"——私有库对匿名 GET 同样 404，
         // 两者不可区分；断言成终态会误导 agent 认定编号错、换路重试，而正解（继续执行让服务端判）
         // 永远不会被尝试。降级为弹窗警示行，存在性由服务端执行时终判（同 pr_merge 元数据读纪律）。
+        // v2.24：静默 vault 回退后仍 404 的，两可已收窄——带凭据不可见 ≠ 匿名不可见。
         var warn404 = metaSt == 404
-            ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——两者不可区分，存在性由服务端执行时判定"
+            ? metaAuthed
+                ? "\n⚠ 预读 404（已带凭据复核）：编号不存在，或 token 无权访问——存在性由服务端执行时判定"
+                : "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——两者不可区分，存在性由服务端执行时判定"
             : "";
         if (prState == "open")
             return ErrBad($"PR #{number} 已是开放状态，无需 reopen；本次未产生任何副作用。若预期中的 CI 未触发，先核对仓库 workflow 的 on: 配置（push/pull_request 触发类型）");
@@ -1787,7 +1796,7 @@ internal static class Program
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
             $"{repo}#{number}:reopen:{prHeadSha ?? "?"}")))[..8].ToLowerInvariant();
         var window = $"""
-            PR：{target}（当前状态：{prState ?? "（元数据不可读：私有库或网络原因，重开前请自行核对）"}）
+            PR：{target}（当前状态：{prState ?? $"（元数据不可读：{MetaUnreadableWhy(metaSt, metaAuthed)}，重开前请自行核对）"}）
             标题：{prTitle ?? "（不可读）"}
             方向：{prBase ?? "?"} ← {prHead ?? "?"}{(prHeadSha is { Length: >= 8 } h ? $"（head {h[..8]}）" : "")}
             重开将恢复该 PR 的讨论与审查上下文；reopened 事件会再次触发 pull_request 类 workflow。{warn404}
@@ -1798,8 +1807,11 @@ internal static class Program
         {
             outcome = Gate.Run(new Gate.Request("pr_reopen", repo, $"#{number}", window, sha,
                 TokenStore.PeekChallenge(),
-                metaSt == 404 ? "匿名预读 404：编号不存在或私有库匿名不可见，存在性由服务端执行时终判"
-                    : prHeadSha is null ? "PR 元数据不可读，重开对象请自行核对" : null));
+                metaSt == 404 ? (metaAuthed
+                        ? "预读 404（已带凭据复核）：编号不存在或 token 无权，存在性由服务端执行时终判"
+                        : "匿名预读 404：编号不存在或私有库匿名不可见，存在性由服务端执行时终判")
+                    : prHeadSha is null
+                        ? $"PR 元数据不可读（{MetaUnreadableWhy(metaSt, metaAuthed)}），重开对象请自行核对" : null));
         }
 
         switch (outcome)
@@ -1937,35 +1949,25 @@ internal static class Program
             return ExitCodes.SealViolation;
         }
 
-        // 尽力而为的匿名元数据读（issues API 对 PR 编号同样应答——靠 pull_request 字段区分类型）
+        // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源；issues API 对 PR 编号同样应答——
+        // 靠 pull_request 字段区分类型）
+        var (metaSt, issJson, metaAuthed) = TryReadMeta($"repos/{repo}/issues/{number}");
         string? issueTitle = null, issueState = null;
         var isPr = false;
-        int metaSt = 0;
-        try
+        if (issJson is not null)
         {
-            var (st, body, notSent, _) = GitHubApi.ApiGetAsync(null, $"repos/{repo}/issues/{number}")
-                .GetAwaiter().GetResult();
-            metaSt = notSent ? -1 : st;
-            if (notSent)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, "http_failed", result: "not_sent");
-            else if (st == 0)
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, "timeout", result: "retry_safe_get");
-            else
-                Audit.Append("api_read", "api.github.com", $"repos/{repo}/issues/{number}", null, $"http_{st}", result: $"{body.Length}B anon");
-            if (st == 200)
-            {
-                var iss = System.Text.Json.Nodes.JsonNode.Parse(body);
-                issueTitle = iss?["title"]?.GetValue<string>();
-                issueState = iss?["state"]?.GetValue<string>();
-                isPr = iss?["pull_request"] is not null;
-            }
+            issueTitle = issJson["title"]?.GetValue<string>();
+            issueState = issJson["state"]?.GetValue<string>();
+            isPr = issJson["pull_request"] is not null;
         }
-        catch { /* 元数据读失败不阻塞批准流 */ }
         // v2.8（2026-10-31 评审 A）：匿名 404 不再断言"不存在"——私有库对匿名 GET 同样 404，
         // 两者不可区分（同 pr_reopen 降级）。且 issues API 对 PR 编号同样应答——404 降级后
         // "是不是 PR"的类型守卫一并失效，警示行须说破：关到 PR 编号上就是关 PR。
+        // v2.24：静默 vault 回退后仍 404 的，两可已收窄（带凭据不可见）。
         var warn404 = metaSt == 404
-            ? "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——若实为 PR 编号，本操作将关闭该 PR（类型未验证）；存在性由服务端执行时判定"
+            ? metaAuthed
+                ? "\n⚠ 预读 404（已带凭据复核）：编号不存在或 token 无权——若实为 PR 编号，本操作将关闭该 PR（类型未验证）；存在性由服务端执行时判定"
+                : "\n⚠ 匿名预读 404：编号不存在，或私有库对匿名读不可见——若实为 PR 编号，本操作将关闭该 PR（类型未验证）；存在性由服务端执行时判定"
             : "";
         if (isPr)
             return ErrBad($"#{number} 是 PR 不是 issue——PR 的生命周期走 pr merge / pr reopen / branch delete，不走 issue close；本次未产生任何副作用");
@@ -1978,7 +1980,7 @@ internal static class Program
             $"{repo}#{number}:{issueTitle ?? "?"}")))[..8].ToLowerInvariant();
         var window = $"""
             关闭 issue：{target}
-            标题：{issueTitle ?? "（元数据不可读：私有库或网络原因，关闭前请自行核对）"}
+            标题：{issueTitle ?? $"（元数据不可读：{MetaUnreadableWhy(metaSt, metaAuthed)}，关闭前请自行核对）"}
             当前状态：{issueState ?? "（不可读）"} → 关闭（closed）
             评论（如需留证请先单独用 sluice comment 发出）不在本操作范围内。{warn404}
             """;
@@ -1988,8 +1990,11 @@ internal static class Program
         {
             outcome = Gate.Run(new Gate.Request("issue_close", repo, $"#{number}", window, sha,
                 TokenStore.PeekChallenge(),
-                metaSt == 404 ? "匿名预读 404：编号不存在或私有库匿名不可见（可能是 PR 编号），由服务端执行时终判"
-                    : issueTitle is null ? "issue 元数据不可读，关闭对象请自行核对" : null));
+                metaSt == 404 ? (metaAuthed
+                        ? "预读 404（已带凭据复核）：编号不存在或 token 无权（可能是 PR 编号），由服务端执行时终判"
+                        : "匿名预读 404：编号不存在或私有库匿名不可见（可能是 PR 编号），由服务端执行时终判")
+                    : issueTitle is null
+                        ? $"issue 元数据不可读（{MetaUnreadableWhy(metaSt, metaAuthed)}），关闭对象请自行核对" : null));
         }
 
         switch (outcome)
@@ -2207,7 +2212,7 @@ internal static class Program
         if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
         if (!TryPreflight("pr_close", repo, $"#{number}", out var pre)) return pre;
 
-        var (metaSt, pr) = TryReadMeta($"repos/{repo}/pulls/{number}");
+        var (metaSt, pr, _) = TryReadMeta($"repos/{repo}/pulls/{number}");
         string? prTitle = pr?["title"]?.GetValue<string>();
         string? prBase = pr?["base"]?["ref"]?.GetValue<string>();
         string? prHead = pr?["head"]?["ref"]?.GetValue<string>();
@@ -2279,7 +2284,7 @@ internal static class Program
         if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
         if (!TryPreflight("issue_reopen", repo, $"#{number}", out var pre)) return pre;
 
-        var (metaSt, iss) = TryReadMeta($"repos/{repo}/issues/{number}");
+        var (metaSt, iss, _) = TryReadMeta($"repos/{repo}/issues/{number}");
         string? issueTitle = iss?["title"]?.GetValue<string>();
         string? issueState = iss?["state"]?.GetValue<string>();
         var isPr = iss?["pull_request"] is not null;
@@ -2362,7 +2367,7 @@ internal static class Program
         // 尽力匿名预读：类型（issue/PR 均有效，弹窗说破）+ 当前标签（摘除清单数据源）
         string? issueTitle = null;
         string[] currentLabels = [];
-        var (mst, mjson) = TryReadMeta($"repos/{repo}/issues/{number}");
+        var (mst, mjson, _) = TryReadMeta($"repos/{repo}/issues/{number}");
         var metaOk = mst == 200 && mjson is not null;
         if (metaOk)
         {
@@ -2471,7 +2476,7 @@ internal static class Program
             catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
         }
 
-        var (metaSt, pr) = TryReadMeta($"repos/{repo}/pulls/{number}");
+        var (metaSt, pr, _) = TryReadMeta($"repos/{repo}/pulls/{number}");
         string? oldTitle = pr?["title"]?.GetValue<string>();
         string? oldBody = pr?["body"]?.GetValue<string>();
         string? oldState = pr?["state"]?.GetValue<string>();
@@ -2563,7 +2568,7 @@ internal static class Program
             catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
         }
 
-        var (metaSt, pr) = TryReadMeta($"repos/{repo}/pulls/{number}");
+        var (metaSt, pr, _) = TryReadMeta($"repos/{repo}/pulls/{number}");
         string? prTitle = pr?["title"]?.GetValue<string>();
         string? prState = pr?["state"]?.GetValue<string>();
         string? prHeadSha = pr?["head"]?["sha"]?.GetValue<string>();
@@ -2642,7 +2647,7 @@ internal static class Program
         if (!TryPreflight("tag_create", repo, tag, out var pre)) return pre;
 
         // 匿名预读（v2.8 纪律）：tag 已存在 = create-or-fail 的确定性拒绝，公开库零成本拦下（省一道弹窗）
-        var (tagSt, tagRef) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
+        var (tagSt, tagRef, _) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
         var existing = tagSt == 200 ? tagRef?["object"]?["sha"]?.GetValue<string>() : null;
         if (existing is { Length: >= 8 } e8)
             return ErrBad($"tag {tag} 已存在（→ {e8[..8]}）——tag 创建是 create-or-fail，不提供移动/覆盖；如需重新打点请换新 tag 名；本次未产生任何副作用");
@@ -2655,7 +2660,7 @@ internal static class Program
         if (IsHexSha(at)) { targetSha = at; atDesc = "直接给定"; }
         else
         {
-            var (bst, bref) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(at)}");
+            var (bst, bref, _) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(at)}");
             var resolved = bst == 200 ? bref?["object"]?["sha"]?.GetValue<string>() : null;
             if (resolved is null)
                 return ErrBad($"无法把 --at {at} 解析为提交（匿名读 {(bst == 404 ? "404：分支不存在，或私有库匿名不可见" : $"HTTP {bst}")}）——私有库请改给完整 40 位 sha（git rev-parse {at} 本地可得）后重跑；本次未产生任何副作用");
@@ -2737,7 +2742,7 @@ internal static class Program
         catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
 
         // 匿名预读①：tag 是否已存在——已存在则 release 挂其上（target 不参与，弹窗披露）
-        var (tagSt, tagRef) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
+        var (tagSt, tagRef, _) = TryReadMeta($"repos/{repo}/git/ref/tags/{GitHubApi.RefPath(tag)}");
         var existingTag = tagSt == 200 ? tagRef?["object"]?["sha"]?.GetValue<string>() : null;
         var warn404 = tagSt == 404
             ? "\n⚠ 匿名预读 404：tag 状态不可辨（不存在，或私有库匿名不可见）——由服务端执行时终判"
@@ -2757,7 +2762,7 @@ internal static class Program
             if (target is not null) src = target;
             else
             {
-                var (rst, rj) = TryReadMeta($"repos/{repo}");
+                var (rst, rj, _) = TryReadMeta($"repos/{repo}");
                 var db = rst == 200 ? rj?["default_branch"]?.GetValue<string>() : null;
                 if (db is null)
                     return ErrBad($"无法解析发布锚点（读取默认分支失败：HTTP {rst}）——请显式给 --target <分支|完整 sha> 后重跑；本次未产生任何副作用");
@@ -2766,7 +2771,7 @@ internal static class Program
             if (IsHexSha(src)) { anchorSha = src; anchorDesc = $"tag 将创建于 {src[..8]}（--target 直接给定的 sha）"; }
             else
             {
-                var (bst, bref) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(src)}");
+                var (bst, bref, _) = TryReadMeta($"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(src)}");
                 var resolved = bst == 200 ? bref?["object"]?["sha"]?.GetValue<string>() : null;
                 if (resolved is null)
                     return ErrBad($"无法把发布锚点 {src} 解析为提交（匿名读 {(bst == 404 ? "404：分支不存在，或私有库匿名不可见" : $"HTTP {bst}")}）——私有库请改给 --target <完整 40 位 sha>（git rev-parse {src} 本地可得）后重跑；本次未产生任何副作用");

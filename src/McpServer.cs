@@ -36,6 +36,33 @@ internal static class McpServer
         _ => "wait_user", // 表外 code = 契约破裂，fail-safe 交回用户
     };
 
+    /// <summary>
+    /// exit → isError 映射（v2.24）：**用户决策族**（拒绝/超时/未过 Hello/冷却/策略拒/限流等待）
+    /// isError=false——工具本身运行成功，结果是闸门决策，text 是给 agent 读的指引而非故障。
+    /// isError=true 会被宿主按"工具出错"渲染（折叠、归为可重试故障、摘要化），拒绝理由随之
+    /// 沉没：2026-11-03 Vitro #452 实弹，同一拒绝理由两次弹窗 agent 仍未得知（retry=never 被
+    /// 当错误重试）。**技术失败族**（internal/未初始化/凭据失效/seal/参数错/HTTP/未知）保持
+    /// isError=true。selftest 按两族穷举锁。
+    /// </summary>
+    internal static bool IsErrorOf(int code) => code switch
+    {
+        ExitCodes.Success or ExitCodes.Denied or ExitCodes.Timeout or ExitCodes.PolicyReject
+            or ExitCodes.Cooldown or ExitCodes.ConsentFailed or ExitCodes.RateLimitWait => false,
+        _ => true,
+    };
+
+    /// <summary>从 CLI 终态消息中提取拒绝自由文本（structuredContent.deny_reason 的来源）。
+    /// 定界符 = Messages.DenyReasonOpen/Close（单源，selftest 往返锁）；提取不到返回 null——
+    /// text 已含全文，structuredContent 只是机器可读副本，不承载完整性。</summary>
+    internal static string? ExtractDenyReason(string text)
+    {
+        var i = text.IndexOf(Messages.DenyReasonOpen, StringComparison.Ordinal);
+        if (i < 0) return null;
+        var from = i + Messages.DenyReasonOpen.Length;
+        var j = text.IndexOf(Messages.DenyReasonClose, from, StringComparison.Ordinal);
+        return j > from ? text[from..j] : null;
+    }
+
     /// <summary>§9 写 op 的 action 值域（v2.11 起与 plan-lite §9 / CLI 写动词表三方对账，selftest 面一致锁；
     /// v2.11 将 comment 更名 pr_comment——§9.7"与 §9 写 op 一一对应"的字面承诺自此零例外）。</summary>
     internal static readonly string[] Actions =
@@ -79,6 +106,8 @@ internal static class McpServer
         请按其指引行动；structuredContent.retry 是机器可读的下一步：never=禁止重试 /
         after_fix=修正参数后可重试 / retry_ok=可直接重试 / wait_user=等待用户指示 /
         wait_until=等待到点 / change_approach=改换方案。
+        用户拒绝/超时等决策结果 isError=false——这不是工具故障：ok=false 表示操作未执行，
+        denied=true 且 deny_reason=用户填写的拒绝理由（若用户留了话，必须按其理由调整方案，禁止重试）。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
         （如 sluice api repos/owner/repo/pulls）。
         """;
@@ -229,7 +258,7 @@ internal static class McpServer
             if (inputsContent is not null) File.WriteAllText(inputsPath, inputsContent, new UTF8Encoding(false));
 
             var (text, code) = SpawnCli(argv);
-            SendToolResult(stdout, idEl, text, code, isError: code != 0);
+            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code));
         }
         catch (Exception ex)
         {
@@ -482,7 +511,9 @@ internal static class McpServer
         w.WriteEndObject();
     }
 
-    /// <summary>工具结果：text=子进程 §8 消息逐字（单源）；structuredContent={ok,code,retry,url?}；isError=!ok。</summary>
+    /// <summary>工具结果：text=子进程 §8 消息逐字（单源）；structuredContent={ok,code,retry,url?,denied?,deny_reason?}。
+    /// ok=操作是否已执行（code==0）；isError=IsErrorOf（v2.24：用户决策族 false——工具没坏，是闸门说了不）。
+    /// ok 与 isError 自 v2.24 起解耦：拒绝结果 ok=false + isError=false。</summary>
     private static void SendToolResult(StreamWriter stdout, JsonElement idEl, string text, int code, bool isError)
     {
         Send(stdout, idEl, w =>
@@ -495,9 +526,15 @@ internal static class McpServer
             w.WriteEndObject();
             w.WriteEndArray();
             w.WriteStartObject("structuredContent");
-            w.WriteBoolean("ok", !isError);
+            w.WriteBoolean("ok", code == ExitCodes.Success);
             w.WriteNumber("code", code);
             w.WriteString("retry", RetryOf(code));
+            if (code == ExitCodes.Denied)
+            {
+                // v2.24：拒绝决策机器可读化——宿主即便对 text 摘要化，deny_reason 也随身携带
+                w.WriteBoolean("denied", true);
+                if (ExtractDenyReason(text) is { } reason) w.WriteString("deny_reason", reason);
+            }
             var url = ExtractUrl(text);
             if (url is not null) w.WriteString("url", url);
             w.WriteEndObject();

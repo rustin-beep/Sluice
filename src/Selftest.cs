@@ -70,7 +70,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -130,6 +130,7 @@ internal static class Selftest
         fail += LabelChecks();
         fail += CrashDetailChecks();
         fail += ReviewFixChecks();
+        fail += DenyVisibilityChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -494,5 +495,57 @@ internal static class Selftest
             if (e > s + 1) ops.Add(line[(s + 1)..e]);
         }
         return ops;
+    }
+
+    /// <summary>
+    /// v2.24 拒绝可见性锁（2026-11-03 Vitro #452 实弹：pr_merge 拒绝两次、理由两次沉没）：
+    /// (1) isError 两族穷举——用户决策族不得标工具错误（宿主错误渲染吞指引），技术失败族必须标；
+    /// (2) deny_reason 定界往返——Messages.Denied 的自由文本必须能被 ExtractDenyReason 完整取回
+    ///     （文案漂移即红，不会静默失效）；(3) 预读归因——403 不得再归因"私有库"（匿名配额限流
+    ///     才是高频真因），404 匿名两可 / 带凭据收窄的措辞面锁死。
+    /// </summary>
+    private static int DenyVisibilityChecks()
+    {
+        Console.WriteLine("--- v2.24 拒绝可见性锁（isError 两族 / deny_reason 往返 / 预读归因）---");
+        int fail = 0;
+
+        foreach (var code in new[]
+                 {
+                     ExitCodes.Success, ExitCodes.Denied, ExitCodes.Timeout, ExitCodes.PolicyReject,
+                     ExitCodes.Cooldown, ExitCodes.ConsentFailed, ExitCodes.RateLimitWait,
+                 })
+            if (McpServer.IsErrorOf(code))
+            { fail++; Console.WriteLine($"!! exit {code} 属用户决策族，不应标 isError（宿主会按工具错误渲染，吞掉拒绝理由）"); }
+        foreach (var code in new[]
+                 {
+                     ExitCodes.Internal, ExitCodes.SealViolation, ExitCodes.NotInitialized,
+                     ExitCodes.CredentialExpired, ExitCodes.BadRequest, ExitCodes.HttpFailed, ExitCodes.Unknown,
+                 })
+            if (!McpServer.IsErrorOf(code))
+            { fail++; Console.WriteLine($"!! exit {code} 属技术失败族，应标 isError"); }
+
+        var reason = "452 不是没跑完吗？453 跑完了吧？";
+        var denied = Messages.Denied("pr_merge", "rustin-beep/Vitro#452", "不批准", reason);
+        var extracted = McpServer.ExtractDenyReason(denied.Prefix + " " + denied.Text);
+        if (extracted != reason)
+        { fail++; Console.WriteLine($"!! deny_reason 往返不一致：提取到 \"{extracted}\" ≠ \"{reason}\"（定界符漂移？）"); }
+
+        var noReason = Messages.Denied("pr_merge", "rustin-beep/Vitro#452", "不批准", null);
+        if (McpServer.ExtractDenyReason(noReason.Prefix + " " + noReason.Text) is not null)
+        { fail++; Console.WriteLine("!! 无自由文本的拒绝消息不应提取出 deny_reason"); }
+
+        if (Program.MetaUnreadableWhy(403, authed: false).Contains("私有"))
+        { fail++; Console.WriteLine("!! 匿名 403 归因不得再写\"私有\"——高频真因是配额限流（2026-11-03 实弹）"); }
+        if (!Program.MetaUnreadableWhy(404, authed: false).Contains("不可区分"))
+        { fail++; Console.WriteLine("!! 匿名 404 须保留两可措辞（私有库/不存在匿名不可区分，v2.8 纪律）"); }
+        if (!Program.MetaUnreadableWhy(404, authed: true).Contains("带凭据"))
+        { fail++; Console.WriteLine("!! 带凭据 404 应收窄措辞（静默 vault 回退后两可不再成立）"); }
+        if (!Program.MetaUnreadableWhy(-1, false).Contains("未发出") || !Program.MetaUnreadableWhy(0, false).Contains("超时"))
+        { fail++; Console.WriteLine("!! -1/0 归因应为\"未发出/超时\""); }
+
+        Console.WriteLine(fail == 0
+            ? "拒绝可见性：isError 两族 / deny_reason 往返 / 预读归因全对齐。"
+            : "拒绝可见性检查有不符项（见上）。");
+        return fail;
     }
 }

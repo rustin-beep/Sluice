@@ -59,6 +59,11 @@ internal static class Messages
         ExitCodes.Success, "—", false);
 
     // ---- denied（exit 2，retry=never） ----
+    // v2.24：自由文本理由以 DenyReasonOpen/Close 定界——McpServer.ExtractDenyReason 据此把
+    // deny_reason 提进 structuredContent（机器可读，防宿主把 isError 结果按错误渲染后理由沉没）。
+    public const string DenyReasonOpen = "用户拒绝理由：\"";
+    public const string DenyReasonClose = "\"——请按此理解";
+
     public static Msg Denied(string op, string target, string preset, string? freeText) => new(
         "[Sluice·终态]",
         $"""
@@ -69,7 +74,7 @@ internal static class Messages
         2. 不要尝试获取、刷新或申请任何 GitHub 凭据或授权（包括 gh auth login、device flow、打开浏览器授权页）；
         3. 如认为该操作仍有必要：用一句话向用户说明目的，等待用户明确指示，不要自行重试；
         4. 若任务其余部分不依赖本操作，继续执行其余部分。
-        {(freeText is { Length: > 0 } ? $"用户拒绝理由：\"{freeText}\"——请按此理解；retry 语义以上方预设为准。" : "")}
+        {(freeText is { Length: > 0 } ? $"{DenyReasonOpen}{freeText}{DenyReasonClose}；retry 语义以上方预设为准。" : "")}
         {PresetGuidance(preset)}
         """,
         ExitCodes.Denied, "never", true);
