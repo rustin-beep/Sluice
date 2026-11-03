@@ -141,6 +141,19 @@ internal static class Messages
         """,
         ExitCodes.SealViolation, "wait_user", true);
 
+    // ---- notice credential helper（v2.19，§9 消息型 helper）：git 索要凭据的那一刻拦下并指路。
+    //      不持凭据不供凭据（stdout 永不输出 username=/password=），只打 stderr 文案后非零退出。
+    //      exit 4 / change_approach：与 policy_reject 同族——"直推 git"这条路被永久禁止，消息点名允许的替代。 ----
+    public static Msg Notice(string host) => new(
+        "[Sluice·终态]",
+        $"""
+        git 向 {host} 索要凭据被拒：本环境的 GitHub 凭据只存在 Sluice 闸门内，git 直连拿不到任何凭据。
+        1. push 场景：改用 sluice push --remote origin --refspec <分支>——将弹出批准窗口由用户决定（不要加 --force）；
+        2. 不要尝试 gh auth login、device flow、浏览器授权或任何获取/写入凭据的方式；
+        3. fetch/pull 公开库无需凭据不受影响；私有库只读请让用户处理（sluice api 可查，读通道无需批准）。
+        """,
+        ExitCodes.PolicyReject, "change_approach", true);
+
     // ---- not_initialized（exit 8，retry=wait_user） ----
     public static Msg NotInitialized() => new(
         "[Sluice]",
@@ -683,6 +696,7 @@ internal static class Messages
         ("cooldown",  Cooldown(DateTime.Today.AddMinutes(10))),
         ("consent",   ConsentFailed("pr_comment", "rustin-beep/Vitro#5")),
         ("seal",      SealViolation("凭据管理器：git:https://github.com")),
+        ("notice",    Notice("github.com")),
         ("notinit",   NotInitialized()),
         ("credexp",   CredentialExpired("HTTP 401")),
         ("badreq",    BadRequest("pr_comment 缺少 --number")),

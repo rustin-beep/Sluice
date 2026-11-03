@@ -93,8 +93,9 @@ internal static class SetupCommand
 
         Console.WriteLine($"已保存 vault：{Path.Combine(dir, "token.bin")}");
         Console.WriteLine();
-        Console.WriteLine("最后一步（承重墙）：运行 sluice seal --fix 封堵环境里的直连凭据，");
-        Console.WriteLine("之后 agent 的一切 GitHub 写操作都只能走 sluice。");
+        Console.WriteLine("最后两步（承重墙）：");
+        Console.WriteLine("  1. sluice seal --fix   ——封堵环境里的直连凭据；");
+        Console.WriteLine("  2. sluice setup --install ——安装 notice credential helper（git 直推 GitHub 时得到指引进 sluice 的消息，而非裸错）。");
         return 0;
     }
 
@@ -166,5 +167,92 @@ internal static class SetupCommand
         foreach (var item in after)
             Console.WriteLine($"  ✗ {item}");
         return ExitCodes.SealViolation;
+    }
+
+    // ---------- sluice setup --install（v2.19，§9 notice 安装器） ----------
+
+    /// <summary>
+    /// 把本 exe 注册为全局 gitconfig 的 github.com 专属 credential helper（notice 模式）。
+    /// 外科手术式（与 SSH 屏蔽块同纪律）：只动 credential.https://github.com.helper——先置空串
+    /// （清空该 URL 从全局继承的 helper 链——GCM 对 github.com 不再应答，其他 host 不受影响），
+    /// 再 add 本 exe notice。git 直推 github.com 将看到 §8 指引文案而非凭据 UI/静默凭据。
+    /// 边界：`git -c credential.helper=…` 显式覆盖可绕过（T2 形状，§9 原文照录，不防）。
+    /// </summary>
+    public static int InstallNotice()
+    {
+        var exe = Environment.ProcessPath;
+        if (exe is null || !File.Exists(exe))
+        {
+            Console.Error.WriteLine("[Sluice] 无法定位自身 exe，安装中止（未产生任何变更）。");
+            return ExitCodes.Internal;
+        }
+        if (exe.Contains(' '))
+        {
+            // gitconfig 的 helper 值经 shell 分词——含空格路径需引号转义，宁拒不装错
+            Console.Error.WriteLine($"[Sluice] 发布路径含空格（{exe}），helper 值转义易错，安装中止。");
+            Console.Error.WriteLine("[Sluice] 请把 sluice.exe 发布/复制到无空格路径后重跑 setup --install。");
+            return ExitCodes.Internal;
+        }
+        var fwd = exe.Replace('\\', '/');
+        const string key = "credential.https://github.com.helper";
+
+        var existing = GitOut("--get-all", key);
+        if (existing.Contains($"\"{fwd} notice\"", StringComparison.Ordinal) ||
+            existing.Contains($"{fwd} notice", StringComparison.Ordinal))
+        {
+            Console.WriteLine($"[Sluice] notice helper 已在位：{key} 含 {fwd} notice，无需重复安装。");
+            return 0;
+        }
+
+        // 序列（多值键不能用普通 set——gh 曾写入多条）：unset-all 清旧值（键不存在时非零，容忍）→
+        // add 空串（清 github.com 从系统层继承的 GCM helper——外科手术式，其他 host 不受影响）→ add 本 exe。
+        // 实弹教训（2026-11-03）：gh 写入的 "!gh auth git-credential" 桥接条目一并清掉——gh 登录状态下
+        // 它会给 git 直供凭据，正是 §6 要封的侧门面；GCM 弹登录 UI 的诱导面也随空串一起消灭。
+        Git("config", "--global", "--unset-all", key);
+        if (Git("config", "--global", "--add", key, "") != 0 ||
+            Git("config", "--global", "--add", key, $"{fwd} notice") != 0)
+        {
+            Console.Error.WriteLine("[Sluice] git config 写入失败（git 不在 PATH？），安装中止（未产生任何变更）。");
+            return ExitCodes.Internal;
+        }
+
+        Console.WriteLine("[Sluice] 已安装 notice credential helper（仅作用 github.com；其他 host 的既有 helper 不受影响）。");
+        Console.WriteLine($"""
+            验证：printf 'protocol=https\nhost=github.com\n\n' | git credential fill
+            → stderr 应出现 [Sluice·终态] 指引，且输出无 password= 行。
+            卸载：git config --global --unset-all {key}
+            """);
+        return 0;
+    }
+
+    private static int Git(params string[] args)
+    {
+        try
+        {
+            // 空串参数必须显式成 ""（join 后消失会让 git 误把 key 当 value）；
+            // 含空格的参数（helper 值 "<exe> notice"）必须整体加引号，否则 git 收到多余参数
+            var cmd = string.Join(' ', args.Select(a =>
+                a.Length == 0 ? "\"\"" : a.Contains(' ') ? $"\"{a}\"" : a));
+            var psi = new System.Diagnostics.ProcessStartInfo("git", cmd)
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            using var p = System.Diagnostics.Process.Start(psi);
+            p?.WaitForExit(15000);
+            return p?.ExitCode ?? -1;
+        }
+        catch { return -1; }
+    }
+
+    private static string GitOut(string flag, string key)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("git", $"config --global {flag} {key}")
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            using var p = System.Diagnostics.Process.Start(psi);
+            var s = p?.StandardOutput.ReadToEnd();
+            p?.WaitForExit(15000);
+            return s ?? "";
+        }
+        catch { return ""; }
     }
 }

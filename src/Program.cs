@@ -87,11 +87,40 @@ internal static class Program
             ["setup", "--token-file", var f] => SetupCommand.SetupAsync(f).GetAwaiter().GetResult(),
             ["seal"] => SetupCommand.Seal(fix: false),
             ["seal", "--fix"] => SetupCommand.Seal(fix: true),
+            ["setup", "--install"] => SetupCommand.InstallNotice(),
+            ["notice", .. var rest] => RunNotice(rest),
             ["selftest"] => Selftest.Run(),
             ["api", .. var rest] => RunApi(rest),
             ["mcp", .. var rest] => McpServer.Run(rest),
             [var verb, ..] => BadVerb(verb),
         };
+    }
+
+    /// <summary>
+    /// §9 notice 消息型 credential helper（v2.19 落地）：git 索要凭据（get）的那一刻不给凭据、
+    /// 打 §8 指引文案到 stderr、非零退出——agent 直推 git 看到的不再是裸 "could not read Username"
+    /// 而是"改走 sluice push + 禁止获取凭据"的可行动消息。不持凭据不供凭据（stdout 永不输出
+    /// username=/password=）；store/erase 静默成功（无状态可存可清）。每次 get 落审计（op=notice，
+    /// result=not_executed）——notice 触发 = 有进程在尝试 git 直连 GitHub，T3 重试风暴的第一手信号。
+    /// 已知边界（§9 原文照录）：`git -c credential.helper=` 显式清空可绕过 notice——T2 形状的行为，不防。
+    /// </summary>
+    private static int RunNotice(string[] rest)
+    {
+        if (rest.FirstOrDefault() is "store" or "erase") return ExitCodes.Success;
+        var host = "github.com";
+        try
+        {
+            // git credential 协议：stdin 为 key=value 行、空行结束。只取 host 指路用；
+            // 其余键（含可能的 username）一概不读不存不回显
+            string? l;
+            while ((l = Console.In.ReadLine()) is not null && l.Length > 0)
+                if (l.StartsWith("host=", StringComparison.Ordinal)) host = l["host=".Length..];
+        }
+        catch { /* stdin 不可读（异常调用）→ 默认 host 照常指路 */ }
+        Audit.Append("notice", host, null, null, "notice", result: "not_executed");
+        var m = Messages.Notice(host);
+        Messages.Write(m);
+        return m.ExitCode;
     }
 
     private static int Usage()
@@ -170,7 +199,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.18");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.19");
         return 0;
     }
 

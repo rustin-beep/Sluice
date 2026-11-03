@@ -62,6 +62,7 @@ internal static class Selftest
         ("pushratelimited", ExitCodes.RateLimitWait, "wait_until"), // v2.16：push 序列限流——分支未动、已传 blob 幂等（事实句措辞异于"未执行"族，不进该检查表）
         ("writeforbidden",  ExitCodes.BadRequest,    "after_fix"),  // v2.16：comment/pr_create 403 自 credential_expired 拆出（v2.5 漏网）
         ("commentrejected", ExitCodes.BadRequest,    "after_fix"),  // v2.16：服务端 404/422 拒绝 ≠ internal（原经 InternalPost 谎记）
+        ("notice",          ExitCodes.PolicyReject,  "change_approach"), // v2.19：git 直连索凭据→指路 sluice push（不供凭据，stdout 永无 password=）
     ];
 
     private static readonly HashSet<string> ValidRetry =
