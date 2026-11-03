@@ -101,13 +101,38 @@ internal static class Gate
             }
             catch (Exception ex)
             {
-                // UI 线程任何崩溃都收敛为 Crashed，让主线程给出 [Sluice·终态] internal 消息而非裸崩
-                Result = new Outcome.Crashed($"{ex.GetType().Name}: {ex.Message}");
+                // UI 线程任何崩溃都收敛为 Crashed，让主线程给出 [Sluice·终态] internal 消息而非裸崩。
+                // 诊断保真（v2.18）：TypeInitializationException 的外层 Message 是通用占位句、不含出错
+                // 类型——10-30×2 / 11-01×4 六次复发只留一句话无法归因。内层异常链 + 最内层堆栈帧
+                // （AOT 帧名含类型与静态构造器名，是唯一定位线索）随身进审计与 stderr，下次复发当场可定位。
+                var detail = DescribeCrash(ex);
+                Result = new Outcome.Crashed(detail);
+                try { Console.Error.WriteLine($"[Sluice] gate 线程异常详情：{detail}"); } catch { }
             }
         });
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
         return Result ?? new Outcome.TimedOut();
+    }
+
+    /// <summary>
+    /// v2.18 崩溃诊断保真（纯函数，selftest 锁）：异常链外→内扁平化（" &lt;- " 连接），
+    /// 附最内层堆栈前 3 帧（" | " 连接），截 600 字符。静态构造器崩溃的类型名只存在于
+    /// InnerException 与其堆栈帧里——只记外层类型名+Message 等于每次复发都从零开始。
+    /// </summary>
+    internal static string DescribeCrash(Exception ex)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (var e = (Exception?)ex; e is not null; e = e.InnerException)
+        {
+            if (sb.Length > 0) sb.Append(" <- ");
+            sb.Append(e.GetType().FullName).Append(": ").Append(e.Message);
+        }
+        var stack = ex.GetBaseException().StackTrace ?? ex.StackTrace ?? "";
+        var frames = string.Join(" | ", stack.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Where(l => l.Contains(" at ")).Take(3).Select(l => l.Trim()));
+        if (frames.Length > 0) sb.Append(" @ ").Append(frames);
+        return sb.Length > 600 ? sb.ToString(0, 600) + "…" : sb.ToString();
     }
 }

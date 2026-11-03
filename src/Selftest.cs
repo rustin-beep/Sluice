@@ -69,7 +69,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -127,6 +127,7 @@ internal static class Selftest
         fail += SurfaceLock();
         fail += PushLogicChecks();
         fail += LabelChecks();
+        fail += CrashDetailChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -322,6 +323,35 @@ internal static class Selftest
         Eq("当前空无摘除", Program.LabelRemovals([], ["bug"]).Length, 0);
 
         Console.WriteLine(fail == 0 ? "标签锁通过。" : "标签锁有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>v2.18 崩溃诊断保真锁：DescribeCrash 必须保住嵌套异常链的每一层类型名
+    /// （TypeInitializationException 外层 Message 是通用占位句，类型名只在内层），
+    /// 且有截断上限（审计行不失控）。缘起：10-30×2 / 11-01×4 六次 internal_gate_crash
+    /// 全部只留一句话、无法归因——诊断信息本身成为不变量。</summary>
+    private static int CrashDetailChecks()
+    {
+        Console.WriteLine("--- 崩溃诊断锁（v2.18：DescribeCrash 异常链保真 / 截断上限）---");
+        int fail = 0;
+        void Ok(bool cond, string what)
+        {
+            if (!cond) { fail++; Console.WriteLine($"!! {what}"); }
+        }
+
+        var deepest = new DllNotFoundException("libEGL");
+        var inner = new InvalidOperationException("静态构造失败", deepest);
+        var wrapped = new TypeInitializationException("Sluice.SomeType", inner);
+        var s = Gate.DescribeCrash(wrapped);
+        Ok(s.Contains("TypeInitializationException"), "丢外层类型名");
+        Ok(s.Contains("InvalidOperationException"), "丢内层类型名（链断）");
+        Ok(s.Contains("DllNotFoundException"), "丢最内层类型名（链断）");
+        Ok(s.Contains(" <- "), "缺链分隔符");
+        Ok(s.Contains("libEGL"), "丢最内层消息");
+
+        Ok(Gate.DescribeCrash(new Exception(new string('x', 5000))).Length <= 602, "超长未截断（审计行失控）");
+
+        Console.WriteLine(fail == 0 ? "崩溃诊断锁通过。" : "崩溃诊断锁有不符项（见上）。");
         return fail;
     }
 
