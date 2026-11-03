@@ -255,6 +255,133 @@ internal static class SetupCommand
         catch { return ""; }
     }
 
+    // ---------- sluice setup --install-snippet（v2.21，§8.4 AGENTS.md 片段安装器） ----------
+
+    /// <summary>片段正文 = plan-lite §8.4（v2.21 扩全动词面 + github_write 双前门表述）。
+    /// 与 §8.2/Messages 同纪律：改 §8.4 必须同步本常量——selftest 不锁散文，靠评审。标记块幂等。</summary>
+    internal const string Snippet = """
+        <!-- sluice-rules BEGIN（由 sluice setup --install-snippet 维护，手改会被覆盖） -->
+        ## Sluice 规则（必须遵守）
+        1. 一切 GitHub 写操作（评论 / PR 创建·合并·重开·关闭·编辑·评审 / push / issue 创建·关闭·重开·标签 / tag / release / 分支删除 / workflow 手动触发）只能经 `sluice` CLI 或 `github_write` 工具（MCP）执行；直接 git push / gh / curl 写 GitHub 会因无凭据失败（git 直连会收到 [Sluice·终态] notice 指引）。
+        2. 输出中出现 `[Sluice·终态]`：这是最终结果。严格按消息内"要求"与 retry 语义执行；凡 retry=never / wait_user / wait_until / change_approach：禁止重试、禁止换方法、禁止尝试获取凭据或发起任何授权流程（含 gh auth login / device flow / 浏览器授权页）。
+        3. 仅 retry=after_fix / retry=retry_ok 允许按消息说明修正或重试同一命令。
+        4. 收到 seal_violation：把消息原文转告用户，暂停所有写操作。
+        5. 非零退出且输出中没有任何 `[Sluice]` 字样：视为结果未知（Sluice 可能崩溃于执行中途），按"先查证、勿重发"处理。
+        6. 一切 GitHub API 读操作用 `sluice api`（读有日志、可核对，防"我读过"幻觉）；git fetch/pull 使用环境中的只读凭据。
+        <!-- sluice-rules END -->
+        """;
+
+    /// <summary>把 §8.4 片段写进当前工作区 AGENTS.md。标记块幂等（重跑=刷新，手改会被覆盖）；
+    /// 无 AGENTS.md 则新建。装完提示用户把文件提交进仓库（§8.4 的可见性对人才有效）。</summary>
+    public static int InstallSnippet()
+    {
+        var path = Path.Combine(Directory.GetCurrentDirectory(), "AGENTS.md");
+        const string begin = "<!-- sluice-rules BEGIN";
+        const string end = "<!-- sluice-rules END -->";
+        var block = Snippet + Environment.NewLine;
+        if (File.Exists(path))
+        {
+            var txt = File.ReadAllText(path);
+            var s = txt.IndexOf(begin, StringComparison.Ordinal);
+            if (s >= 0)
+            {
+                var e = txt.IndexOf(end, StringComparison.Ordinal);
+                if (e < 0) { Console.Error.WriteLine("[Sluice] AGENTS.md 有 BEGIN 无 END 标记（手改损坏），请人工修复后重跑。"); return ExitCodes.Internal; }
+                e += end.Length;
+                // 吃掉 END 行尾换行，块自带结尾换行
+                File.WriteAllText(path, txt[..s] + block + txt[e..].TrimStart('\r', '\n'));
+                Console.WriteLine($"[Sluice] 已刷新既有片段（{path}）。");
+            }
+            else
+            {
+                File.AppendAllText(path, Environment.NewLine + Environment.NewLine + block);
+                Console.WriteLine($"[Sluice] 已追加片段到 {path}。");
+            }
+        }
+        else
+        {
+            File.WriteAllText(path, block);
+            Console.WriteLine($"[Sluice] 已新建 {path} 并写入片段。");
+        }
+        Console.WriteLine("[Sluice] 记得把 AGENTS.md 提交进仓库——片段对 agent 的约束力来自项目可见性。");
+        return 0;
+    }
+
+    // ---------- sluice doctor（v2.21，V1.5 项：一次性健康汇总） ----------
+
+    /// <summary>六项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / 哨兵任务。
+    /// 全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位（seal --fix / setup --install / sentinel-install）。</summary>
+    public static int Doctor()
+    {
+        int bad = 0;
+        void Item(bool ok, string name, string detail)
+        {
+            Console.WriteLine($"  {(ok ? "✓" : "✗")} {name}{(detail.Length > 0 ? $"：{detail}" : "")}");
+            if (!ok) bad++;
+        }
+
+        Console.WriteLine("Sluice doctor —— 只读健康检查（修复动作见各项指引）");
+        var v = typeof(Program).Assembly.GetName().Version;
+        Console.WriteLine($"  · sluice v{v?.ToString(3)} · {Program.BuildStamp}");
+
+        // vault：存在性 + 形态（V1 Hello 派生 / SLCV2 静默）
+        if (!TokenStore.Exists)
+            Item(false, "vault", "token.bin 不存在——运行 sluice setup");
+        else if (TokenStore.IsDpapiVault)
+            Item(true, "vault", "SLCV2 静默格式（DPAPI，批准=桌面点击，§14 L1 让步在册）");
+        else
+        {
+            try
+            {
+                var ch = TokenStore.PeekChallenge();
+                Item(ch.Length > 0, "vault", ch.Length > 0 ? "V1 Hello 派生格式（批准=Windows Hello）" : "V1 格式但挑战缺失——重跑 setup");
+            }
+            catch (Exception ex) { Item(false, "vault", $"读取异常（{ex.GetType().Name}）——重跑 setup"); }
+        }
+
+        // config.json 可解析
+        try
+        {
+            var cfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "config.json");
+            if (!File.Exists(cfg)) Item(true, "config", "缺省（默认值生效）");
+            else
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(cfg));
+                Item(true, "config", "可解析");
+            }
+        }
+        catch (Exception ex) { Item(false, "config", $"解析失败（{ex.Message}）——人工检查"); }
+
+        // seal 预检（写路径同款轻量检查）
+        var viol = SealCheck.Run();
+        Item(viol.Count == 0, "seal 预检", viol.Count == 0 ? "无违规" : $"{viol.Count} 处违规——sluice seal --fix");
+
+        // notice helper
+        const string key = "credential.https://github.com.helper";
+        var helpers = GitOut("--get-all", key);
+        var noticeIn = helpers.Contains("notice", StringComparison.Ordinal);
+        var ghBridge = helpers.Contains("!gh", StringComparison.Ordinal);
+        Item(noticeIn && !ghBridge, "notice helper", noticeIn
+            ? (ghBridge ? "在位但 gh 桥接条目重现——重跑 setup --install" : "在位（仅作用 github.com）")
+            : "不在位——sluice setup --install");
+
+        // 哨兵任务
+        bool taskOk;
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/Query /TN \"Sluice Sentinel\"")
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            p.WaitForExit(15000);
+            taskOk = p.ExitCode == 0;
+        }
+        catch { taskOk = false; }
+        Item(taskOk, "哨兵任务", taskOk ? "已注册（每 5 分钟）" : "未注册——sluice sentinel-install");
+
+        Console.WriteLine(bad == 0 ? "结论：全绿。" : $"结论：{bad} 项需处理（见上 ✗）。");
+        return bad == 0 ? 0 : 1;
+    }
+
     // ---------- sluice sentinel-install（v2.20，§6 哨兵） ----------
 
     /// <summary>

@@ -28,6 +28,8 @@ sluice.exe setup                          # 粘贴 PAT → 校验 → Windows He
 sluice.exe seal --fix                     # 封堵侧门：凭据管理器 / gh / git-credentials / SSH / 环境变量
 sluice.exe setup --install                # 装 notice credential helper（git 直推 GitHub 得到指引进 sluice 的消息，而非裸错/GCM 登录窗）
 sluice.exe sentinel-install               # 哨兵：每 5 分钟 seal 预检，违规弹 Windows 通知（封 device flow"当场成功"窗）
+sluice.exe setup --install-snippet        # 把 §8.4 规则片段写进工作区 AGENTS.md（标记块幂等）
+sluice.exe doctor                         # 六项只读健康检查（vault/seal/notice/哨兵…）
 sluice.exe selftest                       # 消息表与 exit code 自检
 sluice.exe --version                      # 构建戳（时间 + git sha[+dirty] + plan-lite 版本）——排障先看这个
 ```
