@@ -96,7 +96,13 @@ internal static class Program
             ["doctor"] => SetupCommand.Doctor(),
             ["notice", .. var rest] => RunNotice(rest),
             ["selftest"] => Selftest.Run(),
-            ["status", var receipt] => RunStatus(receipt),
+            // v2.27：`["status", var receipt]` 只匹配恰两元素——缺参/多参落 BadVerb 报"未知命令
+            // status"且动词清单不含 status、还提示重新 publish：已知动词的参数错误被引去重新发布。
+            // 单列 arity 收口，走 ErrBad 用法句（after_fix 可自修，不是版本问题）
+            ["status", .. var rest] => rest.Length == 1 ? RunStatus(rest[0]) : ErrBad(
+                rest.Length == 0
+                    ? "status 需要 pending 返回里的 receipt（16 位十六进制），示例：sluice status a1b2c3d4e5f60718"
+                    : $"status 只接受一个 receipt 参数，收到 {rest.Length} 个——示例：sluice status a1b2c3d4e5f60718"),
             ["api", .. var rest] => RunApi(rest),
             ["mcp", .. var rest] => McpServer.Run(rest),
             [var verb, ..] => BadVerb(verb),
@@ -105,16 +111,42 @@ internal static class Program
 
     // ---------- sluice status（v2.25 · §9.7 pending 的收割口：凭 receipt 读审计终态行） ----------
 
-    /// <summary>终态 → status 家族映射（纯函数，selftest 锁）：denied/timeout 复用原决策消息
-    /// （拒绝理由原文与"必须遵守"条款原样再现——pending 收割的意义所在），approved 族报事实句，
-    /// 其余照录决策字面交回用户。</summary>
+    /// <summary>终态 → status 家族映射（纯函数，selftest 锁 + 收割↔live 反向锁）：denied/timeout/
+    /// consent_failed/rate_limited 复用原决策消息（拒绝理由、Hello 指引、限流等待语义原样再现——
+    /// pending 收割的意义所在），approved/up_to_date 报事实句（后者 v2.27 单列 StatusUpToDate），
+    /// 其余照录决策字面交回用户。v2.27 缘起：consent_failed 与 rate_limited 都是批准后才落审计的
+    /// decision——恰落在 pending 收割窗，原映射只盖四族把它们收割成 exit 21/isError=true/"勿重发"，
+    /// 与 live 同 decision 的 6·wait_user / 22·wait_until 指引相反（落哪边取决于人是否 15s 内点完，
+    /// 非确定性契约）。cooldown 不映射：无生产审计行且未接线，映射而无渲染分支只会造出新分叉，
+    /// 接线时同批进。</summary>
     internal static int StatusFamily(string decision) => decision switch
     {
         "denied" => ExitCodes.Denied,
         "timeout" => ExitCodes.Timeout,
         "approved" or "up_to_date" => ExitCodes.Success,
+        "consent_failed" => ExitCodes.ConsentFailed,
+        "rate_limited" => ExitCodes.RateLimitWait,
         _ => ExitCodes.Unknown,
     };
+
+    /// <summary>v2.27 收割渲染辅助（纯函数，selftest 锁）：rate_limited 审计 result 形如
+    /// "http_403:{what}"（push 为 "not_executed:{what}"——PushFail 原有形态，what 即 RateLimitWhat
+    /// 结论）。冒号后是结论原文，收割复用 WriteRateLimited/PushRateLimited 需要；≤v0.7.2 旧行只存
+    /// "http_403"（无结论），回退通用等待句（RateLimitWhat 四种输出均不含 ASCII 冒号，首冒号切分安全）。</summary>
+    internal static string RateLimitWhatOf(string result)
+    {
+        var i = result.IndexOf(':');
+        return i >= 0 && i + 1 < result.Length ? result[(i + 1)..] : "限流拦截（≤v0.7.2 旧审计行未存结论——按等待语义处理，勿密集重试）";
+    }
+
+    /// <summary>v2.27：从 "http_{st}:…" 前缀取 HTTP 状态码（WriteRateLimited 渲染需要）；
+    /// 非 http_ 前缀（push 形态/损坏行）回 0——仅渲染损耗，不参与判定。</summary>
+    internal static int HttpStOf(string result)
+    {
+        if (!result.StartsWith("http_", StringComparison.Ordinal)) return 0;
+        var digits = new string(result[5..].TakeWhile(char.IsDigit).ToArray());
+        return int.TryParse(digits, out var st) ? st : 0;
+    }
 
     private static int RunStatus(string receipt)
     {
@@ -137,8 +169,23 @@ internal static class Program
                 Messages.Write(Messages.Timeout(l.Op, l.Target ?? "?", Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case ExitCodes.Success:
-                Messages.Write(Messages.StatusDone(l.Op, l.Target ?? "?", l.Result));
+                // v2.27：up_to_date 单列——"已获批准并执行"对它不是事实（远端已在目标提交，无需执行）
+                Messages.Write(l.Decision == "up_to_date"
+                    ? Messages.StatusUpToDate(l.Op, l.Target ?? "?", l.Result)
+                    : Messages.StatusDone(l.Op, l.Target ?? "?", l.Result));
                 return ExitCodes.Success;
+            case ExitCodes.ConsentFailed:
+                // v2.27：收割与 live 同 decision 同族——"等用户口头让你再试时重跑"原样再现
+                Messages.Write(Messages.ConsentFailed(l.Op, l.Target ?? "?"));
+                return ExitCodes.ConsentFailed;
+            case ExitCodes.RateLimitWait:
+                // v2.27：限流等待"按窗口等后重跑"原样再现；what 结论自 v2.27 起入审计 result
+                // （≤v0.7.2 旧行回退通用句）。push 单列复用 PushRateLimited——"分支未动、已传
+                // blob 内容寻址幂等"的事实句措辞，不谎称零副作用
+                Messages.Write(l.Op == "push"
+                    ? Messages.PushRateLimited(l.Repo ?? "?", l.Target ?? "?", RateLimitWhatOf(l.Result))
+                    : Messages.WriteRateLimited(l.Op, l.Target ?? "?", HttpStOf(l.Result), RateLimitWhatOf(l.Result)));
+                return ExitCodes.RateLimitWait;
             default:
                 Messages.Write(Messages.StatusOther(l.Op, l.Target ?? "?", l.Decision, l.Result));
                 return ExitCodes.Unknown;
@@ -250,14 +297,16 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.26");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.27");
         return 0;
     }
 
     private static int BadVerb(string verb)
     {
+        // v2.27：动词清单补 status / notice / doctor（评审 P3：清单不含已有动词时，
+        // "未知命令"提示会与 Usage 自相矛盾）；按字母序插各自位置
         Messages.Write(Messages.BadRequest(
-            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / review / tag / release / workflow / branch / api / mcp / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
+            $"未知命令 \"{verb}\"；可用动词：setup / seal / comment / push / pr / issue / review / tag / release / workflow / branch / api / status / notice / doctor / mcp / selftest。{BuildStamp}——若你需要的是较新版本的动词，说明正在使用旧构建，请重新 dotnet publish"));
         return ExitCodes.BadRequest;
     }
 
@@ -807,7 +856,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(st, body) is { } what)
                     {
                         Audit.Append(op, repo, auditTarget, sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                            result: $"http_{st}");
+                            result: $"http_{st}:{what}");
                         Messages.Write(Messages.WriteRateLimited(op, msgTarget, st, what));
                         return ExitCodes.RateLimitWait;
                     }
@@ -976,7 +1025,7 @@ internal static class Program
         if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
         {
             Audit.Append("pr_comment", repo, $"#{number}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                result: $"http_{r.Status}");
+                result: $"http_{r.Status}:{what}");
             Messages.Write(Messages.WriteRateLimited("pr_comment", target, r.Status, what));
             return ExitCodes.RateLimitWait;
         }
@@ -1290,7 +1339,7 @@ internal static class Program
                 if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
                 {
                     Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "rate_limited",
-                        consent: TokenStore.ConsentChannel, result: $"http_{r.Status}");
+                        consent: TokenStore.ConsentChannel, result: $"http_{r.Status}:{what}");
                     Messages.Write(Messages.WriteRateLimited("pr_create", target, r.Status, what));
                     return ExitCodes.RateLimitWait;
                 }
@@ -1554,7 +1603,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(r.Status, r.Reason) is { } what)
                     {
                         Audit.Append("pr_merge", repo, $"#{number}", sha, "rate_limited",
-                            consent: TokenStore.ConsentChannel, result: $"http_{r.Status}");
+                            consent: TokenStore.ConsentChannel, result: $"http_{r.Status}:{what}");
                         Messages.Write(Messages.WriteRateLimited("pr_merge", target, r.Status, what));
                         return ExitCodes.RateLimitWait;
                     }
@@ -1718,7 +1767,7 @@ internal static class Program
                 // v2.16：限流嗅探先行（403 secondary/429 ≠ 保护/权限拒）；429 落下方 default 同查
                 case 403 when GitHubApi.RateLimitWhat(st, body) is { } what:
                     Audit.Append("branch_delete", repo, branch, sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                        result: $"http_{st}");
+                        result: $"http_{st}:{what}");
                     Messages.Write(Messages.WriteRateLimited("branch_delete", target, st, what));
                     return ExitCodes.RateLimitWait;
                 case >= 500:
@@ -1742,7 +1791,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(st, body) is { } what2)
                     {
                         Audit.Append("branch_delete", repo, branch, sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                            result: $"http_{st}");
+                            result: $"http_{st}:{what2}");
                         Messages.Write(Messages.WriteRateLimited("branch_delete", target, st, what2));
                         return ExitCodes.RateLimitWait;
                     }
@@ -1926,7 +1975,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(st, body) is { } what)
                     {
                         Audit.Append("pr_reopen", repo, $"#{number}", sha, "rate_limited",
-                            consent: TokenStore.ConsentChannel, result: $"http_{st}");
+                            consent: TokenStore.ConsentChannel, result: $"http_{st}:{what}");
                         Messages.Write(Messages.WriteRateLimited("pr_reopen", target, st, what));
                         return ExitCodes.RateLimitWait;
                     }
@@ -2108,7 +2157,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(st, body) is { } what)
                     {
                         Audit.Append("issue_close", repo, $"#{number}", sha, "rate_limited",
-                            consent: TokenStore.ConsentChannel, result: $"http_{st}");
+                            consent: TokenStore.ConsentChannel, result: $"http_{st}:{what}");
                         Messages.Write(Messages.WriteRateLimited("issue_close", target, st, what));
                         return ExitCodes.RateLimitWait;
                     }
@@ -2997,7 +3046,7 @@ internal static class Program
                 case 403 when GitHubApi.RateLimitWhat(st, rbody) is { } what:
                     // v2.16：限流嗅探先行——DispatchForbidden 的"重发 PAT"指引对限流是死方子；429 落 default 同查
                     Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                        result: $"http_{st}");
+                        result: $"http_{st}:{what}");
                     Messages.Write(Messages.WriteRateLimited("workflow_dispatch", $"{repo}@{workflow}", st, what));
                     return ExitCodes.RateLimitWait;
                 case 403:
@@ -3022,7 +3071,7 @@ internal static class Program
                     if (GitHubApi.RateLimitWhat(st, rbody) is { } what2)
                     {
                         Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "rate_limited", consent: TokenStore.ConsentChannel,
-                            result: $"http_{st}");
+                            result: $"http_{st}:{what2}");
                         Messages.Write(Messages.WriteRateLimited("workflow_dispatch", $"{repo}@{workflow}", st, what2));
                         return ExitCodes.RateLimitWait;
                     }

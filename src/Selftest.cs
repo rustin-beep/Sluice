@@ -66,6 +66,7 @@ internal static class Selftest
         ("mcppending",      ExitCodes.PendingGate,   "wait_until"), // v2.25：批准窗未决——非终态，receipt 收割（CLI 不产此码，MCP server 合成）
         ("statuspending",   ExitCodes.PendingGate,   "wait_until"), // v2.25：status 查询无终态行（同 23 档，函数性）
         ("statusdone",      ExitCodes.Success,       "—"),          // v2.25：status 收割已批准族
+        ("statusupodate",   ExitCodes.Success,       "—"),          // v2.27：up_to_date 单列（"已获批准并执行"对它是假话）
         ("statusother",     ExitCodes.Unknown,       "wait_user"),  // v2.25：status 收割其余终态（照录决策字面）
         ("serverstale",     ExitCodes.Internal,      "wait_user"),  // v2.26：僵尸 server 自曝——重启会话后重发（与 internal 族同档：技术失败，交回用户）
     ];
@@ -75,7 +76,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26 僵尸自曝锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26 僵尸自曝锁 / v2.27 收割一致锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -251,13 +252,16 @@ internal static class Selftest
                                                    (-1, DateTime.MinValue)), true);
 
         // v2.25：status 终态映射锁——pending 收割后 exit/retry 必须与原决策同族
-        //（denied→2/never、timeout→3/wait_user、approved/up_to_date→0/—、其余→21/wait_user）
+        //（denied→2/never、timeout→3/wait_user、consent_failed→6/wait_user、rate_limited→22/wait_until、
+        // approved/up_to_date→0/—、未映射→21/wait_user；v2.27 扩表：原四族映射把 consent_failed/
+        // rate_limited 收割成 21/isError=true"勿重发"，与 live 指引相反——cooldown 无生产审计行
+        // 且未接线，不映射，接线时同批进）
         foreach (var (decision, want) in new[]
                  {
                      ("denied", ExitCodes.Denied), ("timeout", ExitCodes.Timeout),
                      ("approved", ExitCodes.Success), ("up_to_date", ExitCodes.Success),
+                     ("consent_failed", ExitCodes.ConsentFailed), ("rate_limited", ExitCodes.RateLimitWait),
                      ("not_found", ExitCodes.Unknown), ("http_405", ExitCodes.Unknown),
-                     ("rate_limited", ExitCodes.Unknown),
                  })
             if (Program.StatusFamily(decision) != want)
             { fail++; Console.WriteLine($"!! StatusFamily({decision}) = {Program.StatusFamily(decision)} ≠ {want}"); }
@@ -265,6 +269,40 @@ internal static class Selftest
             || McpServer.RetryOf(Program.StatusFamily("timeout")) != "wait_user"
             || McpServer.RetryOf(Program.StatusFamily("approved")) != "—")
         { fail++; Console.WriteLine("!! status 收割的 exit→retry 必须与原决策族一致"); }
+
+        // v2.27：收割↔live 反向锁——同一 decision 经 status 收割（>15s 未决路径）与 live 直返
+        //（≤15s 快路径）的 exit/retry 必须同族：分叉=非确定性契约（落哪边取决于人是否 15s 内点完）。
+        // 缘起：v2.25 收割面只映射四族，consent_failed/rate_limited 落 21/isError=true"勿重发"，
+        // 与 live 的 wait_user/wait_until"可重试"指引相反——v2.24 立的"用户决策族不得标错误"
+        // 纪律没照到收割面，本锁把两面焊死（live 样例即基准，两表再漂移当场红）
+        foreach (var (decision, liveNames) in new[]
+                 {
+                     ("denied", new[] { "denied" }),
+                     ("timeout", new[] { "timeout" }),
+                     ("consent_failed", new[] { "consent" }),
+                     ("rate_limited", new[] { "writeratelimited", "pushratelimited" }),
+                     ("approved", new[] { "success", "pushdone" }),
+                     ("up_to_date", new[] { "pushuptodate" }),
+                 })
+            foreach (var live in Messages.AllSamples().Where(s => liveNames.Contains(s.Name))
+                .Select(s => s.Sample))
+            {
+                if (Program.StatusFamily(decision) != live.ExitCode)
+                { fail++; Console.WriteLine($"!! 收割 exit 分叉：StatusFamily({decision})={Program.StatusFamily(decision)} ≠ live {live.ExitCode}"); }
+                if (McpServer.RetryOf(Program.StatusFamily(decision)) != live.Retry)
+                { fail++; Console.WriteLine($"!! 收割 retry 分叉：{decision} 收割 {McpServer.RetryOf(Program.StatusFamily(decision))} ≠ live {live.Retry}"); }
+            }
+
+        // v2.27：收割渲染解析锁——rate_limited 审计 result 的 "http_{st}:{what}" / "not_executed:{what}"
+        //（push 形态）两种前缀都要取回结论；≤v0.7.2 旧行 "http_403"（无结论）回退通用等待句
+        Eq("收割 what 解析", Program.RateLimitWhatOf("http_403:secondary rate limit，服务端要求等待约 2 分钟"),
+           "secondary rate limit，服务端要求等待约 2 分钟");
+        Eq("收割 what push 形态", Program.RateLimitWhatOf("not_executed:API 配额（rate limit）耗尽，等待当前配额窗重置（约 1 小时内）"),
+           "API 配额（rate limit）耗尽，等待当前配额窗重置（约 1 小时内）");
+        Eq("收割 what 旧行回退非空", Program.RateLimitWhatOf("http_403") is { Length: > 0 }, true);
+        Eq("收割 st 解析", Program.HttpStOf("http_429:服务端限流（HTTP 429）——通常 1 分钟内解封，稍候重试"), 429);
+        Eq("收割 st 旧行解析", Program.HttpStOf("http_403"), 403);
+        Eq("收割 st 非 http 前缀回 0", Program.HttpStOf("not_executed:x"), 0);
 
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
         return fail;

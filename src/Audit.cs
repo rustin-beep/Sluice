@@ -17,8 +17,10 @@ internal static class Audit
     private static string? Req => Environment.GetEnvironmentVariable("SLUICE_MCP_REQ");
 
     /// <summary>status 查询用：该 req 最后一条非 api_read 审计行（终态行）；无则 null。
-    /// 同文件顺读（追加写、行级完整，逆读收益不值复杂度）。只读本地文件，无网络、无副作用。</summary>
-    public static (string Op, string? Target, string Decision, string? Preset, string? Reason, string Result)? LastFor(string req)
+    /// 同文件顺读（追加写、行级完整，逆读收益不值复杂度）。只读本地文件，无网络、无副作用。
+    /// v2.27 增返 repo：rate_limited 收割复用 PushRateLimited(repo, branch, what) 需要（push 的
+    /// 审计 target 是 branch 或重放形态 branch@旧→新，repo 另在行内 repo 字段）。</summary>
+    public static (string Op, string? Repo, string? Target, string Decision, string? Preset, string? Reason, string Result)? LastFor(string req)
     {
         try
         {
@@ -29,6 +31,7 @@ internal static class Audit
                 var r = d.RootElement;
                 if (r.TryGetProperty("op", out var op) && op.GetString() == "api_read") continue;
                 return (op.GetString() ?? "?",
+                    r.TryGetProperty("repo", out var rp) ? rp.GetString() : null,
                     r.TryGetProperty("target", out var t) ? t.GetString() : null,
                     r.TryGetProperty("decision", out var dec) ? dec.GetString() ?? "?" : "?",
                     r.TryGetProperty("reason_preset", out var p) ? p.GetString() : null,

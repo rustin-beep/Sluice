@@ -129,7 +129,8 @@ internal static class Messages
         """,
         ExitCodes.PendingGate, "wait_until", false);
 
-    /// <summary>status 查得已批准族终态（approved / up_to_date 等）——事实句照审计 result 原样。</summary>
+    /// <summary>status 查得 approved 终态——事实句照审计 result 原样（up_to_date 自 v2.27 单列
+    /// StatusUpToDate："已获批准并执行"对它不是事实——远端已在目标提交，无需执行）。</summary>
     public static Msg StatusDone(string op, string target, string result) => new(
         "[Sluice·终态]",
         $"""
@@ -139,14 +140,27 @@ internal static class Messages
         """,
         ExitCodes.Success, "—", false);
 
-    /// <summary>status 查得其余终态（denied/timeout 之外的技术失败族）——事实照录，语义按决策字面。</summary>
+    /// <summary>status 查得 up_to_date（v2.27）：批准属实、执行确无必要——单列事实句，消解
+    /// StatusDone 模板"已获批准并执行 × 审计结果 not_executed"的自相矛盾（agent 读到"执行了/没执行"二义）。</summary>
+    public static Msg StatusUpToDate(string op, string target, string result) => new(
+        "[Sluice·终态]",
+        $"""
+        终态已查得：{op} → {target} 已获批准；远端已在目标提交，无需执行，GitHub 上没有产生任何变更。
+        审计结果：{result}
+        无需重试，也无需再用其他命令验证；无需再查 status。
+        """,
+        ExitCodes.Success, "—", false);
+
+    /// <summary>status 查得其余终态（收割映射族之外的技术失败族）——事实照录，语义按决策字面。
+    /// v2.27：consent_failed / rate_limited 已进映射族（收割与 live 同 decision 同 exit/retry/isError），
+    /// 本消息只剩真正未映射的 decision（not_found / http_5xx / 各 op_rejected 等）。</summary>
     public static Msg StatusOther(string op, string target, string decision, string result) => new(
         "[Sluice·终态]",
         $"""
         终态已查得：{op} → {target}
         决策：{decision}
         审计结果：{result}
-        该结果不在 denied/timeout/approved 三族内——按决策字面处理（结果未知族交回用户，勿重发）。
+        该结果不在收割映射族内（denied / timeout / consent_failed / rate_limited / approved·up_to_date）——按决策字面处理（结果未知族交回用户，勿重发）。
         """,
         ExitCodes.Unknown, "wait_user", true);
 
@@ -808,6 +822,7 @@ internal static class Messages
         ("mcppending",  PendingGate("a1b2c3d4e5f60718", 15, 75)),
         ("statuspending", StatusPending("a1b2c3d4e5f60718")),
         ("statusdone",  StatusDone("pr_merge", "rustin-beep/Vitro#452", "executed:https://github.com/rustin-beep/Vitro/commit/69f3a989")),
+        ("statusupodate", StatusUpToDate("push", "feat/x", "not_executed")), // v2.27：up_to_date 单列（"已执行"对它是假话）
         ("statusother", StatusOther("workflow_dispatch", "rustin-beep/Vitro ci.yml@x", "not_found", "http_404")),
         ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
         ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
