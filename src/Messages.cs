@@ -99,13 +99,26 @@ internal static class Messages
         "[Sluice]",
         $"""
         批准窗口已弹出，等待用户决策（最长 {settleBySec} 秒内必有终态：批准执行 / 拒绝 / 超时自动拒绝）。
-        本次调用不再阻塞等待——约 {pollAfterSec} 秒后运行：sluice status {receipt}
-        即可查得终态（含用户拒绝理由原文）。结果未定前：
+        本次调用不再阻塞等待——约 {pollAfterSec} 秒后用工具 sluice_status 查终态（参数 receipt：{receipt}；
+        无该工具时 CLI 等价：sluice status {receipt}），即可查得终态（含用户拒绝理由原文）。结果未定前：
         1. 禁止重发同一写操作（窗口已开，重发只会再弹一窗，不是重试途径）；
         2. 禁止换其他方式完成同一操作；
         3. 查询无副作用，可间隔重查直至出现 [Sluice·终态]。
         """,
         ExitCodes.PendingGate, "wait_until", false);
+
+    /// <summary>v2.26：MCP server 映像过期（磁盘 exe 已更新，本进程是 rename-swap 部署后的僵尸）。
+    /// 旧语义会静默丢终态（2026-11-04 实弹：四个 v2.24 旧 server 继续服务，拒绝理由随宿主超时沉没），
+    /// 必须显式自曝换重启，不得继续按旧语义服务写门。</summary>
+    public static Msg ServerStale() => new(
+        "[Sluice·终态]",
+        """
+        Sluice MCP 服务器已过期：磁盘上的 sluice.exe 已被更新，本进程仍在按旧版语义运行——
+        继续使用会丢失用户决策结果（含拒绝理由）。
+        本次调用未执行，无任何副作用。
+        请把本消息原文转告用户：重启本会话（或重连 MCP server）后重新发起同一操作即可。
+        """,
+        ExitCodes.Internal, "wait_user", true);
 
     /// <summary>status 查询：receipt 尚无终态行（窗口仍开着或人仍在打字）——继续等继续查。</summary>
     public static Msg StatusPending(string receipt) => new(
@@ -802,6 +815,7 @@ internal static class Messages
         ("pushratelimited", PushRateLimited("rustin-beep/Vitro", "feat/x", "secondary rate limit，服务端要求等待约 2 分钟")),
         ("writeforbidden", WriteForbidden("pr_create", "rustin-beep/Vitro", "HTTP 403：Resource not accessible by personal access token")),
         ("commentrejected", CommentRejected("rustin-beep/Vitro#52", "HTTP 404：Not Found")),
+        ("serverstale", ServerStale()), // v2.26：僵尸 server 自曝（exit 1/wait_user——重启会话后重试）
     ];
 
     public static void Write(Msg m)

@@ -65,6 +65,27 @@ internal static class McpServer
         return j > from ? text[from..j] : null;
     }
 
+    // ---------- v2.26：过期自检（rename-swap 部署留下的僵尸 server 自曝） ----------
+    // 缘起 2026-11-04 实弹：v0.7.1 经 rename-swap 部署后，四个 v2.24 旧 server 仍在服务
+    // （存活会话句柄随旧名文件继续跑旧代码）——旧 SpawnCli 无限阻塞，宿主 ~30s 弃等，
+    // 用户 40-90s 后作出的拒绝决策落在无人读取的管道里，deny_reason 一世沉没（v2.25 修的
+    // 正是这条链，但旧 server 带不走修复）。守卫 = 每次 tools/call 核对自身映像是否已被
+    // 磁盘更新，过期即显式报错换重启，把"静默丢终态"变成"响亮可行动的失败"。
+
+    /// <summary>进程启动时自身映像的 (大小, 修改时间UTC) 快照。readonly 不可变，非可变全局。</summary>
+    private static readonly (long Size, DateTime Written) StartupStamp = StampOf();
+
+    private static (long Size, DateTime Written) StampOf()
+    {
+        try { var f = new FileInfo(Environment.ProcessPath ?? ""); return (f.Length, f.LastWriteTimeUtc); }
+        catch { return (-1, DateTime.MinValue); } // 路径不可解析/文件不在：哨兵值，与任何真实映像必不等
+    }
+
+    /// <summary>纯函数（selftest 锁）：磁盘上的映像已不是启动时那份 ⇒ 本进程是 rename-swap 后的
+    /// 僵尸，正在提供过期工具语义。文件消失（-1 哨兵）同样视为过期——fail-closed。</summary>
+    internal static bool ImageChanged((long Size, DateTime Written) startup, (long Size, DateTime Written) now)
+        => startup != now;
+
     /// <summary>§9 写 op 的 action 值域（v2.11 起与 plan-lite §9 / CLI 写动词表三方对账，selftest 面一致锁；
     /// v2.11 将 comment 更名 pr_comment——§9.7"与 §9 写 op 一一对应"的字面承诺自此零例外）。</summary>
     internal static readonly string[] Actions =
@@ -110,8 +131,8 @@ internal static class McpServer
         wait_until=等待到点 / change_approach=改换方案。
         用户拒绝/超时等决策结果 isError=false——这不是工具故障：ok=false 表示操作未执行，
         denied=true 且 deny_reason=用户填写的拒绝理由（若用户留了话，必须按其理由调整方案，禁止重试）。
-        若返回 code=23（pending，带 receipt）：批准窗口已弹出、用户尚未决策——等待约 15 秒后运行
-        `sluice status <receipt>` 查终态（拒绝理由原文在此），终态出现前禁止重发本操作。
+        若返回 code=23（pending，带 receipt）：批准窗口已弹出、用户尚未决策——等待约 15 秒后用
+        sluice_status 工具（参数 receipt）查终态（拒绝理由原文在此），终态出现前禁止重发本操作。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
         （如 sluice api repos/owner/repo/pulls）。
         """;
@@ -142,6 +163,26 @@ internal static class McpServer
             "workflow":     { "type": "string", "description": "workflow id 或 .yml 文件名（workflow_dispatch 必填）" },
             "ref":          { "type": "string", "description": "dispatch 目标分支/标签（workflow_dispatch 必填）" },
             "inputs":       { "type": "object", "description": "workflow inputs 键值对（workflow_dispatch 可选）" }
+          }
+        }
+        """;
+
+    /// <summary>sluice_status（v2.26）：pending 收割的 MCP 前门——把"agent 切 Bash 跑 CLI"这道
+    /// 提示层动作收进工具环（结构性在场）：pending 之后 agent 只需继续调用它已熟悉的工具面。</summary>
+    private const string StatusToolDescription =
+        """
+        查询 github_write 返回 code=23（pending，批准窗口未决）的请求终态：用户已决策则返回终态消息
+        （拒绝时含 deny_reason 与理由原文——必须遵守其 retry 语义，禁止重发原操作）；仍未决则再返回
+        code=23，继续等待重查。参数 receipt 来自 pending 结果的 structuredContent。只读本地审计，
+        无副作用，可间隔重查（建议每次间隔 15 秒，直到出现 [Sluice·终态]）。
+        """;
+
+    private static readonly string StatusInputSchema = """
+        {
+          "type": "object",
+          "required": ["receipt"],
+          "properties": {
+            "receipt": { "type": "string", "description": "pending 结果携带的 16 位十六进制查询凭据" }
           }
         }
         """;
@@ -219,9 +260,20 @@ internal static class McpServer
                     w.WriteStartObject();
                     w.WriteString("name", "github_write");
                     w.WriteString("description", ToolDescription);
-                    using var schema = JsonDocument.Parse(InputSchema);
-                    w.WritePropertyName("inputSchema");
-                    schema.RootElement.WriteTo(w);
+                    using (var schema = JsonDocument.Parse(InputSchema))
+                    {
+                        w.WritePropertyName("inputSchema");
+                        schema.RootElement.WriteTo(w);
+                    }
+                    w.WriteEndObject();
+                    w.WriteStartObject();
+                    w.WriteString("name", "sluice_status");
+                    w.WriteString("description", StatusToolDescription);
+                    using (var schema2 = JsonDocument.Parse(StatusInputSchema))
+                    {
+                        w.WritePropertyName("inputSchema");
+                        schema2.RootElement.WriteTo(w);
+                    }
                     w.WriteEndObject();
                     w.WriteEndArray();
                     w.WriteEndObject();
@@ -241,9 +293,19 @@ internal static class McpServer
     private static void CallTool(StreamWriter stdout, JsonElement idEl, JsonElement? p)
     {
         var name = p?.TryGetProperty("name", out var n) == true && n.ValueKind == JsonValueKind.String ? n.GetString() : null;
+        if (name == "sluice_status") { CallStatus(stdout, idEl, p); return; }
         if (name != "github_write")
         {
-            var m = Messages.BadRequest($"未知工具 \"{name}\"；本服务只提供 github_write（§9.7：单一类型化工具，不做透传）");
+            var m = Messages.BadRequest($"未知工具 \"{name}\"；本服务提供 github_write（写闸门）与 sluice_status（pending 收割）（§9.7：类型化工具，不做透传）");
+            SendToolResult(stdout, idEl, MsgText(m), m.ExitCode, isError: true);
+            return;
+        }
+        // v2.26 过期守卫：写门语义正是被旧版本静默腐蚀的部分（阻塞至宿主超时→终态丢失），
+        // 过期即自曝换重启，不再静默服务。sluice_status 不过此闸——audit 格式跨版本稳定，
+        // 僵尸 server 上的在途 receipt 也值得收割（fail-open 只让给只读收割，写门永远 fail-closed）。
+        if (ImageChanged(StartupStamp, StampOf()))
+        {
+            var m = Messages.ServerStale();
             SendToolResult(stdout, idEl, MsgText(m), m.ExitCode, isError: true);
             return;
         }
@@ -273,6 +335,36 @@ internal static class McpServer
         {
             try { if (File.Exists(bodyPath)) File.Delete(bodyPath); } catch { }
             try { if (File.Exists(inputsPath)) File.Delete(inputsPath); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// sluice_status（v2.26）：spawn CLI `status <receipt>`——§8 消息、决策族映射、receipt 校验
+    /// 全部单源在 CLI（RunStatus），server 零收割逻辑（spawn-child 纪律不变）。读审计无副作用、
+    /// 无窗口、毫秒级退出，恒走 SpawnCli 快路径；不过期守卫（见 CallTool 注释）。
+    /// </summary>
+    private static void CallStatus(StreamWriter stdout, JsonElement idEl, JsonElement? p)
+    {
+        try
+        {
+            var a = p?.TryGetProperty("arguments", out var ae) == true && ae.ValueKind == JsonValueKind.Object ? ae : default;
+            string? receipt = null;
+            if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("receipt", out var r) && r.ValueKind == JsonValueKind.String)
+                receipt = r.GetString();
+            if (receipt is null)
+            {
+                var m = Messages.BadRequest("sluice_status 需要 receipt（github_write 返回 code=23 时 structuredContent 里的 16 位凭据）——本次未产生任何副作用");
+                SendToolResult(stdout, idEl, MsgText(m), m.ExitCode, isError: true);
+                return;
+            }
+            var (text, code, _) = SpawnCli(["status", receipt]);
+            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code));
+        }
+        catch (Exception ex)
+        {
+            // 与 CallTool 同款兜底：spawn 失败等异常只废这一次调用，不击穿 HandleLine 杀死常驻 server
+            var m = Messages.BadRequest($"MCP 层异常：{ex.GetType().Name}: {ex.Message}");
+            SendToolResult(stdout, idEl, MsgText(m), m.ExitCode, isError: true);
         }
     }
 

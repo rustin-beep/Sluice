@@ -67,6 +67,7 @@ internal static class Selftest
         ("statuspending",   ExitCodes.PendingGate,   "wait_until"), // v2.25：status 查询无终态行（同 23 档，函数性）
         ("statusdone",      ExitCodes.Success,       "—"),          // v2.25：status 收割已批准族
         ("statusother",     ExitCodes.Unknown,       "wait_user"),  // v2.25：status 收割其余终态（照录决策字面）
+        ("serverstale",     ExitCodes.Internal,      "wait_user"),  // v2.26：僵尸 server 自曝——重启会话后重发（与 internal 族同档：技术失败，交回用户）
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -74,7 +75,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26 僵尸自曝锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -237,6 +238,17 @@ internal static class Selftest
         var c16 = Build("""{"action":"release_create","repo":"o/r","tag":"v1","prerelease":{}}""");
         if (c16.Err is null || c16.Err.ExitCode != ExitCodes.BadRequest)
         { fail++; Console.WriteLine("!! prerelease 对象类型应显式拒（防静默丢参）而非漏放"); }
+
+        // v2.26：过期自检纯函数——rename-swap 部署后，磁盘映像 (大小, 修改时间) 必然变化；
+        // 文件消失（-1 哨兵）同判过期（fail-closed）；完全相同才放行
+        Eq("映像未变放行", McpServer.ImageChanged((23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc)),
+                                              (23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc))), false);
+        Eq("大小变即过期", McpServer.ImageChanged((23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc)),
+                                                 (23712768, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc))), true);
+        Eq("修改时间变即过期", McpServer.ImageChanged((23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc)),
+                                                      (23640576, new DateTime(2026, 11, 4, 11, 0, 0, DateTimeKind.Utc))), true);
+        Eq("文件消失即过期", McpServer.ImageChanged((23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc)),
+                                                   (-1, DateTime.MinValue)), true);
 
         // v2.25：status 终态映射锁——pending 收割后 exit/retry 必须与原决策同族
         //（denied→2/never、timeout→3/wait_user、approved/up_to_date→0/—、其余→21/wait_user）
