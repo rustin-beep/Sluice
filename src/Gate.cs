@@ -32,6 +32,28 @@ internal static class Gate
     public static int TimeoutSeconds { get; } = ReadTimeout();
 
     /// <summary>
+    /// v2.25：MCP 前门"未决即回 pending"的等待秒数（config.json "mcp_pending_sec"，默认 15，
+    /// 夹 [5,55]）。必须小于一切已知 MCP 宿主的工具调用超时（实测 ZCode 系 ~30s）——
+    /// 否则终态落在客户端离场之后，deny_reason 一世沉没（2026-11-04 实弹根因）。
+    /// 纯 UX 旋钮：改大 = 更少走 pending 轮询、更大风险撞客户端超时，自伤侧。
+    /// </summary>
+    public static int McpPendingSec { get; } = ReadMcpPending();
+
+    private static int ReadMcpPending()
+    {
+        try
+        {
+            var cfg = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Sluice", "config.json");
+            if (!File.Exists(cfg)) return 15;
+            using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(cfg));
+            return doc.RootElement.TryGetProperty("mcp_pending_sec", out var v)
+                && v.TryGetInt32(out var sec) ? Math.Clamp(sec, 5, 55) : 15;
+        }
+        catch { return 15; }
+    }
+
+    /// <summary>
     /// D1（2026-10-31 用户决策）：config.json "hello": false 时 vault 走 DPAPI 静默格式（SLCV2），
     /// 批准点击即批准事件，不再弹 Windows Hello。默认 true = 原行为（Hello 签名派生密钥，一次
     /// 生物事件 = 解锁 + 授权）。这是 owner 显式的防护降级：批准事件从生物事件降为桌面事件、

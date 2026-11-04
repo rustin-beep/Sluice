@@ -22,6 +22,7 @@ internal static class ExitCodes
     public const int HttpFailed = 20;
     public const int Unknown = 21;
     public const int RateLimitWait = 22;
+    public const int PendingGate = 23; // v2.25：MCP 前门"批准窗未决"——人还在决策，非终态
 }
 
 internal static class Messages
@@ -88,6 +89,53 @@ internal static class Messages
         "任务重新讨论" => "用户补充：任务需要重新讨论；请先与用户对齐后再决定是否需要此操作。",
         _ => "", // “不批准”：主体文案已完整
     };
+
+    // ---- pending（exit 23，retry=wait_until；v2.25 MCP 前门专用，CLI 不产此码） ----
+    // 缘起 2026-11-04 实弹：宿主客户端 ~30s 放弃工具调用，而人读窗+打拒绝理由要 40-90s——
+    // 终态永远落在客户端离场之后，deny_reason 一世沉没（agent"从不记忆"的根源）。
+    // 服务端在 mcp_pending_sec（默认 15s，< 一切已知客户端超时）未决即回本消息 + receipt，
+    // 子进程（含活窗）继续跑，终态落审计凭 receipt 可查。非终态（前缀 [Sluice]）。
+    public static Msg PendingGate(string receipt, int pollAfterSec, int settleBySec) => new(
+        "[Sluice]",
+        $"""
+        批准窗口已弹出，等待用户决策（最长 {settleBySec} 秒内必有终态：批准执行 / 拒绝 / 超时自动拒绝）。
+        本次调用不再阻塞等待——约 {pollAfterSec} 秒后运行：sluice status {receipt}
+        即可查得终态（含用户拒绝理由原文）。结果未定前：
+        1. 禁止重发同一写操作（窗口已开，重发只会再弹一窗，不是重试途径）；
+        2. 禁止换其他方式完成同一操作；
+        3. 查询无副作用，可间隔重查直至出现 [Sluice·终态]。
+        """,
+        ExitCodes.PendingGate, "wait_until", false);
+
+    /// <summary>status 查询：receipt 尚无终态行（窗口仍开着或人仍在打字）——继续等继续查。</summary>
+    public static Msg StatusPending(string receipt) => new(
+        "[Sluice]",
+        $"""
+        {receipt} 尚无终态：批准窗口仍未决（用户可能在阅读或填写拒绝理由）。
+        再等 15 秒后重跑同一查询；终态必然落盘（最长至批准窗超时）。查询无副作用。
+        """,
+        ExitCodes.PendingGate, "wait_until", false);
+
+    /// <summary>status 查得已批准族终态（approved / up_to_date 等）——事实句照审计 result 原样。</summary>
+    public static Msg StatusDone(string op, string target, string result) => new(
+        "[Sluice·终态]",
+        $"""
+        终态已查得：{op} → {target} 已获批准并执行。
+        审计结果：{result}
+        操作已生效，无需再用其他命令验证；也无需再查 status。
+        """,
+        ExitCodes.Success, "—", false);
+
+    /// <summary>status 查得其余终态（denied/timeout 之外的技术失败族）——事实照录，语义按决策字面。</summary>
+    public static Msg StatusOther(string op, string target, string decision, string result) => new(
+        "[Sluice·终态]",
+        $"""
+        终态已查得：{op} → {target}
+        决策：{decision}
+        审计结果：{result}
+        该结果不在 denied/timeout/approved 三族内——按决策字面处理（结果未知族交回用户，勿重发）。
+        """,
+        ExitCodes.Unknown, "wait_user", true);
 
     // ---- timeout（exit 3，retry=wait_user；时长自 C4 config 可配，文案跟随实际值） ----
     public static Msg Timeout(string op, string target, int seconds) => new(
@@ -744,6 +792,10 @@ internal static class Messages
         ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / *.githubusercontent.com）")),
         ("pushdone", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false)),
         ("replayunresolved", PushReplayUnresolved("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2")),
+        ("mcppending",  PendingGate("a1b2c3d4e5f60718", 15, 75)),
+        ("statuspending", StatusPending("a1b2c3d4e5f60718")),
+        ("statusdone",  StatusDone("pr_merge", "rustin-beep/Vitro#452", "executed:https://github.com/rustin-beep/Vitro/commit/69f3a989")),
+        ("statusother", StatusOther("workflow_dispatch", "rustin-beep/Vitro ci.yml@x", "not_found", "http_404")),
         ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
         ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
         ("writeratelimited", WriteRateLimited("pr_close", "rustin-beep/Vitro#390", 403, "secondary rate limit，服务端要求等待约 2 分钟")),

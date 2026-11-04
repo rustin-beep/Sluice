@@ -63,6 +63,10 @@ internal static class Selftest
         ("writeforbidden",  ExitCodes.BadRequest,    "after_fix"),  // v2.16：comment/pr_create 403 自 credential_expired 拆出（v2.5 漏网）
         ("commentrejected", ExitCodes.BadRequest,    "after_fix"),  // v2.16：服务端 404/422 拒绝 ≠ internal（原经 InternalPost 谎记）
         ("notice",          ExitCodes.PolicyReject,  "change_approach"), // v2.19：git 直连索凭据→指路 sluice push（不供凭据，stdout 永无 password=）
+        ("mcppending",      ExitCodes.PendingGate,   "wait_until"), // v2.25：批准窗未决——非终态，receipt 收割（CLI 不产此码，MCP server 合成）
+        ("statuspending",   ExitCodes.PendingGate,   "wait_until"), // v2.25：status 查询无终态行（同 23 档，函数性）
+        ("statusdone",      ExitCodes.Success,       "—"),          // v2.25：status 收割已批准族
+        ("statusother",     ExitCodes.Unknown,       "wait_user"),  // v2.25：status 收割其余终态（照录决策字面）
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -233,6 +237,22 @@ internal static class Selftest
         var c16 = Build("""{"action":"release_create","repo":"o/r","tag":"v1","prerelease":{}}""");
         if (c16.Err is null || c16.Err.ExitCode != ExitCodes.BadRequest)
         { fail++; Console.WriteLine("!! prerelease 对象类型应显式拒（防静默丢参）而非漏放"); }
+
+        // v2.25：status 终态映射锁——pending 收割后 exit/retry 必须与原决策同族
+        //（denied→2/never、timeout→3/wait_user、approved/up_to_date→0/—、其余→21/wait_user）
+        foreach (var (decision, want) in new[]
+                 {
+                     ("denied", ExitCodes.Denied), ("timeout", ExitCodes.Timeout),
+                     ("approved", ExitCodes.Success), ("up_to_date", ExitCodes.Success),
+                     ("not_found", ExitCodes.Unknown), ("http_405", ExitCodes.Unknown),
+                     ("rate_limited", ExitCodes.Unknown),
+                 })
+            if (Program.StatusFamily(decision) != want)
+            { fail++; Console.WriteLine($"!! StatusFamily({decision}) = {Program.StatusFamily(decision)} ≠ {want}"); }
+        if (McpServer.RetryOf(Program.StatusFamily("denied")) != "never"
+            || McpServer.RetryOf(Program.StatusFamily("timeout")) != "wait_user"
+            || McpServer.RetryOf(Program.StatusFamily("approved")) != "—")
+        { fail++; Console.WriteLine("!! status 收割的 exit→retry 必须与原决策族一致"); }
 
         Console.WriteLine(fail == 0 ? "MCP 映射与参数构造抽查通过。" : "MCP 检查有不符项（见上）。");
         return fail;
@@ -512,7 +532,7 @@ internal static class Selftest
         foreach (var code in new[]
                  {
                      ExitCodes.Success, ExitCodes.Denied, ExitCodes.Timeout, ExitCodes.PolicyReject,
-                     ExitCodes.Cooldown, ExitCodes.ConsentFailed, ExitCodes.RateLimitWait,
+                     ExitCodes.Cooldown, ExitCodes.ConsentFailed, ExitCodes.RateLimitWait, ExitCodes.PendingGate,
                  })
             if (McpServer.IsErrorOf(code))
             { fail++; Console.WriteLine($"!! exit {code} 属用户决策族，不应标 isError（宿主会按工具错误渲染，吞掉拒绝理由）"); }

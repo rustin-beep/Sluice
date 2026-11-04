@@ -33,6 +33,7 @@ internal static class McpServer
         ExitCodes.HttpFailed        => "retry_ok",
         ExitCodes.Unknown           => "wait_user",
         ExitCodes.RateLimitWait     => "wait_until",
+        ExitCodes.PendingGate       => "wait_until",
         _ => "wait_user", // 表外 code = 契约破裂，fail-safe 交回用户
     };
 
@@ -47,7 +48,8 @@ internal static class McpServer
     internal static bool IsErrorOf(int code) => code switch
     {
         ExitCodes.Success or ExitCodes.Denied or ExitCodes.Timeout or ExitCodes.PolicyReject
-            or ExitCodes.Cooldown or ExitCodes.ConsentFailed or ExitCodes.RateLimitWait => false,
+            or ExitCodes.Cooldown or ExitCodes.ConsentFailed or ExitCodes.RateLimitWait
+            or ExitCodes.PendingGate => false,
         _ => true,
     };
 
@@ -108,6 +110,8 @@ internal static class McpServer
         wait_until=等待到点 / change_approach=改换方案。
         用户拒绝/超时等决策结果 isError=false——这不是工具故障：ok=false 表示操作未执行，
         denied=true 且 deny_reason=用户填写的拒绝理由（若用户留了话，必须按其理由调整方案，禁止重试）。
+        若返回 code=23（pending，带 receipt）：批准窗口已弹出、用户尚未决策——等待约 15 秒后运行
+        `sluice status <receipt>` 查终态（拒绝理由原文在此），终态出现前禁止重发本操作。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
         （如 sluice api repos/owner/repo/pulls）。
         """;
@@ -257,8 +261,8 @@ internal static class McpServer
             if (bodyContent is not null) File.WriteAllText(bodyPath, bodyContent, new UTF8Encoding(false));
             if (inputsContent is not null) File.WriteAllText(inputsPath, inputsContent, new UTF8Encoding(false));
 
-            var (text, code) = SpawnCli(argv);
-            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code));
+            var (text, code, receipt) = SpawnCli(argv);
+            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code), receipt);
         }
         catch (Exception ex)
         {
@@ -452,11 +456,16 @@ internal static class McpServer
 
     /// <summary>
     /// spawn CLI 子进程（绝对路径杀 PATH 劫持；ArgumentList 结构化传参无 shell 引号面；双流捕获：
-    /// §8 消息成功在 stdout、失败在 stderr）。不设超时——批准窗最长 600s + push 多请求序列；
-    /// 宿主侧超时由宿主自理，本进程不杀子进程（杀活窗违禁，§9.7）。
+    /// §8 消息成功在 stdout、失败在 stderr）。不杀子进程（杀活窗违禁，审计行是真相）。
+    /// v2.25：等待超过 Gate.McpPendingSec（默认 15s，须 < 宿主工具超时，实测 ZCode 系 ~30s）
+    /// 仍未决 → 本请求回 pending（exit 23 + receipt），子进程照跑、终态落审计——agent 凭
+    /// receipt 用 `sluice status` 收割。此前终态永远落在客户端离场之后，deny_reason 一世
+    /// 沉没（2026-11-04 实弹：人读窗+打拒绝理由 40-90s vs 客户端 30s 弃等，agent"从不记忆"
+    /// 的根源）。快路径（批准/拒绝在窗口期内落地）不变，仍是原终态直返。
     /// </summary>
-    private static (string Text, int Code) SpawnCli(string[] argv)
+    private static (string Text, int Code, string Receipt) SpawnCli(string[] argv)
     {
+        var receipt = Guid.NewGuid().ToString("N")[..16];
         var psi = new ProcessStartInfo(Environment.ProcessPath ?? "sluice.exe")
         {
             UseShellExecute = false,
@@ -466,22 +475,40 @@ internal static class McpServer
             CreateNoWindow = true,
         };
         foreach (var arg in argv) psi.ArgumentList.Add(arg);
-        psi.EnvironmentVariables["SLUICE_VIA"] = "mcp"; // §10 via 字段：纯标签非机密
+        psi.EnvironmentVariables["SLUICE_VIA"] = "mcp";       // §10 via 字段：纯标签非机密
+        psi.EnvironmentVariables["SLUICE_MCP_REQ"] = receipt; // v2.25：审计行随身凭据（同 via 纪律）
 
-        using var p = Process.Start(psi)!;
+        var p = Process.Start(psi)!;
         p.StandardInput.Close(); // 子进程不读 stdin
         var outTask = p.StandardOutput.ReadToEndAsync();
         var errTask = p.StandardError.ReadToEndAsync();
-        p.WaitForExit();
+
+        if (!p.WaitForExit(Gate.McpPendingSec * 1000))
+        {
+            // 未决：活窗不杀（§9.7）。后台排干双流（防子进程写满管道阻塞）并收尸，本请求回 pending。
+            _ = Task.Run(() =>
+            {
+                try { p.WaitForExit(); outTask.Wait(); errTask.Wait(); } catch { }
+                try { p.Dispose(); } catch { }
+            });
+            var m = Messages.PendingGate(receipt,
+                pollAfterSec: Math.Max(10, Gate.McpPendingSec),
+                settleBySec: Gate.TimeoutSeconds + Gate.McpPendingSec);
+            return (MsgText(m), m.ExitCode, receipt);
+        }
+
+        p.WaitForExit(); // 已退出；再等一次确保异步输出流排干（BCL 语义）
+        var code = p.ExitCode;
         var so = outTask.Result; var se = errTask.Result;
+        p.Dispose();
 
         // 主消息流：成功在 stdout、失败在 stderr（§8.2 ToStderr）；另一流非空则作附注（push heartbeat 等）
-        var primary = (p.ExitCode == 0 ? so : se).TrimEnd();
-        var secondary = (p.ExitCode == 0 ? se : so).TrimEnd();
+        var primary = (code == 0 ? so : se).TrimEnd();
+        var secondary = (code == 0 ? se : so).TrimEnd();
         var text = primary.Length == 0 && secondary.Length > 0
             ? secondary
-            : secondary.Length == 0 ? primary : primary + "\n\n[" + (p.ExitCode == 0 ? "stderr" : "stdout") + "]\n" + secondary;
-        return (text.Length == 0 ? "[Sluice] 子进程无输出（exit " + p.ExitCode + "）" : text, p.ExitCode);
+            : secondary.Length == 0 ? primary : primary + "\n\n[" + (code == 0 ? "stderr" : "stdout") + "]\n" + secondary;
+        return (text.Length == 0 ? "[Sluice] 子进程无输出（exit " + code + "）" : text, code, receipt);
     }
 
     // ---------- JSON-RPC 输出 ----------
@@ -511,10 +538,11 @@ internal static class McpServer
         w.WriteEndObject();
     }
 
-    /// <summary>工具结果：text=子进程 §8 消息逐字（单源）；structuredContent={ok,code,retry,url?,denied?,deny_reason?}。
-    /// ok=操作是否已执行（code==0）；isError=IsErrorOf（v2.24：用户决策族 false——工具没坏，是闸门说了不）。
-    /// ok 与 isError 自 v2.24 起解耦：拒绝结果 ok=false + isError=false。</summary>
-    private static void SendToolResult(StreamWriter stdout, JsonElement idEl, string text, int code, bool isError)
+    /// <summary>工具结果：text=子进程 §8 消息逐字（单源）；structuredContent={ok,code,retry,url?,denied?,deny_reason?,receipt?}。
+    /// ok=操作是否已执行（code==0）；isError=IsErrorOf（v2.24：用户决策族 false——工具没坏，是闸门说了不；
+    /// v2.25：pending 亦非错误）。receipt 仅 code=23（pending）时出现——`sluice status` 的查询凭据。</summary>
+    private static void SendToolResult(StreamWriter stdout, JsonElement idEl, string text, int code, bool isError,
+        string? receipt = null)
     {
         Send(stdout, idEl, w =>
         {
@@ -535,6 +563,8 @@ internal static class McpServer
                 w.WriteBoolean("denied", true);
                 if (ExtractDenyReason(text) is { } reason) w.WriteString("deny_reason", reason);
             }
+            if (code == ExitCodes.PendingGate && receipt is not null)
+                w.WriteString("receipt", receipt); // v2.25：pending 收割凭据
             var url = ExtractUrl(text);
             if (url is not null) w.WriteString("url", url);
             w.WriteEndObject();

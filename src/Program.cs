@@ -96,10 +96,53 @@ internal static class Program
             ["doctor"] => SetupCommand.Doctor(),
             ["notice", .. var rest] => RunNotice(rest),
             ["selftest"] => Selftest.Run(),
+            ["status", var receipt] => RunStatus(receipt),
             ["api", .. var rest] => RunApi(rest),
             ["mcp", .. var rest] => McpServer.Run(rest),
             [var verb, ..] => BadVerb(verb),
         };
+    }
+
+    // ---------- sluice status（v2.25 · §9.7 pending 的收割口：凭 receipt 读审计终态行） ----------
+
+    /// <summary>终态 → status 家族映射（纯函数，selftest 锁）：denied/timeout 复用原决策消息
+    /// （拒绝理由原文与"必须遵守"条款原样再现——pending 收割的意义所在），approved 族报事实句，
+    /// 其余照录决策字面交回用户。</summary>
+    internal static int StatusFamily(string decision) => decision switch
+    {
+        "denied" => ExitCodes.Denied,
+        "timeout" => ExitCodes.Timeout,
+        "approved" or "up_to_date" => ExitCodes.Success,
+        _ => ExitCodes.Unknown,
+    };
+
+    private static int RunStatus(string receipt)
+    {
+        if (receipt.Length is < 8 or > 32 || !receipt.All(char.IsAsciiHexDigit))
+            return ErrBad($"status 需要 pending 返回里的 receipt（16 位十六进制），收到：{receipt}");
+        var line = Audit.LastFor(receipt);
+        if (line is null)
+        {
+            Messages.Write(Messages.StatusPending(receipt));
+            return ExitCodes.PendingGate;
+        }
+        var l = line.Value;
+        switch (StatusFamily(l.Decision))
+        {
+            case ExitCodes.Denied:
+                // 单源复用：与现场拒绝同一条消息——理由原文、预设指引、retry=never 全部原样
+                Messages.Write(Messages.Denied(l.Op, l.Target ?? "?", l.Preset ?? "不批准", l.Reason));
+                return ExitCodes.Denied;
+            case ExitCodes.Timeout:
+                Messages.Write(Messages.Timeout(l.Op, l.Target ?? "?", Gate.TimeoutSeconds));
+                return ExitCodes.Timeout;
+            case ExitCodes.Success:
+                Messages.Write(Messages.StatusDone(l.Op, l.Target ?? "?", l.Result));
+                return ExitCodes.Success;
+            default:
+                Messages.Write(Messages.StatusOther(l.Op, l.Target ?? "?", l.Decision, l.Result));
+                return ExitCodes.Unknown;
+        }
     }
 
     /// <summary>
@@ -190,6 +233,8 @@ internal static class Program
               sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 过 Hello 带 token；
                                                         路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计；
                                                         logs 等端点 302→CDN 签名 URL 自动跟随，仅限 GitHub 域 ≤3 跳）
+              sluice status <receipt>                  查 MCP pending 请求的终态（github_write 返回
+                                                        code=23 时附 receipt；拒绝理由原文在此，无副作用可重查）
               sluice selftest                           消息表与 exit code 自检
               sluice mcp [--print-config]               MCP 前门（§9.7）：stdio JSON-RPC 服务，
                                                         单一类型化工具 github_write；spawn-child
@@ -205,7 +250,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.24");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.25");
         return 0;
     }
 
