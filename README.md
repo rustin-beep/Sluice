@@ -14,7 +14,7 @@ agent ──sluice <verb>──▶ 批准窗（全文所见 + 注入输入过滤
 
 1. **批准你所见**——弹窗展示将被发布的全文/替换对象/丢弃清单，长文必须滚到底才亮批准键；
 2. **能力缺席优于拦截**——fine-grained PAT 只授权指定仓库，本地配置不是墙，服务端 403 才是；
-3. **读有日志、写有审计**——`sluice api` 读全量落审计，写操作逐条落 `%LOCALAPPDATA%\Sluice\audit.jsonl`。
+3. **读有日志、写有审计**——`sluice api` / `sluice issue list` 读全量落审计，写操作逐条落 `%LOCALAPPDATA%\Sluice\audit.jsonl`。
 
 ---
 
@@ -69,6 +69,7 @@ sluice.exe --version                      # 构建戳（时间 + git sha[+dirty]
 | `sluice issue create --repo O/R --title T --body-file F [--labels a,b,c]` | 新建 issue | issue close 的对偶件（立案闭环）；正文全文入窗；`--labels` 单请求携带标签，未知标签名预检拦下 |
 | `sluice issue reopen --repo O/R --number N` | 重开已关 issue | issue close 的对偶件；PR 编号同样会被预检拦下 |
 | `sluice issue label --repo O/R --number N --labels a,b,c` | 设置标签（整组替换） | 弹窗披露当前标签→新标签→**摘除清单**；PR 编号同样有效（端点共用）；未知标签名预检拦下；清空全部标签本批不支持 |
+| `sluice issue list --repo O/R [--state open\|closed\|all] [--labels a,b] [--search 关键词] [--limit N] [--page N] [--with-prs] [--auth]` | issue 清单/搜索（只读） | 一行一条（`#N [状态] 标题 {标签}`）；`--labels` 过滤、`--search` 关键词搜（空格分隔 AND，走 GitHub 搜索端点）；清单端点混入的 PR 默认隐去计数披露（`--with-prs` 显示）；`--limit` 1–100 缺省 30；`--search` 与 `--state all` 互斥（搜索端点只有 open/closed）；只读零交互，读落审计 |
 | `sluice tag create --repo O/R --tag V --at <分支\|完整sha>` | 新建远端轻量 tag | create-or-fail 不覆盖；私有库 --at 解析失败时给完整 40 位 sha |
 | `sluice release create --repo O/R --tag V --body-file F [--target <分支\|sha>] [--name N] [--prerelease]` | 发布 release | target 以批准期解析的 sha 锚定（杜绝隐式建 tag 的 TOCTOU）；发布即通知 watchers |
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |

@@ -76,7 +76,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -137,6 +137,7 @@ internal static class Selftest
         fail += CrashDetailChecks();
         fail += ReviewFixChecks();
         fail += DenyVisibilityChecks();
+        fail += IssueListChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -402,6 +403,67 @@ internal static class Selftest
         return fail;
     }
 
+    /// <summary>v2.29 issue list 锁（读侧清单面）：查询拼装（清单/搜索两形态、标签逐名编码、
+    /// state 限定符映射、含空格标签引号短语）与渲染（PR 隐去计数、--with-prs 标记、state_reason
+    /// 附加、标题 120 截断不切代理对、标签 join、搜索 total_count 透传）。与网络解耦——
+    /// 决策表本身即不变量。缘起：agent 实弹"issue 只能逐个查看、不能按标签或关键词搜索"。</summary>
+    private static int IssueListChecks()
+    {
+        Console.WriteLine("--- issue 清单锁（v2.29：查询拼装 / 渲染）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) 清单路径：全参显式（不依赖端点缺省）；标签逐名 percent-encode（CJK 名是常态）
+        Eq("清单缺省参", Program.IssueListPath("o/r", "open", [], 30, 1),
+           "repos/o/r/issues?state=open&per_page=30&page=1&sort=created&direction=desc");
+        Eq("清单全参+标签编码",
+           Program.IssueListPath("rustin-beep/Vitro", "closed", ["bug", "根因压测"], 100, 3),
+           "repos/rustin-beep/Vitro/issues?state=closed&per_page=100&page=3&sort=created&direction=desc"
+               + "&labels=bug," + Uri.EscapeDataString("根因压测"));
+
+        // (2) 搜索路径：q 整体编码（解码后核结构——锁拼装语义而非编码字节序）
+        var sp = Program.IssueSearchPath("o/r", "open", ["needs review"], "内存泄漏 step", 50, 2);
+        Eq("搜索端点前缀", sp.StartsWith("search/issues?q=", StringComparison.Ordinal), true);
+        var q = Uri.UnescapeDataString(sp[(sp.IndexOf("?q=", StringComparison.Ordinal) + 3)..].Split('&')[0]);
+        Eq("搜索 repo 限定", q.Contains("repo:o/r", StringComparison.Ordinal), true);
+        Eq("搜索恒带 type:issue", q.Contains("type:issue", StringComparison.Ordinal), true);
+        Eq("搜索 state 映射", q.Contains("state:open", StringComparison.Ordinal), true);
+        Eq("含空格标签引号短语", q.Contains("label:\"needs review\"", StringComparison.Ordinal), true);
+        Eq("关键词原样缀尾", q.EndsWith(" 内存泄漏 step", StringComparison.Ordinal), true);
+        Eq("搜索分页参数", sp.Contains("per_page=50&page=2", StringComparison.Ordinal), true);
+        Eq("无空格标签不加引号",
+           Uri.UnescapeDataString(Program.IssueSearchPath("o/r", "open", ["bug"], "x", 30, 1)
+               .Split('&')[0])["search/issues?q=".Length..].Contains(" label:bug", StringComparison.Ordinal), true);
+
+        // (3) 渲染：PR 隐去计数 / --with-prs 标记 / state_reason / 截断 / 标签 / 搜索形态 total_count
+        var longTitle = new string('标', 130);
+        var body = """
+            [{"number":479,"state":"open","title":"台账","labels":[{"name":"bug"},{"name":"根因压测"}]},
+             {"number":480,"state":"closed","state_reason":"not planned","title":"PR 条目","labels":[],"pull_request":{"url":"x"}},
+             {"number":481,"state":"open","title":"长标题","labels":[]}]
+            """.Replace("长标题", longTitle);
+        var (lines, issues, prs, total) = Program.RenderIssueList(body, withPrs: false);
+        Eq("issue 计数", issues, 2);
+        Eq("PR 计数（隐去但计入）", prs, 1);
+        Eq("清单形态 total=-1", total, -1L);
+        Eq("隐去 PR 行数", lines.Length, 2);
+        Eq("行格式（标签 join）", lines[0], "#479 [open] 台账 {bug, 根因压测}");
+        var (lines2, _, _, _) = Program.RenderIssueList(body, withPrs: true);
+        Eq("--with-prs 行数", lines2.Length, 3);
+        Eq("--with-prs 带 [PR] 标", lines2[1], "#480 [closed·not planned][PR] PR 条目");
+        Eq("长标题截断=120字+…", (lines[1].Count(c => c == '标'), lines[1].EndsWith("…", StringComparison.Ordinal)), (120, true));
+        var sbody = """{"total_count":7,"items":[{"number":1,"state":"open","title":"t","labels":[]}]}""";
+        var (slines, sissues, sprs, stotal) = Program.RenderIssueList(sbody, withPrs: false);
+        Eq("搜索形态 total_count 透传", stotal, 7L);
+        Eq("搜索形态行数", (slines.Length, sissues, sprs), (1, 1, 0));
+
+        Console.WriteLine(fail == 0 ? "issue 清单锁通过。" : "issue 清单锁有不符项（见上）。");
+        return fail;
+    }
+
     /// <summary>v2.18 崩溃诊断保真锁：DescribeCrash 必须保住嵌套异常链的每一层类型名
     /// （TypeInitializationException 外层 Message 是通用占位句，类型名只在内层），
     /// 且有截断上限（审计行不失控）。缘起：10-30×2 / 11-01×4 六次 internal_gate_crash
@@ -498,7 +560,7 @@ internal static class Selftest
     ];
 
     /// <summary>§9 内的只读 op（不进 CLI 写动词表与 MCP Actions；新增读 op 须在此登记）。</summary>
-    private static readonly string[] ReadOps = ["api"];
+    private static readonly string[] ReadOps = ["api", "issue_list"];
 
     /// <summary>
     /// 面一致锁：plan-lite §9 op 列 ↔ CLI 写动词表（Program.WriteVerbs）↔ MCP Actions（含 AllowedFields）

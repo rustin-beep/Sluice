@@ -104,6 +104,8 @@ internal static class Program
                     ? "status 需要 pending 返回里的 receipt（16 位十六进制），示例：sluice status a1b2c3d4e5f60718"
                     : $"status 只接受一个 receipt 参数，收到 {rest.Length} 个——示例：sluice status a1b2c3d4e5f60718"),
             ["api", .. var rest] => RunApi(rest),
+            // v2.29 读侧清单面：不进 WriteVerbs（非写动词），固定命令走 switch（同 api）
+            ["issue", "list", .. var rest] => RunIssueList(rest),
             ["mcp", .. var rest] => McpServer.Run(rest),
             [var verb, ..] => BadVerb(verb),
         };
@@ -251,6 +253,14 @@ internal static class Program
               sluice issue reopen --repo O/R --number N
                                                         重开已关 issue（经批准；issue_close 的对偶件，
                                                         PR 编号同样会被预检拦下）
+              sluice issue list --repo O/R [--state open|closed|all] [--labels a,b]
+                                                        [--search 关键词] [--limit N] [--page N]
+                                                        [--with-prs] [--auth]
+                                                        issue 清单一行一条（#N [状态] 标题 {标签}）；
+                                                        --labels 标签过滤、--search 关键词搜索（多个
+                                                        空格分隔）；清单端点混入的 PR 默认隐去计数
+                                                        披露，--with-prs 显示；只读零交互（--auth 走
+                                                        vault 读私有库），读落审计
               sluice issue label --repo O/R --number N --labels a,b,c
                                                         设置标签，整组替换（经批准；弹窗披露当前标签→
                                                         新标签→摘除清单；PR 编号同样有效——PR 与 issue
@@ -297,7 +307,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.28");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.29");
         return 0;
     }
 
@@ -1072,47 +1082,69 @@ internal static class Program
             return ExitCodes.BadRequest;
         }
 
+        // v2.29：--auth 凭据获取与结果分类提出单源（issue list 同读通道共用；行为不变）
         string? token = null;
-        if (auth)
-        {
-            if (!TokenStore.Exists)
-            {
-                Messages.Write(Messages.NotInitialized());
-                return ExitCodes.NotInitialized;
-            }
-            // 读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然。
-            // D1：静默 vault（SLCV2，hello:false）无签名可言，直接静默取——
-            // vault 本身已是 owner 显式选择的静默格式，--auth 读随之下沉为零交互。
-            byte[]? sig = null;
-            if (!TokenStore.IsDpapiVault)
-            {
-                try
-                {
-                    sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
-                }
-                catch (VaultKeyMissingException ex)
-                {
-                    Audit.Append("api_read", "api.github.com", path, null, "vault_broken");
-                    Messages.Write(Messages.VaultBroken(ex.Message));
-                    return ExitCodes.NotInitialized;
-                }
-                if (sig is null)
-                {
-                    Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
-                    Messages.Write(Messages.ConsentFailed("api", path));
-                    return ExitCodes.ConsentFailed;
-                }
-            }
-            try { token = TokenStore.LoadApproved(sig); }
-            catch (Exception)
-            {
-                Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
-                Messages.Write(Messages.Internal(afterExecutionStarted: false));
-                return ExitCodes.Internal;
-            }
-        }
+        if (auth && !TryAcquireReadToken("api", path, out token, out var authExit))
+            return authExit;
 
         var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
+        Console.Out.Write(body);
+        return ClassifyApiReadResult(path, token, st, body, notSent, reason);
+    }
+
+    /// <summary>v2.29：读通道 --auth 凭据获取单源（RunApi 与 issue list 共用；原 RunApi 内联段
+    /// 提出，行为不变）。读无破坏力：不弹批准窗，指纹（Hello）即唯一门槛——vault 解密的技术必然。
+    /// D1：静默 vault（SLCV2，hello:false）无签名可言，直接静默取——vault 本身已是 owner 显式
+    /// 选择的静默格式，--auth 读随之下沉为零交互。审计 op 恒 api_read（读通道单源，op 参数只进
+    /// 终态消息文案）。false = 已写终态消息并落审计，exitCode 直接返回。</summary>
+    private static bool TryAcquireReadToken(string op, string path, out string? token, out int exitCode)
+    {
+        token = null;
+        exitCode = 0;
+        if (!TokenStore.Exists)
+        {
+            Messages.Write(Messages.NotInitialized());
+            exitCode = ExitCodes.NotInitialized;
+            return false;
+        }
+        byte[]? sig = null;
+        if (!TokenStore.IsDpapiVault)
+        {
+            try
+            {
+                sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+            }
+            catch (VaultKeyMissingException ex)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "vault_broken");
+                Messages.Write(Messages.VaultBroken(ex.Message));
+                exitCode = ExitCodes.NotInitialized;
+                return false;
+            }
+            if (sig is null)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
+                Messages.Write(Messages.ConsentFailed(op, path));
+                exitCode = ExitCodes.ConsentFailed;
+                return false;
+            }
+        }
+        try { token = TokenStore.LoadApproved(sig); }
+        catch (Exception)
+        {
+            Audit.Append("api_read", "api.github.com", path, null, "internal_vault_decrypt_failed", consent: TokenStore.ConsentChannel);
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            exitCode = ExitCodes.Internal;
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>v2.29：api 读通道结果分类单源（RunApi 与 issue list 共用；原 RunApi 尾段提出，
+    /// 行为不变）：落读审计行 + 写终态消息 + 返回 exit code。2xx 只落审计不写消息——数据体的
+    /// 输出形态（api 原样透传 / issue list 紧凑渲染）由调用方决定。</summary>
+    private static int ClassifyApiReadResult(string path, string? token, int st, string body, bool notSent, string? reason)
+    {
         if (notSent)
         {
             Audit.Append("api_read", "api.github.com", path, null, "http_failed", result: "not_sent");
@@ -1128,7 +1160,6 @@ internal static class Program
         }
 
         Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B{(token is not null ? " auth" : " anon")}");
-        Console.Out.Write(body);
         switch (st)
         {
             case >= 200 and < 300:
@@ -1174,6 +1205,203 @@ internal static class Program
                 Messages.Write(Messages.ApiHttpError(path, st, body.Length));
                 return ExitCodes.BadRequest;
         }
+    }
+
+    // ---------- sluice issue list（§9 v2.29 读侧清单面：agent 实弹反馈"issue 只能逐个查看、
+    //              不能按标签或关键词搜索"——api 通道本可承载（?labels= 过滤、search/issues 端点），
+    //              但 repos/issues 原生 JSON ≈4KB/条（整页 >100KB，输出被截断后 agent 退化成逐条
+    //              issues/N），且端点混入 PR、搜索需 URL 编码知识。本命令 = 同一 api 读通道之上的
+    //              紧凑渲染 + 参数化过滤，不新增通道、不进写动词表/MCP Actions（ReadOps 登记）。
+
+    private static int RunIssueList(string[] args)
+    {
+        string? repo = null, state = "open", labelsRaw = null, search = null;
+        var auth = false;
+        var withPrs = false;
+        int limit = 30, page = 1;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? Next() => i + 1 < args.Length ? args[++i] : null;
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = Next();
+                    if (repo is null) return ErrMissing("issue list", "--repo");
+                    break;
+                case "--state":
+                    state = Next() ?? "";
+                    if (state is not ("open" or "closed" or "all"))
+                        return ErrBad($"--state 只接受 open / closed / all，收到：{state}");
+                    break;
+                case "--labels":
+                    labelsRaw = Next();
+                    if (labelsRaw is null) return ErrMissing("issue list", "--labels");
+                    break;
+                case "--search":
+                    search = Next();
+                    if (search is null) return ErrMissing("issue list", "--search");
+                    if (search.Trim().Length == 0) return ErrBad("--search 需要至少一个关键词（多关键词空格分隔，语义为 AND）");
+                    break;
+                case "--limit":
+                    var l = Next();
+                    if (l is null || !int.TryParse(l, out limit) || limit is < 1 or > 100)
+                        return ErrBad("--limit 需要 1–100 的整数（GitHub per_page 上限 100；更多结果用 --page 翻页）");
+                    break;
+                case "--page":
+                    var p = Next();
+                    if (p is null || !int.TryParse(p, out page) || page < 1)
+                        return ErrBad("--page 需要 ≥1 的整数");
+                    break;
+                case "--with-prs":
+                    withPrs = true;
+                    break;
+                case "--auth":
+                    auth = true;
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null)
+            return ErrBad("issue list 缺少 --repo（示例：sluice issue list --repo owner/repo --labels bug --search 内存泄漏）");
+        if (!IsRepoName(repo))
+            return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        string[] labels = [];
+        if (labelsRaw is not null)
+        {
+            labels = LabelsParse(labelsRaw) ?? [];
+            if (labels.Length == 0)
+                return ErrBad("--labels 逗号分隔标签名（trim 后空段/重复拒；不带此参数 = 不过滤）");
+        }
+        // 搜索端点的 state 限定符只有 open/closed 两态——all 会静默缩窄成"仅 open"（缺省），
+        // 与清单端点语义相悖。fail-closed 点破而非放行（v2.8 纪律：不可辨时说破，不猜）
+        if (search is not null && state == "all")
+            return ErrBad("--search 与 --state all 不兼容：搜索端点只有 open / closed 两态（缺省 open）——全量翻阅请去掉 --search 走清单模式");
+
+        var path = search is not null
+            ? IssueSearchPath(repo, state, labels, search, limit, page)
+            : IssueListPath(repo, state, labels, limit, page);
+
+        // 读通道同 posture（§9 v2.2/v2.29）：默认匿名零交互；--auth 过 Hello/静默 vault；读落审计
+        string? token = null;
+        if (auth && !TryAcquireReadToken("issue list", path, out token, out var authExit))
+            return authExit;
+
+        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
+        var cls = ClassifyApiReadResult(path, token, st, body, notSent, reason);
+        if (cls != ExitCodes.Success)
+        {
+            // 非 2xx 原样透传响应体到 stdout（同 api 通道纪律——错误族的共享消息声称"响应体已输出
+            // 到 stdout"，服务端 message 字段就在里面；成功路径才走紧凑渲染不透传）
+            Console.Out.Write(body);
+            return cls;
+        }
+
+        try
+        {
+            var (lines, issues, prs, total) = RenderIssueList(body, withPrs);
+            var shown = lines.Length;
+            var labelNote = labels.Length > 0 ? $" · labels={string.Join(",", labels)}" : "";
+            if (search is not null)
+            {
+                Console.WriteLine($"issue 搜索 · {repo} · 关键词「{search.Trim()}」{labelNote} · state={state} · 命中 {total} 条 · 第 {page} 页（每页 {limit}）");
+                foreach (var line in lines) Console.WriteLine(line);
+                var first = (page - 1) * limit + 1;
+                Console.WriteLine(total > page * limit
+                    ? $"显示第 {first}–{first + shown - 1} 条 · 下一页：--page {page + 1}"
+                    : $"显示第 {first}–{first + shown - 1} 条 · 已是末页");
+            }
+            else
+            {
+                Console.WriteLine($"issue 清单 · {repo} · state={state}{labelNote} · 第 {page} 页（每页 {limit}）");
+                foreach (var line in lines) Console.WriteLine(line);
+                var prNote = prs > 0
+                    ? (withPrs ? $"（含 {prs} 个 PR）" : $"（另有 {prs} 个 PR 已隐去，--with-prs 显示）")
+                    : "";
+                Console.WriteLine($"共 {issues} 条 issue{prNote}");
+                // repos/issues 端点无总数——满员即可能还有下一页，不足即末页（不猜总数）
+                var raw = issues + prs;
+                Console.WriteLine(raw == limit
+                    ? $"本页满员，可能还有下一页：--page {page + 1}"
+                    : "已是末页");
+            }
+            return ExitCodes.Success;
+        }
+        catch (Exception)
+        {
+            // 2xx 但形态意外（非数组/非搜索对象）：读无副作用可重跑；审计已由分类段落行，
+            // 此处只补归因（render_failed 不另开审计 op——读通道单源）
+            Messages.Write(Messages.Internal(afterExecutionStarted: false));
+            return ExitCodes.Internal;
+        }
+    }
+
+    /// <summary>v2.29 清单路径（纯函数，selftest 锁）：state/labels/per_page/page/sort 全参显式——
+    /// 不依赖端点缺省（缺省漂移即行为漂移）。labels 逐名 percent-encode 后逗号拼（GitHub 多标签
+    /// 过滤语法；含逗号标签名 LabelsParse 已拒）。</summary>
+    internal static string IssueListPath(string repo, string state, string[] labels, int limit, int page) =>
+        $"repos/{repo}/issues?state={state}&per_page={limit}&page={page}&sort=created&direction=desc"
+        + (labels.Length > 0 ? $"&labels={string.Join(",", labels.Select(Uri.EscapeDataString))}" : "");
+
+    /// <summary>v2.29 搜索路径（纯函数，selftest 锁）：search/issues 端点，q 单次整体 percent-encode
+    /// （空格→%20、CJK→%XX——调用方不再需要 URL 编码知识，这正是 agent 绕开它的原因之一）；
+    /// repo/type:issue 恒在；state=all 不存在——调用方已拒；含空格标签用引号短语（搜索限定符语法）；
+    /// 不传 sort——搜索端点缺省 best-match，关键词排序正是搜索的本意（清单端点才是 created 序）。</summary>
+    internal static string IssueSearchPath(string repo, string state, string[] labels, string keywords, int limit, int page)
+    {
+        var q = $"repo:{repo} type:issue";
+        if (state != "all") q += $" state:{state}";
+        foreach (var l in labels) q += l.Contains(' ') ? $" label:\"{l}\"" : $" label:{l}";
+        q += $" {keywords.Trim()}";
+        return $"search/issues?q={Uri.EscapeDataString(q)}&per_page={limit}&page={page}";
+    }
+
+    /// <summary>v2.29 清单渲染（纯函数，selftest 锁）。两种 2xx 形态：repos/issues = JsonArray；
+    /// search/issues = {"total_count":N,"items":[…]}（Total 透传，清单形态恒 -1）。PR 条目
+    /// （响应含 pull_request 字段）默认隐去但计数——端点混 PR 是 GitHub 事实，隐去不等于不存在；
+    /// --with-prs 显示并带 [PR] 标。行格式：#N [state[·state_reason]][PR] 标题 {标签}；标题 >120
+    /// 字符截断加 …（不切代理对——切了渲染成乱码）。形态意外抛异常交 Internal（读无副作用可重跑）。</summary>
+    internal static (string[] Lines, int Issues, int Prs, long Total) RenderIssueList(string body, bool withPrs)
+    {
+        var node = System.Text.Json.Nodes.JsonNode.Parse(body);
+        System.Text.Json.Nodes.JsonArray items;
+        long total = -1;
+        if (node is System.Text.Json.Nodes.JsonArray arr) items = arr;
+        else if (node is System.Text.Json.Nodes.JsonObject o && o["items"] is System.Text.Json.Nodes.JsonArray ia)
+        {
+            items = ia;
+            total = o["total_count"]?.GetValue<long>() ?? -1;
+        }
+        else throw new System.Text.Json.JsonException("issue 清单响应形态意外（非数组亦非搜索对象）");
+
+        var lines = new List<string>();
+        var issues = 0;
+        var prs = 0;
+        foreach (var it in items)
+        {
+            if (it is null) continue;
+            var isPr = it["pull_request"] is not null;
+            if (isPr) prs++; else issues++;
+            if (isPr && !withPrs) continue;
+            var state = it["state"]?.GetValue<string>() ?? "?";
+            var reason = it["state_reason"]?.GetValue<string>();
+            var stateTag = reason is null ? state : $"{state}·{reason}";
+            var title = it["title"]?.GetValue<string>() ?? "（无标题）";
+            if (title.Length > 120)
+            {
+                var cut = char.IsHighSurrogate(title[119]) ? 119 : 120;
+                title = title[..cut] + "…";
+            }
+            var labelNames = new List<string>();
+            if (it["labels"] is System.Text.Json.Nodes.JsonArray labs)
+                foreach (var lab in labs)
+                    if (lab?["name"]?.GetValue<string>() is { } ln)
+                        labelNames.Add(ln);
+            var number = it["number"];
+            lines.Add($"#{number} [{stateTag}]{(isPr ? "[PR]" : "")} {title}"
+                + (labelNames.Count > 0 ? $" {{{string.Join(", ", labelNames)}}}" : ""));
+        }
+        return (lines.ToArray(), issues, prs, total);
     }
 
     // ---------- sluice pr create（V1 · §9 pr_create，同闸门路径） ----------

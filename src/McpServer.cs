@@ -137,7 +137,9 @@ internal static class McpServer
         若返回 code=23（pending，带 receipt）：批准窗口已弹出、用户尚未决策——等待约 15 秒后用
         sluice_status 工具（参数 receipt）查终态（拒绝理由原文在此），终态出现前禁止重发本操作。
         一次调用恰好执行一个写操作。只读查询不要用本工具：运行命令 sluice api <path>
-        （如 sluice api repos/owner/repo/pulls）。
+        （如 sluice api repos/owner/repo/pulls）；issue 清单与按标签/关键词过滤用
+        sluice issue list --repo owner/repo [--state open|closed|all] [--labels a,b] [--search 关键词]
+        （一行一条紧凑输出，不必逐个 issues/N 拉取）。
         """;
 
     private static readonly string InputSchema = """
