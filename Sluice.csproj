@@ -11,7 +11,7 @@
     <InvariantGlobalization>false</InvariantGlobalization>
     <!-- 探针定稿：NativeAOT（启动 ~100ms，exe 19MB）；AOT 隐含 trimming -->
     <PublishAot>true</PublishAot>
-    <Version>0.7.3</Version>
+    <Version>0.7.4</Version>
   </PropertyGroup>
 
   <!-- B2（2026-10-30 实战）：构建时间戳 + git sha 内嵌为 AssemblyMetadata，

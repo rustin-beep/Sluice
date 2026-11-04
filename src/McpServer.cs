@@ -82,9 +82,12 @@ internal static class McpServer
     }
 
     /// <summary>纯函数（selftest 锁）：磁盘上的映像已不是启动时那份 ⇒ 本进程是 rename-swap 后的
-    /// 僵尸，正在提供过期工具语义。文件消失（-1 哨兵）同样视为过期——fail-closed。</summary>
+    /// 僵尸，正在提供过期工具语义。文件消失（-1 哨兵）同样视为过期——fail-closed；含 (-1,-1)
+    /// 双哨兵形态（v2.28：启动时 ProcessPath 即不可解析、此后每次 StampOf() 同为 (-1,MinValue)，
+    /// 相等比较恒 false ⇒ 永不判过期——注释与锁都声称"文件消失同判过期"却只盖了 (真实值,-1)
+    /// 方向，双 -1 破了声称的不变量；哨兵在 startup 侧即判，短路在前）。</summary>
     internal static bool ImageChanged((long Size, DateTime Written) startup, (long Size, DateTime Written) now)
-        => startup != now;
+        => startup.Size < 0 || startup != now;
 
     /// <summary>§9 写 op 的 action 值域（v2.11 起与 plan-lite §9 / CLI 写动词表三方对账，selftest 面一致锁；
     /// v2.11 将 comment 更名 pr_comment——§9.7"与 §9 写 op 一一对应"的字面承诺自此零例外）。</summary>

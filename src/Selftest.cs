@@ -76,7 +76,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26 僵尸自曝锁 / v2.27 收割一致锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -250,6 +250,9 @@ internal static class Selftest
                                                       (23640576, new DateTime(2026, 11, 4, 11, 0, 0, DateTimeKind.Utc))), true);
         Eq("文件消失即过期", McpServer.ImageChanged((23640576, new DateTime(2026, 11, 4, 10, 28, 5, DateTimeKind.Utc)),
                                                    (-1, DateTime.MinValue)), true);
+        // v2.28：双哨兵 (-1,-1)——启动时即不可解析、此后也取不到，相等比较会放行（永不判过期），
+        // 与"文件消失同判过期 fail-closed"的声称矛盾；startup 侧哨兵前置短路
+        Eq("双哨兵(-1,-1)同判过期", McpServer.ImageChanged((-1, DateTime.MinValue), (-1, DateTime.MinValue)), true);
 
         // v2.25：status 终态映射锁——pending 收割后 exit/retry 必须与原决策同族
         //（denied→2/never、timeout→3/wait_user、consent_failed→6/wait_user、rate_limited→22/wait_until、
