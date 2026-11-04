@@ -44,3 +44,10 @@
 - logs 数据体读取待 PAT 补 Actions:Read 后实测（跟随路径已 tarball 实测通过）。
 - `--auth` 认证读的 PAT 权限指引（ApiAuthRequired 文案已够；setup 文档可补一句 Actions:Read 的用途说明）。
 - 旁证入册：09:16/09:36 两次 `internal_gate_crash (TypeInitializationException)` 未定位（自愈，留观）；10:29/10:54 push timeout 与平台不稳窗吻合。
+
+## 4. 遗留销账（2026-11-04）
+
+- **重放通道：已实弹**——首笔 approved 重放 2026-10-31 03:33Z（`iss-358-359-360-362-linux@0bf3c586→c9ac530d`，本文次日）；至 2026-11-04 05:41Z 累计 124 条重放审计行（target 含 `→` 的 push）：approved 89 / up_to_date 8 / remote_moved 8 / timeout 12 / denied 4 / other 3——CLI 与 MCP 前门（via 字段）都在用。§9.6 通道验证闭环。
+- **logs 数据体：实测通过（2026-11-04 05:49Z）**——`sluice api "repos/rustin-beep/Vitro/actions/jobs/126409293571/logs" --auth` → exit 0 / HTTP 200 / 85251B 日志体落 stdout / 2.7s；302→CDN 签名 URL 跟随 + DoH + issuer 校验全程无感，审计行 `http_200 · 85251B auth`。PAT 已带 Actions:Read（同窗匿名 runs 读仍 403 限流，对照成立）。实测二进制 `v0.7.0 · git 2ae969d5+dirty · plan-lite v2.24`。跟随路径全族（tarball/logs）实弹完毕。
+- **Actions:Read 指引：已落地**——README PAT 矩阵含「`api --auth` 读 CI（runs/jobs/logs）→ Actions: Read」行。
+- **gate 崩溃仍留观**：诊断保真已先行（97cd5ae DescribeCrash，异常链+堆栈随身进审计），根因未再现。
