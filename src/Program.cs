@@ -119,8 +119,9 @@ internal static class Program
     /// 其余照录决策字面交回用户。v2.27 缘起：consent_failed 与 rate_limited 都是批准后才落审计的
     /// decision——恰落在 pending 收割窗，原映射只盖四族把它们收割成 exit 21/isError=true/"勿重发"，
     /// 与 live 同 decision 的 6·wait_user / 22·wait_until 指引相反（落哪边取决于人是否 15s 内点完，
-    /// 非确定性契约）。cooldown 不映射：无生产审计行且未接线，映射而无渲染分支只会造出新分叉，
-    /// 接线时同批进。</summary>
+    /// 非确定性契约）。v2.31：http_failed 同批入族（20/retry_ok——E0-20261108 实弹同一矛盾）；
+    /// pending / dedup_blocked 不进本表——RunStatus 在 switch 之前单列处理（行龄/链式跳转）。
+    /// cooldown 不映射：无生产审计行且未接线，映射而无渲染分支只会造出新分叉，接线时同批进。</summary>
     internal static int StatusFamily(string decision) => decision switch
     {
         "denied" => ExitCodes.Denied,
@@ -128,8 +129,26 @@ internal static class Program
         "approved" or "up_to_date" => ExitCodes.Success,
         "consent_failed" => ExitCodes.ConsentFailed,
         "rate_limited" => ExitCodes.RateLimitWait,
+        "http_failed" => ExitCodes.HttpFailed,
         _ => ExitCodes.Unknown,
     };
+
+    /// <summary>v2.31（纯函数，selftest 锁）：dedup_blocked 审计 result 形如 "pending:{req|cli}"——
+    /// 取 pending: 后的原请求标识；非该形态返回 null（RunStatus 链式收割用）。</summary>
+    internal static string? DedupInnerOf(string result)
+    {
+        const string P = "pending:";
+        return result.StartsWith(P, StringComparison.Ordinal) && result.Length > P.Length ? result[P.Length..] : null;
+    }
+
+    /// <summary>v2.31（纯函数，selftest 锁）：http_failed 审计 result 形如 "not_sent:{describe}"
+    /// （≤v0.7.5 旧行仅 "not_sent"）——取首个冒号后的网络层描述，无则空串（StatusHttpFailed 渲染）。
+    /// Describe 输出不含 ASCII 冒号开头形态，首冒号切分安全（同 RateLimitWhatOf 纪律）。</summary>
+    internal static string NotSentDetailOf(string result)
+    {
+        var i = result.IndexOf(':');
+        return i >= 0 && i + 1 < result.Length ? result[(i + 1)..] : "";
+    }
 
     /// <summary>v2.27 收割渲染辅助（纯函数，selftest 锁）：rate_limited 审计 result 形如
     /// "http_403:{what}"（push 为 "not_executed:{what}"——PushFail 原有形态，what 即 RateLimitWhat
@@ -161,6 +180,28 @@ internal static class Program
             return ExitCodes.PendingGate;
         }
         var l = line.Value;
+        // v2.31：pending 行（请求在窗）——fresh 继续等；超龄 = 孤儿窗（进程已死，终态不会再来，
+        // 不再无限回"尚未决"——E0 报告误诊的"永久 pending"体验的根治）
+        if (l.Decision == "pending")
+        {
+            if (DateTime.UtcNow - l.Ts <= DedupGate.StaleAfter)
+            {
+                Messages.Write(Messages.StatusPending(receipt));
+                return ExitCodes.PendingGate;
+            }
+            Messages.Write(Messages.StatusOrphan(receipt, l.Op, l.Target ?? "?", (int)DedupGate.StaleAfter.TotalSeconds));
+            return ExitCodes.Unknown;
+        }
+        // v2.31：dedup_blocked 行——本回执已并入原请求，链式收割原回执终态（跳一层，inner==receipt 防环；
+        // inner==cli 无回执可跳，回放 DedupBlockedCli 的终态语义：等对方终态落盘后重发）
+        if (l.Decision == "dedup_blocked")
+        {
+            if (DedupInnerOf(l.Result) is { } inner && inner != receipt && inner != "cli"
+                && inner.Length is >= 8 and <= 32 && inner.All(char.IsAsciiHexDigit))
+                return RunStatus(inner);
+            Messages.Write(Messages.DedupBlockedCli(l.Op, l.Target ?? "?", Gate.TimeoutSeconds));
+            return ExitCodes.Cooldown;
+        }
         switch (StatusFamily(l.Decision))
         {
             case ExitCodes.Denied:
@@ -188,6 +229,13 @@ internal static class Program
                     ? Messages.PushRateLimited(l.Repo ?? "?", l.Target ?? "?", RateLimitWhatOf(l.Result))
                     : Messages.WriteRateLimited(l.Op, l.Target ?? "?", HttpStOf(l.Result), RateLimitWhatOf(l.Result)));
                 return ExitCodes.RateLimitWait;
+            case ExitCodes.HttpFailed:
+                // v2.31：http_failed 收割入族（同 live 20/retry_ok——请求未发出、无任何副作用、
+                // 间隔 30s 可重试）。此前落 StatusOther/21/wait_user"勿重发"，同一决策两条路径
+                // 指引相反（E0-20261108 实弹回执 14fb4b0f）。网络层描述自 v2.31 起随审计 result
+                //（"not_sent:{describe}"），旧行无描述渲染为空
+                Messages.Write(Messages.StatusHttpFailed(l.Op, l.Target ?? "?", NotSentDetailOf(l.Result)));
+                return ExitCodes.HttpFailed;
             default:
                 Messages.Write(Messages.StatusOther(l.Op, l.Target ?? "?", l.Decision, l.Result));
                 return ExitCodes.Unknown;
@@ -259,8 +307,8 @@ internal static class Program
                                                         issue 清单一行一条（#N [状态] 标题 {标签}）；
                                                         --labels 标签过滤、--search 关键词搜索（多个
                                                         空格分隔）；清单端点混入的 PR 默认隐去计数
-                                                        披露，--with-prs 显示；只读零交互（--auth 走
-                                                        vault 读私有库），读落审计
+                                                        披露，--with-prs 显示；只读零交互（--auth/静默
+                                                        复读走 vault），读落审计
               sluice issue label --repo O/R --number N --labels a,b,c
                                                         设置标签，整组替换（经批准；弹窗披露当前标签→
                                                         新标签→摘除清单；PR 编号同样有效——PR 与 issue
@@ -287,7 +335,9 @@ internal static class Program
                                                         需 PAT Actions:Read and write，缺则 403 有专属指引）
               sluice branch delete --repo O/R --branch B
                                                         删除远端分支 ref（commits 保留，可用 sha 重建）
-              sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 过 Hello 带 token；
+              sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 直接带 token 读私有库；
+                                                        匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读
+                                                        一次（独立配额，公开库几乎总能读通）；
                                                         路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计；
                                                         logs 等端点 302→CDN 签名 URL 自动跟随，仅限 GitHub 域 ≤3 跳）
               sluice status <receipt>                  查 MCP pending 请求的终态（github_write 返回
@@ -307,7 +357,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.29");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.31");
         return 0;
     }
 
@@ -402,6 +452,9 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        // v2.31：入闸单源——同 (push, repo, branch) 已有未决窗则拦截并入原回执；否则落 pending 行
+        //（去重键用裸分支名：重放形态 target 随内容变化，不可作键）
+        if (!TryEnterGate("push", repo, branch, null, out var gateDedup)) return gateDedup;
 
         RestPush.Plan plan;
         try
@@ -510,7 +563,8 @@ internal static class Program
         try { r = RestPush.ExecuteAsync(token, plan).GetAwaiter().GetResult(); }
         catch (HttpRequestException ex)
         {
-            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            // v2.31：网络层描述随行（"not_sent:{describe}"）——status 收割 StatusHttpFailed 渲染用
+            Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}");
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -726,7 +780,31 @@ internal static class Program
             exitCode = ExitCodes.SealViolation;
             return false;
         }
-        return true;
+        // v2.31：入闸单源——同 (op,repo,auditTarget) 已有未决窗则拦截并入原回执；否则落 pending 行
+        return TryEnterGate(op, repo, auditTarget, null, out exitCode);
+    }
+
+    /// <summary>v2.31 写请求入闸单源（TryPreflight 尾部 + 8 个内联 verb 同款调用）：
+    /// ① 落 pending 审计行——未决请求从此对 sluice_status / 去重可见（E0-20261108 前
+    /// 未决零痕迹，"尚无终态"无法区分排队与丢单）；② 同 (op, repo, target) 已有存活
+    /// pending（DedupGate.FindPending，孤儿超龄放行）→ 不开新窗，落 dedup_blocked 行
+    /// （result="pending:{原req|cli}"，收割链据此跳转）+ 消息并入原回执（MCP）/等待指引
+    /// （CLI，无回执不挂 23）。"终态未定禁止重发"由调用方纪律升级为闸门强制。</summary>
+    internal static bool TryEnterGate(string op, string repo, string target, string? sha8, out int exitCode)
+    {
+        exitCode = 0;
+        var dup = DedupGate.FindPending(op, repo, target);
+        if (dup is null)
+        {
+            DedupGate.MarkPending(op, repo, target, sha8);
+            return true;
+        }
+        Audit.Append(op, repo, target, sha8, "dedup_blocked", result: $"pending:{dup}");
+        Messages.Write(dup == "cli"
+            ? Messages.DedupBlockedCli(op, target, Gate.TimeoutSeconds)
+            : Messages.DedupBlocked(op, target, dup, Gate.TimeoutSeconds + Gate.McpPendingSec));
+        exitCode = dup == "cli" ? ExitCodes.Cooldown : ExitCodes.PendingGate;
+        return false;
     }
 
     /// <summary>尽力元数据预读（pr_merge/pr_reopen/issue_close/branch_delete 纪律，v2.11 收敛单源）：
@@ -876,7 +954,7 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append(op, repo, auditTarget, sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            Audit.Append(op, repo, auditTarget, sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}"); // v2.31 描述随行（收割渲染）
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -947,6 +1025,7 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        if (!TryEnterGate("pr_comment", repo, $"#{number}", null, out var gateDedup)) return gateDedup; // v2.31 入闸单源
 
         string body;
         try { body = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
@@ -1068,7 +1147,7 @@ internal static class Program
         if (path is null)
         {
             Messages.Write(Messages.BadRequest(
-                "api 缺少 <api-path>（示例：sluice api repos/owner/repo/pulls/9；私有资源加 --auth 过 Windows Hello）"));
+                "api 缺少 <api-path>（示例：sluice api repos/owner/repo/pulls/9；私有资源加 --auth 直接带凭据读）"));
             return ExitCodes.BadRequest;
         }
         // GET-only + 路径白名单（拒 scheme/主机/.. 逃逸——这不是开放代理，只收 api.github.com 的相对路径）。
@@ -1087,9 +1166,10 @@ internal static class Program
         if (auth && !TryAcquireReadToken("api", path, out token, out var authExit))
             return authExit;
 
-        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
+        // v2.30：匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读（TryReadMeta 模式推广）
+        var (st, body, notSent, reason, usedToken) = ApiGetWithAnonFallback(path, token);
         Console.Out.Write(body);
-        return ClassifyApiReadResult(path, token, st, body, notSent, reason);
+        return ClassifyApiReadResult(path, usedToken, st, body, notSent, reason);
     }
 
     /// <summary>v2.29：读通道 --auth 凭据获取单源（RunApi 与 issue list 共用；原 RunApi 内联段
@@ -1207,6 +1287,38 @@ internal static class Program
         }
     }
 
+    /// <summary>v2.30：匿名读回退判定（纯函数，selftest 锁）：401/403/404/429 = 认证可见性/限流族
+    /// ——匿名撞这四档时带凭据复读可能翻盘（匿名 primary 配额耗尽 / actions 端点对匿名收紧 /
+    /// 私有库匿名不可见）；其余状态复读无意义或已有专属档（2xx 成功、3xx 域外重定向、
+    /// 5xx 带凭据同样 5xx、0/-1 网络层与凭据无关）。</summary>
+    internal static bool AnonReadShouldFallback(int st) => st is 401 or 403 or 404 or 429;
+
+    /// <summary>v2.30：api 读通道匿名回退——v2.24 TryReadMeta 模式推广到整个读通道（RunApi 与
+    /// issue list 共用）。2026-11-05 实弹：匿名配额 60/h 耗尽后 agent 读操作全数 403 卡死，同刻
+    /// --auth 200；且 fine-grained PAT 对白名单外公开库全可读（Metadata 强制权限，实测覆盖
+    /// issues/actions 端点），复读几乎总能翻盘。匿名撞 401/403/404/429 且 vault 为静默格式
+    /// （SLCV2，同 --auth 零交互姿态——读无破坏力，不弹批准窗）→ 以 token 复读一次，复读结果
+    /// 即最终结果（分类/审计同 --auth：双失败时"token 无权/私有库"的归因诚实）。Hello vault
+    /// 不复读（门控前多一道生物事件 = 弹窗疲劳，TryReadMeta 同纪律）；vault 异常退回匿名结果
+    /// 不阻塞。匿名尝试照常落读审计（fallback 时 audit 两行：anon + auth）。</summary>
+    private static (int St, string Body, bool NotSent, string? Reason, string? Token)
+        ApiGetWithAnonFallback(string path, string? token)
+    {
+        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
+        if (token is not null || notSent || st == 0 || !AnonReadShouldFallback(st)
+            || !TokenStore.Exists || !TokenStore.IsDpapiVault)
+            return (st, body, notSent, reason, token);
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B anon");
+        Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {st}），静默 vault 带凭据复读一次（走独立配额）");
+        try
+        {
+            var tok = TokenStore.LoadApproved(null);
+            var (st2, body2, notSent2, reason2) = GitHubApi.ApiGetAsync(tok, path).GetAwaiter().GetResult();
+            return (st2, body2, notSent2, reason2, tok);
+        }
+        catch { return (st, body, notSent, reason, token); } // vault 异常退回匿名结果（TryReadMeta 同纪律）
+    }
+
     // ---------- sluice issue list（§9 v2.29 读侧清单面：agent 实弹反馈"issue 只能逐个查看、
     //              不能按标签或关键词搜索"——api 通道本可承载（?labels= 过滤、search/issues 端点），
     //              但 repos/issues 原生 JSON ≈4KB/条（整页 >100KB，输出被截断后 agent 退化成逐条
@@ -1287,8 +1399,9 @@ internal static class Program
         if (auth && !TryAcquireReadToken("issue list", path, out token, out var authExit))
             return authExit;
 
-        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
-        var cls = ClassifyApiReadResult(path, token, st, body, notSent, reason);
+        // v2.30：匿名回退同 api 通道（读通道单源——issue list 是同一读通道的紧凑渲染面）
+        var (st, body, notSent, reason, usedToken) = ApiGetWithAnonFallback(path, token);
+        var cls = ClassifyApiReadResult(path, usedToken, st, body, notSent, reason);
         if (cls != ExitCodes.Success)
         {
             // 非 2xx 原样透传响应体到 stdout（同 api 通道纪律——错误族的共享消息声称"响应体已输出
@@ -1473,6 +1586,8 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        // v2.31 入闸单源（键取审计 target 形态 "{$base}←{$head}"，与终态行/去重行同形）
+        if (!TryEnterGate("pr_create", repo, $"{@base}←{head}", null, out var gateDedup)) return gateDedup;
 
         string body;
         try { body = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
@@ -1553,7 +1668,7 @@ internal static class Program
                 Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
                 return ExitCodes.CredentialExpired;
             case GitHubApi.OutcomeKind.NotSent:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{r.Reason ?? "连接失败"}"); // v2.31 描述随行
                 Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
                 return ExitCodes.HttpFailed;
             case GitHubApi.OutcomeKind.UnknownOutcome:
@@ -1646,6 +1761,7 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        if (!TryEnterGate("pr_merge", repo, $"#{number}", null, out var gateDedup)) return gateDedup; // v2.31 入闸单源
 
         // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源：匿名 403/404 且静默 vault 时以凭据复读，
         // 2026-11-03 Vitro #452 实弹——匿名配额耗尽后弹窗"? ← ？"且误报"私有库"）。
@@ -1750,7 +1866,7 @@ internal static class Program
             {
                 // 复核 GET 无副作用且 merge 未发出——整条命令可安全重跑（retry_ok）
                 Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel,
-                    result: vNotSent ? "not_sent" : "timeout_retry_safe_get");
+                    result: vNotSent ? $"not_sent:{vWhy ?? "连接失败"}" : "timeout_retry_safe_get"); // v2.31 描述随行（收割渲染）
                 Messages.Write(Messages.PrMergeVerifyFailed(vNotSent ? vWhy ?? "连接失败" : "复核请求超时"));
                 return ExitCodes.HttpFailed;
             }
@@ -1806,7 +1922,7 @@ internal static class Program
                     catch (Exception ex)
                     {
                         Audit.Append("pr_merge", repo, headBranch, sha, "delete_head_failed",
-                            consent: TokenStore.ConsentChannel, result: "not_sent");
+                            consent: TokenStore.ConsentChannel, result: $"not_sent:{ex.Message}"); // v2.31 描述随行
                         Messages.Write(Messages.BranchDeleteFailed(repo, headBranch, ex.Message));
                     }
                 }
@@ -1817,7 +1933,7 @@ internal static class Program
                 Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}"));
                 return ExitCodes.CredentialExpired;
             case GitHubApi.OutcomeKind.NotSent:
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{r.Reason ?? "连接失败"}"); // v2.31 描述随行
                 Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
                 return ExitCodes.HttpFailed;
             case GitHubApi.OutcomeKind.UnknownOutcome:
@@ -1894,6 +2010,7 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        if (!TryEnterGate("branch_delete", repo, branch, null, out var gateDedup)) return gateDedup; // v2.31 入闸单源
 
         var target = $"{repo}@{branch}";
         var sha = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(target)))[..8].ToLowerInvariant();
@@ -2031,7 +2148,7 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("branch_delete", repo, branch, sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            Audit.Append("branch_delete", repo, branch, sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}"); // v2.31 描述随行
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -2086,6 +2203,7 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        if (!TryEnterGate("pr_reopen", repo, $"#{number}", null, out var gateDedup)) return gateDedup; // v2.31 入闸单源
 
         // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源，同 pr_merge 纪律：读落审计，失败不阻塞）
         var (metaSt, prJson, metaAuthed) = TryReadMeta($"repos/{repo}/pulls/{number}");
@@ -2217,7 +2335,7 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("pr_reopen", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            Audit.Append("pr_reopen", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}"); // v2.31 描述随行
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -2270,6 +2388,7 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        if (!TryEnterGate("issue_close", repo, $"#{number}", null, out var gateDedup)) return gateDedup; // v2.31 入闸单源
 
         // 尽力而为的元数据预读（v2.24 收敛 TryReadMeta 单源；issues API 对 PR 编号同样应答——
         // 靠 pull_request 字段区分类型）
@@ -2399,7 +2518,7 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("issue_close", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            Audit.Append("issue_close", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}"); // v2.31 描述随行
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -3183,6 +3302,8 @@ internal static class Program
             Messages.Write(Messages.SealViolation(string.Join("；", violations)));
             return ExitCodes.SealViolation;
         }
+        // v2.31 入闸单源（键取审计 target 形态 "{workflow}@{ref}"）
+        if (!TryEnterGate("workflow_dispatch", repo, $"{workflow}@{@ref}", null, out var gateDedup)) return gateDedup;
 
         string? inputsJson = null;
         if (inputsFile is not null)
@@ -3311,7 +3432,7 @@ internal static class Program
         }
         catch (HttpRequestException ex)
         {
-            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+            Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{GitHubApi.Describe(ex)}"); // v2.31 描述随行
             Messages.Write(Messages.HttpFailed(GitHubApi.Describe(ex)));
             return ExitCodes.HttpFailed;
         }
@@ -3341,7 +3462,7 @@ internal static class Program
 
     private static int NotSent(GitHubApi.ApiResult r, string repo, int number, string sha)
     {
-        Audit.Append("pr_comment", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: "not_sent");
+        Audit.Append("pr_comment", repo, $"#{number}", sha, "http_failed", consent: TokenStore.ConsentChannel, result: $"not_sent:{r.Reason ?? "连接失败"}"); // v2.31 描述随行
         Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
         return ExitCodes.HttpFailed;
     }

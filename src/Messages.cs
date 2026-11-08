@@ -65,6 +65,13 @@ internal static class Messages
     public const string DenyReasonOpen = "用户拒绝理由：\"";
     public const string DenyReasonClose = "\"——请按此理解";
 
+    // v2.31：回执以 ReceiptOpen/Close 定界——McpServer.ExtractReceipt 据此把 receipt 提进
+    // structuredContent（单源，selftest 往返锁）。用武之地不止 server 自产的 PendingGate：
+    // 子进程快路径的 DedupBlocked 携带的是**原请求**回执（非本次生成）——server 不看消息
+    // 定界就只会回错自己刚生成的 GUID，收割链断在第一跳。
+    public const string ReceiptOpen = "回执「";
+    public const string ReceiptClose = "」";
+
     public static Msg Denied(string op, string target, string preset, string? freeText) => new(
         "[Sluice·终态]",
         $"""
@@ -99,13 +106,40 @@ internal static class Messages
         "[Sluice]",
         $"""
         批准窗口已弹出，等待用户决策（最长 {settleBySec} 秒内必有终态：批准执行 / 拒绝 / 超时自动拒绝）。
-        本次调用不再阻塞等待——约 {pollAfterSec} 秒后用工具 sluice_status 查终态（参数 receipt：{receipt}；
+        本次调用不再阻塞等待——约 {pollAfterSec} 秒后用工具 sluice_status 查终态（参数 receipt：{ReceiptOpen}{receipt}{ReceiptClose}；
         无该工具时 CLI 等价：sluice status {receipt}），即可查得终态（含用户拒绝理由原文）。结果未定前：
-        1. 禁止重发同一写操作（窗口已开，重发只会再弹一窗，不是重试途径）；
+        1. 禁止重发同一写操作（v2.31 起重发会被闸门去重并入本回执，不会另开新窗，不是重试途径）；
         2. 禁止换其他方式完成同一操作；
         3. 查询无副作用，可间隔重查直至出现 [Sluice·终态]。
         """,
         ExitCodes.PendingGate, "wait_until", false);
+
+    /// <summary>v2.31 同操作未决去重（E0-20261108 实弹：同目标三窗堆叠，用户 6 连点）：
+    /// 同 (op,repo,target) 已有未决批准窗时，新请求不开新窗、不执行、无任何副作用——并入原回执。
+    /// exit 23：对调用方而言"本操作的命运 = 那扇窗的命运"，pending 语义成立；原回执随
+    /// ReceiptOpen/Close 定界随文，server 提进 structuredContent.receipt——收割链：
+    /// 本回执 → dedup_blocked 审计行 → 原回执终态（RunStatus 链式跳转）。</summary>
+    public static Msg DedupBlocked(string op, string target, string receipt, int settleBySec) => new(
+        "[Sluice]",
+        $"""
+        {op} → {target} 已有一扇未决批准窗（同操作同目标一次只开一窗）。
+        本次未开新窗、未执行、无任何副作用——已并入原请求：{ReceiptOpen}{receipt}{ReceiptClose}。
+        约 15 秒后用工具 sluice_status 查该回执终态（无该工具时 CLI 等价：sluice status {receipt}），
+        最长 {settleBySec} 秒内必有终态（批准执行 / 拒绝 / 超时自动拒绝）；终态出现前禁止重发本操作。
+        """,
+        ExitCodes.PendingGate, "wait_until", false);
+
+    /// <summary>v2.31：未决窗在 CLI 前门（无回执可查）——本回执即终态，等对方终态落盘后重发。
+    /// 不挂 23（pending 家族无 receipt 可收割，只会造出永远查不到终态的回执——恰是 E0 报告
+    /// 误诊的"永久 pending"）；Cooldown(5)/wait_until/isError=false：闸门暂不可用，等到点再敲。</summary>
+    public static Msg DedupBlockedCli(string op, string target, int timeoutSec) => new(
+        "[Sluice·终态]",
+        $"""
+        {op} → {target} 已有一扇未决批准窗（来自 CLI 前门，无回执可查）。本次操作未执行，无任何变更。
+        该窗最长 {timeoutSec} 秒内必有终态（批准执行 / 拒绝 / 超时自动拒绝）——等它落盘后重发本操作即可。
+        这就是本次调用的终态，不会再变化。
+        """,
+        ExitCodes.Cooldown, "wait_until", false);
 
     /// <summary>v2.26：MCP server 映像过期（磁盘 exe 已更新，本进程是 rename-swap 部署后的僵尸）。
     /// 旧语义会静默丢终态（2026-11-04 实弹：四个 v2.24 旧 server 继续服务，拒绝理由随宿主超时沉没），
@@ -152,17 +186,46 @@ internal static class Messages
         ExitCodes.Success, "—", false);
 
     /// <summary>status 查得其余终态（收割映射族之外的技术失败族）——事实照录，语义按决策字面。
-    /// v2.27：consent_failed / rate_limited 已进映射族（收割与 live 同 decision 同 exit/retry/isError），
-    /// 本消息只剩真正未映射的 decision（not_found / http_5xx / 各 op_rejected 等）。</summary>
+    /// v2.27：consent_failed / rate_limited 已进映射族（收割与 live 同 decision 同 exit/retry/isError）；
+    /// v2.31：http_failed 同批入族（StatusHttpFailed）。本消息只剩真正未映射的 decision
+    /// （unknown / not_found / http_5xx / 各 op_rejected 等——bad_request 族收割重建需 plan 语境，
+    /// 暂照录字面，plan-lite v2.31 遗留项）。</summary>
     public static Msg StatusOther(string op, string target, string decision, string result) => new(
         "[Sluice·终态]",
         $"""
         终态已查得：{op} → {target}
         决策：{decision}
         审计结果：{result}
-        该结果不在收割映射族内（denied / timeout / consent_failed / rate_limited / approved·up_to_date）——按决策字面处理（结果未知族交回用户，勿重发）。
+        该结果不在收割映射族内（denied / timeout / consent_failed / rate_limited / approved·up_to_date / http_failed）——按决策字面处理（结果未知族交回用户，勿重发）。
         """,
         ExitCodes.Unknown, "wait_user", true);
+
+    /// <summary>v2.31：pending 行超龄无终态——窗口进程已死（硬杀/断电/rename-swap 部署），
+    /// 终态不会再出现。不再无限回"尚未决"（E0-20261108 报告误诊的"永久 pending"体验的根治：
+    /// 回执要么等来终态、要么到点被点名孤儿——不会永远第三态）。窗口未决就不会进入执行段，
+    /// 故"大概率未执行"是事实句，但硬杀时点无法证明，仍按结果未知族的查证纪律给指引。</summary>
+    public static Msg StatusOrphan(string receipt, string op, string target, int staleSec) => new(
+        "[Sluice·终态]",
+        $"""
+        {receipt} 的批准窗已超过 {staleSec} 秒仍无终态——窗口进程疑似已死（正常窗口最迟超时自动拒绝并落盘），
+        终态不会再出现。该请求大概率未执行（窗口未决不进入执行段），但无法完全排除。
+        1. 不要原地无限重查本回执——它是孤儿，不会再有终态；
+        2. 按结果未知处理：{op} → {target} 先查证（sluice api 看目标现状，或请用户核对页面）；
+        3. 查证未生效 → 可重发（v2.31 起孤儿 pending 不阻塞新请求，会开新窗）；已生效 → 不要再发。
+        """,
+        ExitCodes.Unknown, "wait_user", true);
+
+    /// <summary>v2.31：http_failed 收割入族——同步路径本就是 20/retry_ok（请求未发出、无任何副作用，
+    /// "间隔 30 秒可重试"），收割此前落 StatusOther/21/wait_user"勿重发"，同一决策两条路径指引相反
+    /// （E0 实弹回执 14fb4b0f：agent 收割到 wait_user，而同步语义可直接重试）。detail 为 v2.31 起
+    /// 随审计行的网络层描述（≤v0.7.5 旧行仅 "not_sent"，渲染为空）。</summary>
+    public static Msg StatusHttpFailed(string op, string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        终态已查得：{op} → {target} 网络层失败，请求未发出，无任何副作用{(detail.Length > 0 ? $"（{detail}）" : "")}。
+        与同步路径同语义：可间隔 30 秒后重发同一操作；连续 3 次失败则报告用户。
+        """,
+        ExitCodes.HttpFailed, "retry_ok", true);
 
     // ---- timeout（exit 3，retry=wait_user；时长自 C4 config 可配，文案跟随实际值） ----
     public static Msg Timeout(string op, string target, int seconds) => new(
@@ -824,6 +887,10 @@ internal static class Messages
         ("statusdone",  StatusDone("pr_merge", "rustin-beep/Vitro#452", "executed:https://github.com/rustin-beep/Vitro/commit/69f3a989")),
         ("statusupodate", StatusUpToDate("push", "feat/x", "not_executed")), // v2.27：up_to_date 单列（"已执行"对它是假话）
         ("statusother", StatusOther("workflow_dispatch", "rustin-beep/Vitro ci.yml@x", "not_found", "http_404")),
+        ("statusorphan", StatusOrphan("a1b2c3d4e5f60718", "push", "rustin-beep/vivarium v3-libc", 180)), // v2.31：孤儿 pending 点名（终态不会再来）
+        ("statushttpfailed", StatusHttpFailed("push", "v3-libc", "连接被重置")), // v2.31：http_failed 收割入族（同 live 的 20/retry_ok）
+        ("dedupblocked", DedupBlocked("push", "v3-libc", "a1b2c3d4e5f60718", 75)), // v2.31：同操作未决去重——并入原回执（23/wait_until）
+        ("dedupblockedcli", DedupBlockedCli("push", "v3-libc", 60)), // v2.31：未决窗在 CLI 前门（5/wait_until——无回执可收割，不给 23）
         ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
         ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),
         ("writeratelimited", WriteRateLimited("pr_close", "rustin-beep/Vitro#390", 403, "secondary rate limit，服务端要求等待约 2 分钟")),

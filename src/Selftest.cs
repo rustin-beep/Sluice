@@ -69,6 +69,10 @@ internal static class Selftest
         ("statusupodate",   ExitCodes.Success,       "—"),          // v2.27：up_to_date 单列（"已获批准并执行"对它是假话）
         ("statusother",     ExitCodes.Unknown,       "wait_user"),  // v2.25：status 收割其余终态（照录决策字面）
         ("serverstale",     ExitCodes.Internal,      "wait_user"),  // v2.26：僵尸 server 自曝——重启会话后重发（与 internal 族同档：技术失败，交回用户）
+        ("statusorphan",     ExitCodes.Unknown,      "wait_user"),  // v2.31：孤儿 pending 点名——终态不会再来，查证后重发（不再无限"尚未决"）
+        ("statushttpfailed", ExitCodes.HttpFailed,   "retry_ok"),   // v2.31：http_failed 收割入族（同 live 20/retry_ok，消解两路径指引相反）
+        ("dedupblocked",     ExitCodes.PendingGate,  "wait_until"), // v2.31：同操作未决去重——并入原回执（对调用方仍是 pending 语义，收割链可达终态）
+        ("dedupblockedcli",  ExitCodes.Cooldown,     "wait_until"), // v2.31：未决窗在 CLI 前门（无回执不挂 23——否则造出永查无终态的回执）
     ];
 
     private static readonly HashSet<string> ValidRetry =
@@ -76,7 +80,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -116,8 +120,12 @@ internal static class Selftest
                     or "apiredirected" or "pushbasemissing" or "pushtoolarge" or "pushsteprejected"
                 && !sample.Text.Contains("本次未产生任何副作用"))
             { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
-            if (name is "httpfail" or "pushblobmismatch" && !sample.Text.Contains("无任何副作用"))
+            if (name is "httpfail" or "pushblobmismatch" or "statushttpfailed" && !sample.Text.Contains("无任何副作用"))
             { fail++; Console.WriteLine("!! http_failed 缺\"无任何副作用\"句"); }
+            if (name == "dedupblockedcli" && !sample.Text.Contains("本次操作未执行"))
+            { fail++; Console.WriteLine("!! dedup CLI 版缺事实前置句\"本次操作未执行\""); }
+            if (name == "statusorphan" && !sample.Text.Contains("结果未知"))
+            { fail++; Console.WriteLine("!! 孤儿点名缺\"结果未知\"查证语义"); }
 
             // 设计原则 4：拒绝类消息必含绕行禁止语义（措辞按 §8.2 原文：cooldown 用"绕过"，其余用"重试"）
             if (name is "denied" or "timeout" or "policy" && !sample.Text.Contains("重试"))
@@ -138,6 +146,8 @@ internal static class Selftest
         fail += ReviewFixChecks();
         fail += DenyVisibilityChecks();
         fail += IssueListChecks();
+        fail += AnonFallbackChecks();
+        fail += PendingDedupChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -373,7 +383,7 @@ internal static class Selftest
     }
 
     /// <summary>v2.17 标签面批的 pure 决策入锁：--labels 解析（trim / 空段拒 / 重复拒——
-    /// OrdinalIgnoreCase，GitHub 标签唯一性大小写不敏感）与整组替换摘除清单（当前减新）。
+    /// OrdinalIgnoreCase，GitHub 标签唯一性大小写不敏感）与整组替换摘除清单（当前减）。
     /// 与网络解耦——决策表本身即不变量。</summary>
     private static int LabelChecks()
     {
@@ -400,6 +410,27 @@ internal static class Selftest
         Eq("当前空无摘除", Program.LabelRemovals([], ["bug"]).Length, 0);
 
         Console.WriteLine(fail == 0 ? "标签锁通过。" : "标签锁有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>v2.30 匿名读回退判定入锁：401/403/404/429（认证可见性/限流族）触发复读；
+    /// 2xx/3xx/422/5xx/超时/未发出不触发（复读无意义或与凭据无关）。与网络/vault 解耦——
+    /// 触发面本身就是不变量（扩大触发面 = 每次对应失败多一次 token 请求与审计行）。</summary>
+    private static int AnonFallbackChecks()
+    {
+        Console.WriteLine("--- 匿名读回退锁（v2.30：401/403/404/429 触发，其余不触发）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        foreach (var st in new[] { 401, 403, 404, 429 })
+            Eq($"HTTP {st} 触发复读", Program.AnonReadShouldFallback(st), true);
+        foreach (var st in new[] { 200, 204, 301, 302, 422, 500, 0, -1 })
+            Eq($"HTTP {st} 不触发", Program.AnonReadShouldFallback(st), false);
+
+        Console.WriteLine(fail == 0 ? "匿名读回退锁通过。" : "匿名读回退锁有不符项（见上）。");
         return fail;
     }
 
@@ -681,6 +712,84 @@ internal static class Selftest
         Console.WriteLine(fail == 0
             ? "拒绝可见性：isError 两族 / deny_reason 往返 / 预读归因全对齐。"
             : "拒绝可见性检查有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>
+    /// v2.31 pending 行 + 同操作去重锁（E0-20261108 实弹：vivarium v3-libc 三窗堆叠 6 连点、
+    /// 未决零痕迹、http_failed 收割与 live 指引相反）。全部纯函数直测，零文件系统。
+    /// </summary>
+    private static int PendingDedupChecks()
+    {
+        Console.WriteLine("--- v2.31 pending 行与去重锁（FindPendingCore / receipt 往返 / 收割映射 / result 解析）---");
+        int fail = 0;
+        void Eq(string what, object? actual, object? expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        var now = DateTime.UtcNow;
+        var stale = TimeSpan.FromSeconds(180);
+        DedupGate.Row R(int secAgo, string? req, string decision, string op = "push", string target = "v3-libc",
+            string? repo = "rustin-beep/vivarium") =>
+            new(now - TimeSpan.FromSeconds(secAgo), req, op, repo, target, decision);
+
+        // rowsDesc 参数约定 = 逆序（新行在前）
+        // S1 fresh MCP pending → 命中返回原 req
+        Eq("S1 fresh pending", DedupGate.FindPendingCore(
+            [R(10, "a1b2c3d4e5f60718", "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), "a1b2c3d4e5f60718");
+        // S2 同 req 更晚已有终态（终态在逆序首位）→ 已收割，放行
+        Eq("S2 终态收割", DedupGate.FindPendingCore(
+            [R(5, "a1b2c3d4e5f60718", "approved"), R(60, "a1b2c3d4e5f60718", "pending")],
+            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+        // S3 fresh CLI pending（req=null）→ "cli"
+        Eq("S3 CLI pending", DedupGate.FindPendingCore(
+            [R(10, null, "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), "cli");
+        // S4 CLI pending 后同目标更晚有真终态 → 按目标关联放行（快速决策不得锁目标到超龄）
+        Eq("S4 CLI 终态关联", DedupGate.FindPendingCore(
+            [R(5, null, "denied"), R(60, null, "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+        // S5 超龄孤儿 → 放行（死窗不得永久占坑）
+        Eq("S5 孤儿放行", DedupGate.FindPendingCore(
+            [R(400, "a1b2c3d4e5f60718", "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+        // S6 pending 后有 dedup_blocked（更晚）但无终态 → 原 pending 仍活（dedup_blocked 不解析任何请求）
+        Eq("S6 dedup 不解析", DedupGate.FindPendingCore(
+            [R(5, "ffffffffffffffff", "dedup_blocked"), R(60, "a1b2c3d4e5f60718", "pending")],
+            "push", "rustin-beep/vivarium", "v3-libc", now, stale), "a1b2c3d4e5f60718");
+        // S7 不同目标/不同 op 的 pending → 不跨界
+        Eq("S7 目标隔离", DedupGate.FindPendingCore(
+            [R(10, "a1b2c3d4e5f60718", "pending", target: "v3-frontend")],
+            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+        Eq("S7 op 隔离", DedupGate.FindPendingCore(
+            [R(10, "a1b2c3d4e5f60718", "pending", op: "branch_delete")],
+            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+
+        // receipt 定界往返（server 超时路径与 dedup 快路径都以消息为准——定界漂移 = 收割链断）
+        var rc = "a1b2c3d4e5f60718";
+        var pg = Messages.PendingGate(rc, 15, 75);
+        Eq("PendingGate 回执往返", McpServer.ExtractReceipt(pg.Prefix + " " + pg.Text), rc);
+        var db = Messages.DedupBlocked("push", "v3-libc", rc, 75);
+        Eq("DedupBlocked 回执往返", McpServer.ExtractReceipt(db.Prefix + " " + db.Text), rc);
+        var dbc = Messages.DedupBlockedCli("push", "v3-libc", 60);
+        Eq("DedupBlockedCli 无回执", McpServer.ExtractReceipt(dbc.Prefix + " " + dbc.Text), null);
+
+        // 收割映射：http_failed 入族；pending/dedup_blocked 必须不进 StatusFamily（RunStatus 在
+        // switch 前单列处理行龄/链式——进了表反而会被 StatusOther 吞掉）
+        Eq("StatusFamily http_failed", Program.StatusFamily("http_failed"), ExitCodes.HttpFailed);
+        Eq("StatusFamily pending 不入表", Program.StatusFamily("pending"), ExitCodes.Unknown);
+        Eq("StatusFamily dedup 不入表", Program.StatusFamily("dedup_blocked"), ExitCodes.Unknown);
+
+        // result 解析（收割链与描述提取）
+        Eq("DedupInnerOf", Program.DedupInnerOf("pending:a1b2c3d4e5f60718"), "a1b2c3d4e5f60718");
+        Eq("DedupInnerOf cli", Program.DedupInnerOf("pending:cli"), "cli");
+        Eq("DedupInnerOf 非形态", Program.DedupInnerOf("not_sent:x"), null);
+        Eq("DedupInnerOf 空值", Program.DedupInnerOf("pending:"), null);
+        Eq("NotSentDetailOf 有描述", Program.NotSentDetailOf("not_sent:连接被重置"), "连接被重置");
+        Eq("NotSentDetailOf 旧行", Program.NotSentDetailOf("not_sent"), "");
+        Eq("NotSentDetailOf verify 形态", Program.NotSentDetailOf("timeout_retry_safe_get"), "");
+
+        Console.WriteLine(fail == 0
+            ? "pending 行与去重：FindPendingCore 七景 / receipt 往返 / 收割映射 / result 解析全对齐。"
+            : "pending 去重检查有不符项（见上）。");
         return fail;
     }
 }

@@ -65,6 +65,20 @@ internal static class McpServer
         return j > from ? text[from..j] : null;
     }
 
+    /// <summary>v2.31：从消息文本提取回执（structuredContent.receipt 的来源）。定界符 =
+    /// Messages.ReceiptOpen/Close（单源，selftest 往返锁）；提取不到返回 null（SendToolResult
+    /// 随即省略 receipt 字段）。用武之地：server 超时路径的 PendingGate（回执=自产 GUID）与
+    /// 子进程快路径的 DedupBlocked（回执=**原请求**回执，非本次生成）——不看定界就只会把
+    /// 自己刚生成的 GUID 塞给调用方，收割链断在第一跳（E0-20261108 同族病灶）。</summary>
+    internal static string? ExtractReceipt(string text)
+    {
+        var i = text.IndexOf(Messages.ReceiptOpen, StringComparison.Ordinal);
+        if (i < 0) return null;
+        var from = i + Messages.ReceiptOpen.Length;
+        var j = text.IndexOf(Messages.ReceiptClose, from, StringComparison.Ordinal);
+        return j > from ? text[from..j] : null;
+    }
+
     // ---------- v2.26：过期自检（rename-swap 部署留下的僵尸 server 自曝） ----------
     // 缘起 2026-11-04 实弹：v0.7.1 经 rename-swap 部署后，四个 v2.24 旧 server 仍在服务
     // （存活会话句柄随旧名文件继续跑旧代码）——旧 SpawnCli 无限阻塞，宿主 ~30s 弃等，
@@ -328,8 +342,12 @@ internal static class McpServer
             if (bodyContent is not null) File.WriteAllText(bodyPath, bodyContent, new UTF8Encoding(false));
             if (inputsContent is not null) File.WriteAllText(inputsPath, inputsContent, new UTF8Encoding(false));
 
-            var (text, code, receipt) = SpawnCli(argv);
-            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code), receipt);
+            var (text, code) = SpawnCli(argv);
+            // v2.31：code=23 的回执以消息定界为准——超时路径=本 server 自产 GUID（随 PendingGate
+            // 消息）；快路径 dedup=**原请求**回执（DedupBlocked 消息携带）。提取不到则省略字段，
+            // 不回填自产 GUID（伪回执 = 调用方永久查无终态，E0-20261108 病灶的镜像）。
+            SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code),
+                receipt: code == ExitCodes.PendingGate ? ExtractReceipt(text) : null);
         }
         catch (Exception ex)
         {
@@ -362,7 +380,7 @@ internal static class McpServer
                 SendToolResult(stdout, idEl, MsgText(m), m.ExitCode, isError: true);
                 return;
             }
-            var (text, code, _) = SpawnCli(["status", receipt]);
+            var (text, code) = SpawnCli(["status", receipt]);
             SendToolResult(stdout, idEl, text, code, isError: IsErrorOf(code));
         }
         catch (Exception ex)
@@ -559,8 +577,11 @@ internal static class McpServer
     /// receipt 用 `sluice status` 收割。此前终态永远落在客户端离场之后，deny_reason 一世
     /// 沉没（2026-11-04 实弹：人读窗+打拒绝理由 40-90s vs 客户端 30s 弃等，agent"从不记忆"
     /// 的根源）。快路径（批准/拒绝在窗口期内落地）不变，仍是原终态直返。
+    /// v2.31：回执不再由本函数回填——code=23 时 CallTool 以消息定界（ExtractReceipt）为准：
+    /// 超时路径 = 自产 GUID（PendingGate 消息携带）；子进程快路径 dedup = 原请求回执
+    /// （DedupBlocked 消息携带）。快路径退出码 23 自此合法（v2.31 去重拦截，秒回不开窗）。
     /// </summary>
-    private static (string Text, int Code, string Receipt) SpawnCli(string[] argv)
+    private static (string Text, int Code) SpawnCli(string[] argv)
     {
         var receipt = Guid.NewGuid().ToString("N")[..16];
         var psi = new ProcessStartInfo(Environment.ProcessPath ?? "sluice.exe")
@@ -591,7 +612,7 @@ internal static class McpServer
             var m = Messages.PendingGate(receipt,
                 pollAfterSec: Math.Max(10, Gate.McpPendingSec),
                 settleBySec: Gate.TimeoutSeconds + Gate.McpPendingSec);
-            return (MsgText(m), m.ExitCode, receipt);
+            return (MsgText(m), m.ExitCode);
         }
 
         p.WaitForExit(); // 已退出；再等一次确保异步输出流排干（BCL 语义）
@@ -605,7 +626,7 @@ internal static class McpServer
         var text = primary.Length == 0 && secondary.Length > 0
             ? secondary
             : secondary.Length == 0 ? primary : primary + "\n\n[" + (code == 0 ? "stderr" : "stdout") + "]\n" + secondary;
-        return (text.Length == 0 ? "[Sluice] 子进程无输出（exit " + code + "）" : text, code, receipt);
+        return (text.Length == 0 ? "[Sluice] 子进程无输出（exit " + code + "）" : text, code);
     }
 
     // ---------- JSON-RPC 输出 ----------
