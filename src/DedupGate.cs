@@ -1,14 +1,15 @@
 namespace Sluice;
 
 /// <summary>
-/// v2.31 同操作未决去重 + pending 行可见化。缘起 E0-20261108 实弹（rustin-beep/vivarium v3-libc）：
-/// agent 在上一枚回执未决时两次重发，同目标三窗并发堆叠，用户为一次逻辑操作点了 6 次批准窗；
-/// 且未决请求在台账中零痕迹——sluice_status 的"尚无终态"无法区分"窗口排队中"与"回执不存在"，
-/// 终态行落地前调用方只能盲等。机制：每个写请求进入闸门前先落一行 decision=pending 审计行
-/// （req 随 SLUICE_MCP_REQ 环境变量随身，CLI 来源无 req），pending 自此对 sluice_status
-/// 与本去重全程可见；新请求撞上同 (op, repo, target) 的存活 pending → 不开新窗，
-/// 落 dedup_blocked 行并入原回执（MCP）/返回等待指引（CLI）——"终态未定禁止重发"由
-/// 调用方纪律升级为闸门强制。去重是 UX 面不是安全面：文件缺失/损坏一律视作无 pending（fail-open）。
+/// v2.31 同操作未决去重 + pending 行可见化；v2.32 审阅修复批（P1/P2/P3.1/P3.5）规则升版。
+/// 缘起 E0-20261108 实弹（rustin-beep/vivarium v3-libc）：agent 在上一枚回执未决时两次重发，
+/// 同目标三窗并发堆叠，用户为一次逻辑操作点了 6 次批准窗；且未决请求在台账中零痕迹。
+/// 机制：每个写请求进入闸门前先落一行 decision=pending 审计行（req 随 SLUICE_MCP_REQ 随身，
+/// CLI 来源无 req；result 携带占位 nonce）；pending 自此对 sluice_status 与本去重全程可见。
+/// v2.32 占位-扫描序（审阅 P2 check-then-act 闭口）：**先 append 占位、后扫描**——pending 行
+/// 本身就是锁，文件行序即全序；并发双发时只有"最早一行"的请求胜出开窗，后来者写
+/// dedup_blocked 自赎（同 req 行相互解析）并退让。去重是 UX 面不是安全面：文件缺失/损坏
+/// 一律视作无 pending（fail-open）。
 /// </summary>
 internal static class DedupGate
 {
@@ -17,67 +18,102 @@ internal static class DedupGate
     /// 比窗口堆叠更糟；孤儿态由 sluice_status 以 StatusOrphan 点名（终态不会再来，按结果未知查证）。</summary>
     public static TimeSpan StaleAfter => TimeSpan.FromSeconds(Gate.TimeoutSeconds + 120);
 
-    /// <summary>去重视角的行摘要（收割视角是 Audit.LastFor，两者字段需求不同）。</summary>
-    internal sealed record Row(DateTime Ts, string? Req, string Op, string? Repo, string Target, string Decision);
+    /// <summary>去重视角的行摘要（收割视角是 Audit.LastFor，两者字段需求不同）。
+    /// Result 携带 pending 占位 nonce（"window:{nonce}"）与 dedup_blocked 的指向（"pending:{...}"）。</summary>
+    internal sealed record Row(DateTime Ts, string? Req, string Op, string? Repo, string Target, string Decision,
+        string Result = "");
 
-    /// <summary>查同 (op, repo, target) 的存活未决请求：返回其 req（CLI 来源无 req 时返回 "cli"），无则 null。</summary>
-    public static string? FindPending(string op, string? repo, string target) =>
-        FindPendingCore(ReadRecentRows(), op, repo, target, DateTime.UtcNow, StaleAfter);
+    /// <summary>占位-扫描（v2.32）：ownNonce = 本请求刚落的占位行标识。查同 (op, repo, target)
+    /// 的**更早**存活未决请求（文件行序即全序——并发双发只有最早者胜出）：返回其 req
+    /// （CLI 来源无 req 时返回 "cli"），无则 null（本请求胜出）。</summary>
+    public static string? FindPending(string op, string? repo, string target, string? ownNonce = null) =>
+        FindPendingCore(ReadRecentRows(), op, repo, target, DateTime.UtcNow, StaleAfter, ownNonce);
 
     /// <summary>
-    /// 纯核心（selftest 锁）。rowsDesc = 逆序（新行在前）的非 api_read 审计行。存活判定：
-    /// pending 行的 req 已被更晚的终态行收割（逆序先见终态即记 resolved）→ 已了结；
-    /// CLI 行（req=null，无凭据可关联）按"更晚存在同目标真终态行"判定已了结——同目标
-    /// 快速决策后不得把下一次请求锁到超龄；dedup_blocked 不是终态（它只拦了自己那枚请求，
-    /// 原 pending 仍活）。超龄 pending（孤儿）一律放行。匹配键 = (op, repo, target) 字面相等
-    /// ——target 用各 verb 的审计 target 形态（push 例外：统一用裸分支名，重放形态随内容变化
-    /// 不可作键）。
+    /// 纯核心（selftest 锁，v2.32 规则升版）。rowsDesc = 逆序（新行在前，index 0 最新）的非
+    /// api_read 审计行。判定规则：
+    /// ① 非终态行两类——pending（占位/活窗）与 dedup_blocked（自赎行：只解析**同 req** 的
+    /// pending——竞态败者写的，req=null 的 CLI 自赎行解析不了自己，但其幽灵 pending 会与
+    /// CLI 胜者同生共死（同目标终态行一到双双解析），无害；dedup_blocked **绝不**置
+    /// matchedTerminalSeen——否则 CLI 败者行会错放 CLI 胜者的活窗（E0 复燃，审阅 S6b 变异点））；
+    /// ② 真终态行（其余一切 decision）——req 非空则 req 进 resolved（收割该 req 的一切 pending）；
+    /// 且若 Matches 则置 matchedTerminalSeen（CLI 行 req=null 无凭据关联，按同目标终态关联）；
+    /// ③ Matches：op/repo 相等 + target 字面相等，或 push 的重放形态 target（"{branch}@旧→新"）
+    /// 前缀匹配裸分支名（v2.32 P3.1——重放终态行此前永远关联不上 CLI pending，白锁 180s；
+    /// "@" 界标防 v3/v3-libc 前缀误撞）；
+    /// ④ 胜负（v2.32 占位-扫描）：ownNonce 行 = 自己的占位（index 记为 ownIdx，找不到 = -1
+    /// 保守视为最新）；**仅 index &gt; ownIdx 的存活 pending（文件序更早）能胜我**；多个胜者中
+    /// 返回 index 最大（最早）的那个——它是真正持窗者；无胜者 → null。
     /// </summary>
-    internal static string? FindPendingCore(IEnumerable<Row> rowsDesc, string op, string? repo, string target,
-        DateTime nowUtc, TimeSpan staleAfter)
+    internal static string? FindPendingCore(IReadOnlyList<Row> rowsDesc, string op, string? repo, string target,
+        DateTime nowUtc, TimeSpan staleAfter, string? ownNonce = null)
     {
         var resolved = new HashSet<string>();
         var matchedTerminalSeen = false;
-        foreach (var r in rowsDesc)
+        var ownIdx = -1;
+        for (var i = 0; i < rowsDesc.Count; i++)
+            if (ownNonce is not null && rowsDesc[i].Decision == "pending" && rowsDesc[i].Result == $"window:{ownNonce}")
+            { ownIdx = i; break; }
+
+        bool Matches(Row r) => r.Op == op && r.Repo == repo
+            && (r.Target == target
+                || (op == "push" && r.Target.StartsWith(target + "@", StringComparison.Ordinal)));
+        bool Live(Row r, int i) =>
+            i > ownIdx
+            && !(r.Req is { } rq && resolved.Contains(rq))
+            && !(r.Req is null && matchedTerminalSeen)
+            && nowUtc - r.Ts <= staleAfter;
+
+        string? winner = null;
+        var winnerIdx = -1;
+        for (var i = 0; i < rowsDesc.Count; i++)
         {
-            var matches = r.Op == op && r.Repo == repo && r.Target == target;
+            var r = rowsDesc[i];
             if (r.Decision != "pending")
             {
                 if (r.Decision != "dedup_blocked")
                 {
-                    if (matches) matchedTerminalSeen = true;
-                    if (r.Req is { } q) resolved.Add(q);
+                    if (Matches(r)) matchedTerminalSeen = true;
                 }
+                if (r.Req is { } q) resolved.Add(q); // 真终态与 dedup_blocked 同：req 非空即收割该 req
                 continue;
             }
-            if (!matches) continue;
-            if (r.Req is { } rq && resolved.Contains(rq)) continue;   // MCP 行：同 req 更晚已有终态
-            if (r.Req is null && matchedTerminalSeen) continue;       // CLI 行：同目标更晚已有真终态
-            if (nowUtc - r.Ts > staleAfter) continue;                 // 孤儿：不阻塞（终态不会再来）
-            return r.Req ?? "cli";
+            if (!Matches(r)) continue;
+            if (!Live(r, i)) continue;
+            if (i > winnerIdx) { winner = r.Req ?? "cli"; winnerIdx = i; } // 最早存活者持窗
         }
-        return null;
+        return winner;
     }
 
-    /// <summary>请求进入闸门前落 pending 行——先写行再开窗，窗口等待期全程可查。</summary>
-    public static void MarkPending(string op, string? repo, string target, string? sha8) =>
-        Audit.Append(op, repo, target, sha8, "pending", result: "window");
+    /// <summary>请求进入闸门前先落占位行（v2.32：占位先于扫描——pending 行本身就是锁）。
+    /// result 携带占位 nonce，扫描时据此排除自己。</summary>
+    public static void MarkPending(string op, string? repo, string target, string? sha8, string nonce) =>
+        Audit.Append(op, repo, target, sha8, "pending", result: $"window:{nonce}");
 
     private const int MaxScan = 2000;
 
-    /// <summary>逆序有界读（fresh pending 必在近尾部；全量收益不值复杂度，同 LastFor 纪律）。</summary>
-    private static IEnumerable<Row> ReadRecentRows()
+    /// <summary>逆序有界读（v2.32 环形缓冲：顺序单遍读文件、只留末 MaxScan 行——Reverse()
+    /// 物化全文件，审计只增不减，4200 行起每写请求 O(全文件) 不划算；fresh pending 必在近尾部）。</summary>
+    private static IReadOnlyList<Row> ReadRecentRows()
     {
         var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Sluice", "audit.jsonl");
-        var rows = new List<Row>();
+        var ring = new Queue<string>();
         try
         {
-            foreach (var line in File.ReadLines(path).Reverse().Take(MaxScan))
-                if (ParseRow(line) is { } r && r.Op != "api_read") rows.Add(r);
+            foreach (var line in File.ReadLines(path))
+            {
+                ring.Enqueue(line);
+                if (ring.Count > MaxScan) ring.Dequeue();
+            }
         }
         catch { /* 文件缺失/行损坏：视作无 pending（fail-open） */ }
-        return rows;
+        var arr = ring.ToArray(); // 文件序（旧→新）
+        var list = new List<Row>(arr.Length);
+        for (var i = arr.Length - 1; i >= 0; i--) // 逆序：新行在前（FindPendingCore 的约定）
+            if (ParseRow(arr[i]) is { } r && r.Op != "api_read")
+                list.Add(r);
+        return list;
     }
 
     /// <summary>行解析（损坏行返 null 跳过，不拖垮整扫）。ts 解析失败落 MinValue ⇒ 必然超龄 ⇒ 放行，
@@ -99,7 +135,8 @@ internal static class DedupGate
                 r.TryGetProperty("op", out var o) ? o.GetString() ?? "?" : "?",
                 r.TryGetProperty("repo", out var rp) ? rp.GetString() : null,
                 r.TryGetProperty("target", out var tg) ? tg.GetString() ?? "" : "",
-                dec.GetString() ?? "?");
+                dec.GetString() ?? "?",
+                r.TryGetProperty("result", out var res) ? res.GetString() ?? "" : "");
         }
         catch { return null; }
     }

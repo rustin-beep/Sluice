@@ -71,7 +71,10 @@ internal static class Selftest
         ("serverstale",     ExitCodes.Internal,      "wait_user"),  // v2.26：僵尸 server 自曝——重启会话后重发（与 internal 族同档：技术失败，交回用户）
         ("statusorphan",     ExitCodes.Unknown,      "wait_user"),  // v2.31：孤儿 pending 点名——终态不会再来，查证后重发（不再无限"尚未决"）
         ("statushttpfailed", ExitCodes.HttpFailed,   "retry_ok"),   // v2.31：http_failed 收割入族（同 live 20/retry_ok，消解两路径指引相反）
-        ("dedupblocked",     ExitCodes.PendingGate,  "wait_until"), // v2.31：同操作未决去重——并入原回执（对调用方仍是 pending 语义，收割链可达终态）
+        ("statusabandoned",  ExitCodes.BadRequest,   "after_fix"),  // v2.32：入闸后早退的水位兜底行（审阅 P1 对偶面——同早退现场 after_fix）
+        ("statusmergetail",     ExitCodes.Success,   "—"),          // v2.32：--delete-head 收尾行（合并已生效，删除成功）
+        ("statusmergetailfail", ExitCodes.Success,   "—"),          // v2.32：收尾删除失败不动摇已生效的合并（审阅 P3.4）
+        ("dedupblocked",     ExitCodes.PendingGate,  "wait_until"), // v2.31：同目标未决去重——并入原回执（对调用方仍是 pending 语义，收割链可达终态）
         ("dedupblockedcli",  ExitCodes.Cooldown,     "wait_until"), // v2.31：未决窗在 CLI 前门（无回执不挂 23——否则造出永查无终态的回执）
     ];
 
@@ -80,7 +83,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -126,6 +129,12 @@ internal static class Selftest
             { fail++; Console.WriteLine("!! dedup CLI 版缺事实前置句\"本次操作未执行\""); }
             if (name == "statusorphan" && !sample.Text.Contains("结果未知"))
             { fail++; Console.WriteLine("!! 孤儿点名缺\"结果未知\"查证语义"); }
+            if (name == "statusabandoned" && !sample.Text.Contains("无任何副作用"))
+            { fail++; Console.WriteLine("!! abandoned 收割缺\"无任何副作用\"句"); }
+            if (name == "statusmergetailfail" && !sample.Text.Contains("不影响合并结果"))
+            { fail++; Console.WriteLine("!! 收尾失败版缺\"不影响合并结果\"事实句"); }
+            if (name == "dedupblocked" && !sample.Text.Contains("同目标"))
+            { fail++; Console.WriteLine("!! dedup 措辞应为\"同目标\"（target 级键是设计裁定，不得声称\"同操作\"）"); }
 
             // 设计原则 4：拒绝类消息必含绕行禁止语义（措辞按 §8.2 原文：cooldown 用"绕过"，其余用"重试"）
             if (name is "denied" or "timeout" or "policy" && !sample.Text.Contains("重试"))
@@ -148,6 +157,7 @@ internal static class Selftest
         fail += IssueListChecks();
         fail += AnonFallbackChecks();
         fail += PendingDedupChecks();
+        fail += ReviewFix232Checks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -716,12 +726,15 @@ internal static class Selftest
     }
 
     /// <summary>
-    /// v2.31 pending 行 + 同操作去重锁（E0-20261108 实弹：vivarium v3-libc 三窗堆叠 6 连点、
-    /// 未决零痕迹、http_failed 收割与 live 指引相反）。全部纯函数直测，零文件系统。
+    /// v2.31+v2.32 pending 行 + 去重锁（E0-20261108 实弹：三窗堆叠 6 连点、未决零痕迹、
+    /// http_failed 收割与 live 指引相反；v2.32 审阅变异探针补洞）。全部纯函数直测，零文件系统。
+    /// v2.32 新增：S6b（CLI 行 dedup_blocked 不得置 matchedTerminalSeen——变异 `!= "dedup_blocked"`
+    /// 改恒真曾使 selftest 仍 PASS，放行的正是 E0 要挡的第二扇窗）；S8 败者自赎（同 req 相互解析）；
+    /// S9 占位-扫描竞态（文件行序即全序，最早占位者胜出）；S10 push 重放形态 target 关联（@ 界标）。
     /// </summary>
     private static int PendingDedupChecks()
     {
-        Console.WriteLine("--- v2.31 pending 行与去重锁（FindPendingCore / receipt 往返 / 收割映射 / result 解析）---");
+        Console.WriteLine("--- v2.31+v2.32 pending 行与去重锁（FindPendingCore / receipt 往返 / 收割映射 / result 解析）---");
         int fail = 0;
         void Eq(string what, object? actual, object? expected)
         {
@@ -730,38 +743,67 @@ internal static class Selftest
 
         var now = DateTime.UtcNow;
         var stale = TimeSpan.FromSeconds(180);
+        const string Rpo = "rustin-beep/vivarium";
         DedupGate.Row R(int secAgo, string? req, string decision, string op = "push", string target = "v3-libc",
-            string? repo = "rustin-beep/vivarium") =>
-            new(now - TimeSpan.FromSeconds(secAgo), req, op, repo, target, decision);
+            string? repo = Rpo, string result = "") =>
+            new(now - TimeSpan.FromSeconds(secAgo), req, op, repo, target, decision, result);
 
         // rowsDesc 参数约定 = 逆序（新行在前）
         // S1 fresh MCP pending → 命中返回原 req
         Eq("S1 fresh pending", DedupGate.FindPendingCore(
-            [R(10, "a1b2c3d4e5f60718", "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), "a1b2c3d4e5f60718");
-        // S2 同 req 更晚已有终态（终态在逆序首位）→ 已收割，放行
+            [R(10, "a1b2c3d4e5f60718", "pending")], "push", Rpo, "v3-libc", now, stale), "a1b2c3d4e5f60718");
+        // S2 同 req 更晚已有终态 → 已收割，放行
         Eq("S2 终态收割", DedupGate.FindPendingCore(
             [R(5, "a1b2c3d4e5f60718", "approved"), R(60, "a1b2c3d4e5f60718", "pending")],
-            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+            "push", Rpo, "v3-libc", now, stale), null);
         // S3 fresh CLI pending（req=null）→ "cli"
         Eq("S3 CLI pending", DedupGate.FindPendingCore(
-            [R(10, null, "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), "cli");
+            [R(10, null, "pending")], "push", Rpo, "v3-libc", now, stale), "cli");
         // S4 CLI pending 后同目标更晚有真终态 → 按目标关联放行（快速决策不得锁目标到超龄）
         Eq("S4 CLI 终态关联", DedupGate.FindPendingCore(
-            [R(5, null, "denied"), R(60, null, "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+            [R(5, null, "denied"), R(60, null, "pending")], "push", Rpo, "v3-libc", now, stale), null);
         // S5 超龄孤儿 → 放行（死窗不得永久占坑）
         Eq("S5 孤儿放行", DedupGate.FindPendingCore(
-            [R(400, "a1b2c3d4e5f60718", "pending")], "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
-        // S6 pending 后有 dedup_blocked（更晚）但无终态 → 原 pending 仍活（dedup_blocked 不解析任何请求）
-        Eq("S6 dedup 不解析", DedupGate.FindPendingCore(
+            [R(400, "a1b2c3d4e5f60718", "pending")], "push", Rpo, "v3-libc", now, stale), null);
+        // S6 MCP 行：他人的 dedup_blocked 不解析原 pending（原窗仍活）
+        Eq("S6 dedup 不解析他人", DedupGate.FindPendingCore(
             [R(5, "ffffffffffffffff", "dedup_blocked"), R(60, "a1b2c3d4e5f60718", "pending")],
-            "push", "rustin-beep/vivarium", "v3-libc", now, stale), "a1b2c3d4e5f60718");
+            "push", Rpo, "v3-libc", now, stale), "a1b2c3d4e5f60718");
+        // S6b（v2.32 审阅变异洞）：CLI 行的 dedup_blocked 同样不得当终态——若置 matchedTerminalSeen，
+        // CLI 活窗未决时一条 dedup_blocked 就会放行下一个请求开第二扇窗（E0 复燃）
+        Eq("S6b CLI dedup 不解析", DedupGate.FindPendingCore(
+            [R(5, null, "dedup_blocked"), R(60, null, "pending")], "push", Rpo, "v3-libc", now, stale), "cli");
         // S7 不同目标/不同 op 的 pending → 不跨界
         Eq("S7 目标隔离", DedupGate.FindPendingCore(
-            [R(10, "a1b2c3d4e5f60718", "pending", target: "v3-frontend")],
-            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+            [R(10, "a1b2c3d4e5f60718", "pending", target: "v3-frontend")], "push", Rpo, "v3-libc", now, stale), null);
         Eq("S7 op 隔离", DedupGate.FindPendingCore(
-            [R(10, "a1b2c3d4e5f60718", "pending", op: "branch_delete")],
-            "push", "rustin-beep/vivarium", "v3-libc", now, stale), null);
+            [R(10, "a1b2c3d4e5f60718", "pending", op: "branch_delete")], "push", Rpo, "v3-libc", now, stale), null);
+        // S8（v2.32 败者自赎）：dedup_blocked 只解析**同 req** 的 pending——竞态败者自赎后，
+        // 仍能看见更早的胜者 pending（它才是持窗者）
+        Eq("S8 败者自赎见胜者", DedupGate.FindPendingCore(
+            [R(5, "bebebabe00000000", "dedup_blocked"), R(6, "bebebabe00000000", "pending"),
+             R(60, "a1b2c3d4e5f60718", "pending")], "push", Rpo, "v3-libc", now, stale), "a1b2c3d4e5f60718");
+        // S9（v2.32 占位-扫描）：并发双发，文件行序即全序。desc = [B(晚), A(早)]：
+        // A 携 ownNonce 扫描 → B 更晚不胜我 → A 胜出（null = 本请求开窗）；
+        // B 携 ownNonce 扫描 → A 更早 → B 退让给 A 的回执；第三方（无 nonce）→ 见最早持窗者 A
+        var race = new[]
+        {
+            R(10, "bbbbbbbbbbbbbbbb", "pending", result: "window:bbbbbbbb"),
+            R(11, "aaaaaaaaaaaaaaaa", "pending", result: "window:aaaaaaaa"),
+        };
+        Eq("S9 早占位者胜出", DedupGate.FindPendingCore(race, "push", Rpo, "v3-libc", now, stale,
+            ownNonce: "aaaaaaaa"), null);
+        Eq("S9 晚占位者退让", DedupGate.FindPendingCore(race, "push", Rpo, "v3-libc", now, stale,
+            ownNonce: "bbbbbbbb"), "aaaaaaaaaaaaaaaa");
+        Eq("S9 第三方见最早", DedupGate.FindPendingCore(race, "push", Rpo, "v3-libc", now, stale), "aaaaaaaaaaaaaaaa");
+        // S10（v2.32 审阅 P3.1）：push 重放终态行 target="branch@旧→新" 须解析裸分支名的 CLI pending；
+        // "@" 界标防前缀误撞（v3 分支的终态不得解析 v3-libc 的 pending）
+        Eq("S10 重放终态关联 CLI", DedupGate.FindPendingCore(
+            [R(5, null, "approved", target: "v3-libc@a1b2c3d4→e5f60718"), R(60, null, "pending", target: "v3-libc")],
+            "push", Rpo, "v3-libc", now, stale), null);
+        Eq("S10 @界标防误撞", DedupGate.FindPendingCore(
+            [R(5, null, "approved", target: "v3@x→y"), R(60, null, "pending", target: "v3-libc")],
+            "push", Rpo, "v3-libc", now, stale), "cli");
 
         // receipt 定界往返（server 超时路径与 dedup 快路径都以消息为准——定界漂移 = 收割链断）
         var rc = "a1b2c3d4e5f60718";
@@ -772,9 +814,12 @@ internal static class Selftest
         var dbc = Messages.DedupBlockedCli("push", "v3-libc", 60);
         Eq("DedupBlockedCli 无回执", McpServer.ExtractReceipt(dbc.Prefix + " " + dbc.Text), null);
 
-        // 收割映射：http_failed 入族；pending/dedup_blocked 必须不进 StatusFamily（RunStatus 在
-        // switch 前单列处理行龄/链式——进了表反而会被 StatusOther 吞掉）
+        // 收割映射：http_failed/abandoned/delete_head_* 入族；pending/dedup_blocked 必须不进
+        // StatusFamily（RunStatus 在 switch 前单列处理行龄/链式——进了表反而会被 StatusOther 吞掉）
         Eq("StatusFamily http_failed", Program.StatusFamily("http_failed"), ExitCodes.HttpFailed);
+        Eq("StatusFamily abandoned", Program.StatusFamily("abandoned"), ExitCodes.BadRequest);
+        Eq("StatusFamily delete_head 成", Program.StatusFamily("delete_head_executed"), ExitCodes.Success);
+        Eq("StatusFamily delete_head 败", Program.StatusFamily("delete_head_failed"), ExitCodes.Success);
         Eq("StatusFamily pending 不入表", Program.StatusFamily("pending"), ExitCodes.Unknown);
         Eq("StatusFamily dedup 不入表", Program.StatusFamily("dedup_blocked"), ExitCodes.Unknown);
 
@@ -788,8 +833,78 @@ internal static class Selftest
         Eq("NotSentDetailOf verify 形态", Program.NotSentDetailOf("timeout_retry_safe_get"), "");
 
         Console.WriteLine(fail == 0
-            ? "pending 行与去重：FindPendingCore 七景 / receipt 往返 / 收割映射 / result 解析全对齐。"
+            ? "pending 行与去重：FindPendingCore 十四景 / receipt 往返 / 收割映射 / result 解析全对齐。"
             : "pending 去重检查有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>
+    /// v2.32 审阅修复批锁：① AGENTS.md 片段三源一致（rule 7 曾只改 SetupCommand 一源——
+    /// SetupCommand 自称"selftest 不锁散文，靠评审"，评审抓到后本锁把该豁免收窄到
+    /// "AGENTS.md 实际块 == Snippet 常量"这一机械可比面）；② --search 空页页脚（审阅 P3.3）；
+    /// ③ 标题截断代理对（审阅 P3.7——实现本就正确，缺的是样例锁）。
+    /// </summary>
+    private static int ReviewFix232Checks()
+    {
+        Console.WriteLine("--- v2.32 审阅修复锁（AGENTS 三源 / 搜索空页脚 / 代理对截断）---");
+        int fail = 0;
+        void Eq(string what, object? actual, object? expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // ① AGENTS.md 标记块 == SetupCommand.Snippet（找到仓库根的 AGENTS.md 才锁；发布件场景跳过）
+        var src = "未找到 AGENTS.md（发布件场景跳过三源锁）";
+        for (var i = 0; i <= 4; i++)
+        {
+            var p = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+                string.Concat(Enumerable.Repeat(".." + Path.DirectorySeparatorChar, i)), "AGENTS.md"));
+            if (!File.Exists(p)) continue;
+            src = p;
+            var text = File.ReadAllText(p);
+            var b = text.IndexOf(SetupCommand.SnippetBegin, StringComparison.Ordinal);
+            var e = b >= 0 ? text.IndexOf(SetupCommand.SnippetEnd, b + 1, StringComparison.Ordinal) : -1;
+            if (b < 0 || e < 0)
+            { fail++; Console.WriteLine("!! AGENTS.md 标记块缺失/损坏（BEGIN 后无 END）"); break; }
+            var block = text[(b + SetupCommand.SnippetBegin.Length)..e].Trim();
+            var want = SetupCommand.Snippet.Trim();
+            var wb = want.IndexOf(SetupCommand.SnippetBegin, StringComparison.Ordinal);
+            var we = want.IndexOf(SetupCommand.SnippetEnd, wb + 1, StringComparison.Ordinal);
+            var wantInner = want[(wb + SetupCommand.SnippetBegin.Length)..we].Trim();
+            // 容忍行尾空白/换行风格差异，语义逐行对齐
+            static string Norm(string s) => string.Join("\n", s.Split('\n').Select(l => l.TrimEnd()));
+            if (Norm(block) != Norm(wantInner))
+            {
+                fail++;
+                Console.WriteLine("!! AGENTS.md 实际块 ≠ SetupCommand.Snippet（rule 7 三源断裂复发——跑 sluice setup --install-snippet 或手工同步）");
+            }
+            break;
+        }
+        Console.WriteLine($"AGENTS 三源来源：{src}");
+
+        // ② --search 空页页脚（零命中与页码越界同形，统一点名；旧版渲染"显示第 1–0 条"）
+        Eq("空页·零命中", Program.SearchFooter(1, 30, 0, 0), "无匹配结果（第 1 页为空：关键词无命中，或页码越界——回第 1 页核对）");
+        Eq("空页·页码越界", Program.SearchFooter(9, 30, 0, 257), "无匹配结果（第 9 页为空：关键词无命中，或页码越界——回第 1 页核对）");
+        Eq("正常翻页", Program.SearchFooter(1, 30, 30, 95), "显示第 1–30 条 · 下一页：--page 2");
+        Eq("末页", Program.SearchFooter(4, 30, 5, 95), "显示第 91–95 条 · 已是末页");
+
+        // ③ 标题截断代理对：切点 120 落在高代理位时回退 119（不产出断代理对）；BMP 边界照切
+        var sur = new string('标', 119) + "🎮尾"; // 长度 122，[119]=高代理位
+        var bodySur = $$"""[{"number":1,"state":"open","title":"{{sur}}","labels":[]}]""";
+        var (linesSur, _, _, _) = Program.RenderIssueList(bodySur, withPrs: false);
+        if (!linesSur[0].Contains("…") || linesSur[0].Contains("🎮"))
+        { fail++; Console.WriteLine("!! 代理对截断：应在 119 位回退切点（🎮 整体让位于 …）"); }
+        if (linesSur[0].Any(char.IsSurrogate))
+        { fail++; Console.WriteLine("!! 截断产出断代理对（渲染乱码）"); }
+        var bmp = new string('标', 120) + "尾"; // 长度 121，[119]=BMP——切 120
+        var bodyBmp = $$"""[{"number":1,"state":"open","title":"{{bmp}}","labels":[]}]""";
+        var (linesBmp, _, _, _) = Program.RenderIssueList(bodyBmp, withPrs: false);
+        if (!linesBmp[0].Contains("…") || linesBmp[0].Contains("尾"))
+        { fail++; Console.WriteLine("!! BMP 边界：应切 120 位（尾字让位于 …）"); }
+
+        Console.WriteLine(fail == 0
+            ? "v2.32 审阅修复：AGENTS 三源 / 搜索空页脚 / 代理对截断全对齐。"
+            : "v2.32 审阅修复检查有不符项（见上）。");
         return fail;
     }
 }

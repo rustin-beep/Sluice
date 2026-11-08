@@ -29,19 +29,29 @@ internal static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        // 预赋值：catch 内 Messages.Write 若抛，finally 仍要读 exit（兜底行内嵌退出码）
+        var exit = ExitCodes.Internal;
         try
         {
         // GUI 宿主可能无控制台句柄（sluice mcp 被宿主以管道方式拉起时 setter 会抛）——尽力设置
         try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { /* 管道/无控制台：McpServer 自带显式 UTF-8 流 */ }
-        return Dispatch(args);
+        exit = Dispatch(args);
         }
         catch (Exception ex)
         {
             // 兜底：任何未分类异常 → internal 前段（执行尚未开始）
             Console.Error.WriteLine($"[Sluice] 未捕获异常：{ex.GetType().Name}: {ex.Message}");
             Messages.Write(Messages.Internal(afterExecutionStarted: false));
-            return ExitCodes.Internal;
+            exit = ExitCodes.Internal;
         }
+        finally
+        {
+            // v2.32（审阅 P1）：幽灵 pending 兜底——入闸后水位未涨（ErrBad/BadRequest 一族早退
+            // 不落行）则补 abandoned 终态行，(op,repo,target) 不会被自己的占位行锁死 StaleAfter
+            if (GateArmed is { } g && Audit.NonReadAppends == g.Watermark)
+                Audit.Append(g.Op, g.Repo, g.Target, g.Sha8, "abandoned", result: $"early_exit:exit_{exit}");
+        }
+        return exit;
     }
 
     /// <summary>
@@ -130,6 +140,10 @@ internal static class Program
         "consent_failed" => ExitCodes.ConsentFailed,
         "rate_limited" => ExitCodes.RateLimitWait,
         "http_failed" => ExitCodes.HttpFailed,
+        // v2.32（审阅 P1/P3.4）：abandoned = 入闸后早退的水位兜底行（bad_request 族语义）；
+        // delete_head_* = approved 之后的收尾行（Success 族，成败均不动摇已生效的合并）
+        "abandoned" => ExitCodes.BadRequest,
+        "delete_head_executed" or "delete_head_failed" => ExitCodes.Success,
         _ => ExitCodes.Unknown,
     };
 
@@ -169,7 +183,7 @@ internal static class Program
         return int.TryParse(digits, out var st) ? st : 0;
     }
 
-    private static int RunStatus(string receipt)
+    private static int RunStatus(string receipt, int depth = 0)
     {
         if (receipt.Length is < 8 or > 32 || !receipt.All(char.IsAsciiHexDigit))
             return ErrBad($"status 需要 pending 返回里的 receipt（16 位十六进制），收到：{receipt}");
@@ -192,13 +206,20 @@ internal static class Program
             Messages.Write(Messages.StatusOrphan(receipt, l.Op, l.Target ?? "?", (int)DedupGate.StaleAfter.TotalSeconds));
             return ExitCodes.Unknown;
         }
-        // v2.31：dedup_blocked 行——本回执已并入原请求，链式收割原回执终态（跳一层，inner==receipt 防环；
-        // inner==cli 无回执可跳，回放 DedupBlockedCli 的终态语义：等对方终态落盘后重发）
+        // v2.31：dedup_blocked 行——本回执已并入原请求，链式收割原回执终态（跳一层）；
+        // v2.32：链深限 1——双竞态互相退让（A 赎 B、B 赎 A）会让 A→B→A 无环检测地绕圈
+        // （inner≠receipt 只防自环），depth>0 落 dedup_blocked 即照录字面交回用户。
+        // inner==cli 无回执可跳，回放 DedupBlockedCli 的终态语义：等对方终态落盘后重发
         if (l.Decision == "dedup_blocked")
         {
-            if (DedupInnerOf(l.Result) is { } inner && inner != receipt && inner != "cli"
+            if (depth == 0 && DedupInnerOf(l.Result) is { } inner && inner != receipt && inner != "cli"
                 && inner.Length is >= 8 and <= 32 && inner.All(char.IsAsciiHexDigit))
-                return RunStatus(inner);
+                return RunStatus(inner, depth + 1);
+            if (depth > 0)
+            {
+                Messages.Write(Messages.StatusOther(l.Op, l.Target ?? "?", l.Decision, l.Result));
+                return ExitCodes.Unknown;
+            }
             Messages.Write(Messages.DedupBlockedCli(l.Op, l.Target ?? "?", Gate.TimeoutSeconds));
             return ExitCodes.Cooldown;
         }
@@ -212,6 +233,15 @@ internal static class Program
                 Messages.Write(Messages.Timeout(l.Op, l.Target ?? "?", Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case ExitCodes.Success:
+                // v2.32（审阅 P3.4）：delete_head_* 是 approved 之后的 --delete-head 收尾行，
+                // LastFor 取"最后一行"会顶替终态，把已生效的合并收割成"结果未知勿重发"——
+                // 单列渲染，成败均不动摇合并结果
+                if (l.Decision is "delete_head_executed" or "delete_head_failed")
+                {
+                    Messages.Write(Messages.StatusMergeTail(l.Op, l.Target ?? "?", l.Result,
+                        l.Decision == "delete_head_executed"));
+                    return ExitCodes.Success;
+                }
                 // v2.27：up_to_date 单列——"已获批准并执行"对它不是事实（远端已在目标提交，无需执行）
                 Messages.Write(l.Decision == "up_to_date"
                     ? Messages.StatusUpToDate(l.Op, l.Target ?? "?", l.Result)
@@ -230,12 +260,17 @@ internal static class Program
                     : Messages.WriteRateLimited(l.Op, l.Target ?? "?", HttpStOf(l.Result), RateLimitWhatOf(l.Result)));
                 return ExitCodes.RateLimitWait;
             case ExitCodes.HttpFailed:
-                // v2.31：http_failed 收割入族（同 live 20/retry_ok——请求未发出、无任何副作用、
+                // v2.31：http_failed 收割入族（同 live 20/retry_ok——请求未发出、无任何副作用，
                 // 间隔 30s 可重试）。此前落 StatusOther/21/wait_user"勿重发"，同一决策两条路径
                 // 指引相反（E0-20261108 实弹回执 14fb4b0f）。网络层描述自 v2.31 起随审计 result
                 //（"not_sent:{describe}"），旧行无描述渲染为空
                 Messages.Write(Messages.StatusHttpFailed(l.Op, l.Target ?? "?", NotSentDetailOf(l.Result)));
                 return ExitCodes.HttpFailed;
+            case ExitCodes.BadRequest when l.Decision == "abandoned":
+                // v2.32（审阅 P1 对偶面）：入闸后早退的水位兜底行——未开窗、未执行、无副作用，
+                // after_fix 同早退现场（按调用现场输出的修正指引处理后重发）
+                Messages.Write(Messages.StatusAbandoned(l.Op, l.Target ?? "?"));
+                return ExitCodes.BadRequest;
             default:
                 Messages.Write(Messages.StatusOther(l.Op, l.Target ?? "?", l.Decision, l.Result));
                 return ExitCodes.Unknown;
@@ -357,7 +392,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.31");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.32");
         return 0;
     }
 
@@ -784,19 +819,24 @@ internal static class Program
         return TryEnterGate(op, repo, auditTarget, null, out exitCode);
     }
 
-    /// <summary>v2.31 写请求入闸单源（TryPreflight 尾部 + 8 个内联 verb 同款调用）：
-    /// ① 落 pending 审计行——未决请求从此对 sluice_status / 去重可见（E0-20261108 前
-    /// 未决零痕迹，"尚无终态"无法区分排队与丢单）；② 同 (op, repo, target) 已有存活
-    /// pending（DedupGate.FindPending，孤儿超龄放行）→ 不开新窗，落 dedup_blocked 行
-    /// （result="pending:{原req|cli}"，收割链据此跳转）+ 消息并入原回执（MCP）/等待指引
-    /// （CLI，无回执不挂 23）。"终态未定禁止重发"由调用方纪律升级为闸门强制。</summary>
+    /// <summary>v2.31 写请求入闸单源（TryPreflight 尾部 + 8 个内联 verb 同款调用）；
+    /// v2.32 审阅修复批升版：① **先占位后扫描**（P2 check-then-act 闭口）——pending 行本身就是
+    /// 锁、文件行序即全序，MCP 并行双发只有最早占位者开窗，后来者写 dedup_blocked 自赎退让；
+    /// ② **入闸即武装水位兜底**（P1 幽灵 pending）——入闸后到开窗前的 ErrBad/BadRequest 早退
+    /// 一行审计都不写，残留 pending 会把 (op,repo,target) 锁死 StaleAfter（180s 起）且 exit 10
+    /// 的 after_fix 契约（"重新运行同一命令即可"）当场失效；Main 的 finally 见水位未涨即补
+    /// abandoned 终态行（单点覆盖全部 13 处早退，比逐点补 Append 可靠）。同目标存活 pending
+    /// （孤儿超龄放行）→ 不开新窗，落 dedup_blocked 行（result="pending:{原req|cli}"，收割链
+    /// 据此跳转）+ 消息并入原回执（MCP）/等待指引（CLI，无回执不挂 23）。</summary>
     internal static bool TryEnterGate(string op, string repo, string target, string? sha8, out int exitCode)
     {
         exitCode = 0;
-        var dup = DedupGate.FindPending(op, repo, target);
+        var nonce = Guid.NewGuid().ToString("N")[..8];
+        DedupGate.MarkPending(op, repo, target, sha8, nonce);
+        var dup = DedupGate.FindPending(op, repo, target, ownNonce: nonce);
         if (dup is null)
         {
-            DedupGate.MarkPending(op, repo, target, sha8);
+            GateArmed = (op, repo, target, sha8, Audit.NonReadAppends);
             return true;
         }
         Audit.Append(op, repo, target, sha8, "dedup_blocked", result: $"pending:{dup}");
@@ -806,6 +846,11 @@ internal static class Program
         exitCode = dup == "cli" ? ExitCodes.Cooldown : ExitCodes.PendingGate;
         return false;
     }
+
+    /// <summary>v2.32（审阅 P1）：入闸成功时武装（op,repo,target,sha8,水位）；Main 的 finally
+    /// 里水位未涨 = 入闸后一行本操作审计都没写（ErrBad/BadRequest 早退）→ 补 abandoned 终态行，
+    /// pending 与终态行同 op/repo/target 相互解析，键即刻释放。</summary>
+    private static (string Op, string Repo, string Target, string? Sha8, int Watermark)? GateArmed;
 
     /// <summary>尽力元数据预读（pr_merge/pr_reopen/issue_close/branch_delete 纪律，v2.11 收敛单源）：
     /// 读落审计；失败/非 200 不阻塞批准流——弹窗退化为参数展示 + 归因警示行（文案用 MetaUnreadableWhy）。
@@ -822,13 +867,14 @@ internal static class Program
             return (st, json, Authed: false);
         try
         {
-            var (ast, ajson) = ReadMetaOnce(path, TokenStore.LoadApproved(null));
+            var (ast, ajson) = ReadMetaOnce(path, TokenStore.LoadApproved(null), fallback: true);
             return (ast, ajson, Authed: true);
         }
         catch { return (st, json, Authed: false); } // vault 异常不阻塞批准流：退回匿名结果
     }
 
-    private static (int St, System.Text.Json.Nodes.JsonNode? Json) ReadMetaOnce(string path, string? token)
+    private static (int St, System.Text.Json.Nodes.JsonNode? Json) ReadMetaOnce(string path, string? token,
+        bool fallback = false)
     {
         try
         {
@@ -838,8 +884,9 @@ internal static class Program
             else if (st == 0)
                 Audit.Append("api_read", "api.github.com", path, null, "timeout", result: "retry_safe_get");
             else
+                // v2.32（审阅 P3.6）：与 api 通道同源——静默复读写 auth(fallback)，与显式带凭据可区分
                 Audit.Append("api_read", "api.github.com", path, null, $"http_{st}",
-                    result: $"{body.Length}B{(token is null ? " anon" : " auth")}");
+                    result: $"{body.Length}B{(token is null ? " anon" : fallback ? " auth(fallback)" : " auth")}");
             return notSent ? (-1, null) : st == 200 ? (st, System.Text.Json.Nodes.JsonNode.Parse(body)) : (st, null);
         }
         catch { return (0, null); }
@@ -1167,9 +1214,9 @@ internal static class Program
             return authExit;
 
         // v2.30：匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读（TryReadMeta 模式推广）
-        var (st, body, notSent, reason, usedToken) = ApiGetWithAnonFallback(path, token);
+        var (st, body, notSent, reason, usedToken, fallback) = ApiGetWithAnonFallback(path, token);
         Console.Out.Write(body);
-        return ClassifyApiReadResult(path, usedToken, st, body, notSent, reason);
+        return ClassifyApiReadResult(path, usedToken, st, body, notSent, reason, fallback);
     }
 
     /// <summary>v2.29：读通道 --auth 凭据获取单源（RunApi 与 issue list 共用；原 RunApi 内联段
@@ -1223,7 +1270,8 @@ internal static class Program
     /// <summary>v2.29：api 读通道结果分类单源（RunApi 与 issue list 共用；原 RunApi 尾段提出，
     /// 行为不变）：落读审计行 + 写终态消息 + 返回 exit code。2xx 只落审计不写消息——数据体的
     /// 输出形态（api 原样透传 / issue list 紧凑渲染）由调用方决定。</summary>
-    private static int ClassifyApiReadResult(string path, string? token, int st, string body, bool notSent, string? reason)
+    private static int ClassifyApiReadResult(string path, string? token, int st, string body, bool notSent, string? reason,
+        bool fallbackAuth = false)
     {
         if (notSent)
         {
@@ -1239,7 +1287,10 @@ internal static class Program
             return ExitCodes.HttpFailed;
         }
 
-        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B{(token is not null ? " auth" : " anon")}");
+        // v2.32（审阅 P3.6）：auth(fallback) 单列——匿名撞 401/403/404/429 后的静默复读与显式
+        // --auth 在审计里不可区分，"这次读是谁点的"回答不了；fallbackAuth 只影响本行措辞
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}",
+            result: $"{body.Length}B{(token is null ? " anon" : fallbackAuth ? " auth(fallback)" : " auth")}");
         switch (st)
         {
             case >= 200 and < 300:
@@ -1301,22 +1352,23 @@ internal static class Program
     /// 即最终结果（分类/审计同 --auth：双失败时"token 无权/私有库"的归因诚实）。Hello vault
     /// 不复读（门控前多一道生物事件 = 弹窗疲劳，TryReadMeta 同纪律）；vault 异常退回匿名结果
     /// 不阻塞。匿名尝试照常落读审计（fallback 时 audit 两行：anon + auth）。</summary>
-    private static (int St, string Body, bool NotSent, string? Reason, string? Token)
+    private static (int St, string Body, bool NotSent, string? Reason, string? Token, bool Fallback)
         ApiGetWithAnonFallback(string path, string? token)
     {
         var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
         if (token is not null || notSent || st == 0 || !AnonReadShouldFallback(st)
             || !TokenStore.Exists || !TokenStore.IsDpapiVault)
-            return (st, body, notSent, reason, token);
+            return (st, body, notSent, reason, token, Fallback: false);
         Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B anon");
         Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {st}），静默 vault 带凭据复读一次（走独立配额）");
         try
         {
             var tok = TokenStore.LoadApproved(null);
             var (st2, body2, notSent2, reason2) = GitHubApi.ApiGetAsync(tok, path).GetAwaiter().GetResult();
-            return (st2, body2, notSent2, reason2, tok);
+            // v2.32（审阅 P3.6）：fallback 标记上浮——审计终行写 auth(fallback)，与显式 --auth 可区分
+            return (st2, body2, notSent2, reason2, tok, Fallback: true);
         }
-        catch { return (st, body, notSent, reason, token); } // vault 异常退回匿名结果（TryReadMeta 同纪律）
+        catch { return (st, body, notSent, reason, token, Fallback: false); } // vault 异常退回匿名结果（TryReadMeta 同纪律）
     }
 
     // ---------- sluice issue list（§9 v2.29 读侧清单面：agent 实弹反馈"issue 只能逐个查看、
@@ -1400,8 +1452,8 @@ internal static class Program
             return authExit;
 
         // v2.30：匿名回退同 api 通道（读通道单源——issue list 是同一读通道的紧凑渲染面）
-        var (st, body, notSent, reason, usedToken) = ApiGetWithAnonFallback(path, token);
-        var cls = ClassifyApiReadResult(path, usedToken, st, body, notSent, reason);
+        var (st, body, notSent, reason, usedToken, fallback) = ApiGetWithAnonFallback(path, token);
+        var cls = ClassifyApiReadResult(path, usedToken, st, body, notSent, reason, fallback);
         if (cls != ExitCodes.Success)
         {
             // 非 2xx 原样透传响应体到 stdout（同 api 通道纪律——错误族的共享消息声称"响应体已输出
@@ -1419,10 +1471,7 @@ internal static class Program
             {
                 Console.WriteLine($"issue 搜索 · {repo} · 关键词「{search.Trim()}」{labelNote} · state={state} · 命中 {total} 条 · 第 {page} 页（每页 {limit}）");
                 foreach (var line in lines) Console.WriteLine(line);
-                var first = (page - 1) * limit + 1;
-                Console.WriteLine(total > page * limit
-                    ? $"显示第 {first}–{first + shown - 1} 条 · 下一页：--page {page + 1}"
-                    : $"显示第 {first}–{first + shown - 1} 条 · 已是末页");
+                Console.WriteLine(SearchFooter(page, limit, shown, total));
             }
             else
             {
@@ -1474,6 +1523,18 @@ internal static class Program
     /// （响应含 pull_request 字段）默认隐去但计数——端点混 PR 是 GitHub 事实，隐去不等于不存在；
     /// --with-prs 显示并带 [PR] 标。行格式：#N [state[·state_reason]][PR] 标题 {标签}；标题 >120
     /// 字符截断加 …（不切代理对——切了渲染成乱码）。形态意外抛异常交 Internal（读无副作用可重跑）。</summary>
+    /// <summary>v2.32（纯函数，selftest 锁 · 审阅 P3.3）：--search 页脚。空页特判——旧版
+    /// 零命中/页码越界（shown=0）会渲染"显示第 1–0 条 · 已是末页"；两态同形，统一点名。</summary>
+    internal static string SearchFooter(int page, int limit, int shown, long total)
+    {
+        var first = (page - 1) * limit + 1;
+        if (shown <= 0 || total <= 0)
+            return $"无匹配结果（第 {page} 页为空：关键词无命中，或页码越界——回第 1 页核对）";
+        return total > page * limit
+            ? $"显示第 {first}–{first + shown - 1} 条 · 下一页：--page {page + 1}"
+            : $"显示第 {first}–{first + shown - 1} 条 · 已是末页";
+    }
+
     internal static (string[] Lines, int Issues, int Prs, long Total) RenderIssueList(string body, bool withPrs)
     {
         var node = System.Text.Json.Nodes.JsonNode.Parse(body);

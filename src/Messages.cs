@@ -122,7 +122,7 @@ internal static class Messages
     public static Msg DedupBlocked(string op, string target, string receipt, int settleBySec) => new(
         "[Sluice]",
         $"""
-        {op} → {target} 已有一扇未决批准窗（同操作同目标一次只开一窗）。
+        {op} → {target} 已有一扇未决批准窗（同目标一次只开一窗——不同内容的同目标写操作同样等待，防窗口堆叠）。
         本次未开新窗、未执行、无任何副作用——已并入原请求：{ReceiptOpen}{receipt}{ReceiptClose}。
         约 15 秒后用工具 sluice_status 查该回执终态（无该工具时 CLI 等价：sluice status {receipt}），
         最长 {settleBySec} 秒内必有终态（批准执行 / 拒绝 / 超时自动拒绝）；终态出现前禁止重发本操作。
@@ -226,6 +226,35 @@ internal static class Messages
         与同步路径同语义：可间隔 30 秒后重发同一操作；连续 3 次失败则报告用户。
         """,
         ExitCodes.HttpFailed, "retry_ok", true);
+
+    /// <summary>v2.32（审阅 P1 对偶面）：abandoned 收割——入闸后早退（ErrBad/BadRequest 一族
+    /// 不落行，Main 的水位兜底补本行）。事实：未开窗、未执行、无任何副作用；after_fix 同
+    /// 早退现场（按当时输出的修正指引处理后重发；v2.32 起 (op,repo,target) 不再被幽灵
+    /// pending 锁死，重发即时放行）。</summary>
+    public static Msg StatusAbandoned(string op, string target) => new(
+        "[Sluice·终态]",
+        $"""
+        终态已查得：{op} → {target} 在开窗前早退（参数/前置检查未过），未执行，无任何副作用。
+        按调用现场输出的修正指引处理后可直接重发；本回执不会另有变化，无需再查 status。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    /// <summary>v2.32（审阅 P3.4）：pr_merge --delete-head 的收尾行顶替终态——delete_head_*
+    /// 落在 approved 之后，LastFor 取"最后一行"会把已生效的合并收割成 StatusOther/21
+    /// "结果未知勿重发"。本消息把事实说全：合并已生效；删除只是收尾，成败均不动摇合并结果。</summary>
+    public static Msg StatusMergeTail(string op, string target, string result, bool headDeleted) => new(
+        "[Sluice·终态]",
+        headDeleted
+            ? $"""
+              终态已查得：{op} → {target} 已获批准并执行；合并后 head 分支删除成功（本行是 --delete-head 收尾行）。
+              审计结果：{result}
+              操作已生效，无需再用其他命令验证；无需再查 status。
+              """
+            : $"""
+              终态已查得：{op} → {target} 已获批准并执行，合并已生效——本行是 --delete-head 收尾行：分支删除未成功（审计结果：{result}），不影响合并结果。
+              分支保留；如需删除可稍后重发 branch delete（收尾失败不阻塞任何事）。
+              """,
+        ExitCodes.Success, "—", false);
 
     // ---- timeout（exit 3，retry=wait_user；时长自 C4 config 可配，文案跟随实际值） ----
     public static Msg Timeout(string op, string target, int seconds) => new(
@@ -889,7 +918,10 @@ internal static class Messages
         ("statusother", StatusOther("workflow_dispatch", "rustin-beep/Vitro ci.yml@x", "not_found", "http_404")),
         ("statusorphan", StatusOrphan("a1b2c3d4e5f60718", "push", "rustin-beep/vivarium v3-libc", 180)), // v2.31：孤儿 pending 点名（终态不会再来）
         ("statushttpfailed", StatusHttpFailed("push", "v3-libc", "连接被重置")), // v2.31：http_failed 收割入族（同 live 的 20/retry_ok）
-        ("dedupblocked", DedupBlocked("push", "v3-libc", "a1b2c3d4e5f60718", 75)), // v2.31：同操作未决去重——并入原回执（23/wait_until）
+        ("statusabandoned", StatusAbandoned("push", "v3-libc")), // v2.32：入闸后早退的水位兜底行（10/after_fix——同早退现场）
+        ("statusmergetail", StatusMergeTail("pr_merge", "rustin-beep/Vitro#452", "executed", headDeleted: true)), // v2.32：--delete-head 收尾行（0/——）
+        ("statusmergetailfail", StatusMergeTail("pr_merge", "rustin-beep/Vitro#452", "http_403", headDeleted: false)), // v2.32：收尾失败不动摇已生效的合并
+        ("dedupblocked", DedupBlocked("push", "v3-libc", "a1b2c3d4e5f60718", 75)), // v2.31：同目标未决去重——并入原回执（23/wait_until）；v2.32 措辞对齐（同目标，非同操作）
         ("dedupblockedcli", DedupBlockedCli("push", "v3-libc", 60)), // v2.31：未决窗在 CLI 前门（5/wait_until——无回执可收割，不给 23）
         ("apirateanon", ApiRateLimitedAnon("repos/rustin-beep/Vitro/issues/52", 403)),
         ("apiratewait", ApiRateLimitedWait("repos/rustin-beep/Vitro/issues/52", 403, "secondary rate limit，服务端要求等待约 2 分钟")),

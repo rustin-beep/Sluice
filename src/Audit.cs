@@ -16,6 +16,12 @@ internal static class Audit
     /// 同 via 纪律：纯标签非机密。</summary>
     private static string? Req => Environment.GetEnvironmentVariable("SLUICE_MCP_REQ");
 
+    /// <summary>v2.32 非 api_read 追加计数（审阅 P1 幽灵 pending 兜底的水位计）：TryEnterGate
+    /// 入闸成功时记下当前水位，Main 的 finally 里水位未涨 = 入闸后一行本操作审计都没写
+    /// （ErrBad/BadRequest 一族早退不落行）→ 补一行 abandoned 终态，(op,repo,target)
+    /// 不被幽灵 pending 锁死 180s。CLI 单进程单请求，无需并发保护。</summary>
+    internal static int NonReadAppends { get; private set; }
+
     /// <summary>status 查询用：该 req 最后一条非 api_read 审计行；无则 null。
     /// 同文件顺读（追加写、行级完整，逆读收益不值复杂度）。只读本地文件，无网络、无副作用。
     /// v2.27 增返 repo：rate_limited 收割复用 PushRateLimited(repo, branch, what) 需要（push 的
@@ -81,6 +87,7 @@ internal static class Audit
             }
             File.AppendAllBytes(path, ms.ToArray());
             File.AppendAllText(path, Environment.NewLine);
+            if (op != "api_read") NonReadAppends++;
         }
         catch
         {
