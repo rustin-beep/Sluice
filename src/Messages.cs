@@ -37,18 +37,27 @@ internal static class Messages
         """,
         ExitCodes.Success, "—", false);
 
-    // ---- push 成功（exit 0；v2.10：REST 推送不回写本地 origin/{branch} 引用——成功消息必附
-    //      fetch 提示，掐掉"首次成功 → rebase → 再推必踩 NonFF/ReplayUnresolved"这条确定性路径；
-    //      v2.14：skipped>0 时附去重行——远端已有未重传的 blob 数一目了然） ----
-    public static Msg PushDone(string repo, string branch, string newSha, bool replay, int skipped = 0) => new(
+    // ---- push 成功（exit 0；v2.10：成功消息必附本地引用状态说明，掐掉"首次成功 → rebase →
+    //      再推必踩 NonFF/ReplayUnresolved"这条确定性路径；v2.14：skipped>0 时附去重行；
+    //      v2.33：refsNote 三态——已回写 / 未回写因分叉（平行重打哨兵）/ 未回写其他原因） ----
+    public static Msg PushDone(string repo, string branch, string newSha, bool replay, int skipped = 0,
+        string? refsNote = null) => new(
         "[Sluice]",
         $"""
         已完成：push → {repo}@{branch}（HTTP 200{(replay ? "，重放式更新" : "")}）
         结果：https://github.com/{repo}/commit/{newSha}
-        {(skipped > 0 ? $"去重：{skipped} 个 blob 远端默认分支已有，未重传。\n" : "")}注意：本地 origin/{branch} 未更新（REST 推送不回写本地引用）——后续 rebase / 重推同分支前先 git fetch origin {branch}。
+        {(skipped > 0 ? $"去重：{skipped} 个 blob 远端默认分支已有，未重传。\n" : "")}{refsNote ?? $"注意：本地 origin/{branch} 未更新——后续 rebase / 重推同分支前先 git fetch origin {branch}。"}
         操作已在远端生效，无需再用其他命令验证。
         """,
         ExitCodes.Success, "—", false);
+
+    // v2.33（Bug 2）：refsNote 构造——回写成功 / 分叉哨兵 / 其他失败，三态单源
+    public static string PushRefsWritten(string branch, string sha8) =>
+        $"本地 origin/{branch} 已回写至 {sha8}（与远端一致，后续增量/重放可直接走）。";
+    public static string PushRefsDiverged(string branch, string sha8) =>
+        $"注意：本地 origin/{branch} 未回写——远端头 {sha8} 的提交对象不在本地（重打链与本地历史分叉，平行链信号）。后续更新该分支前请让用户先 git fetch（agent 通道 fetch 被封）。";
+    public static string PushRefsNotWritten(string branch, string why) =>
+        $"注意：本地 origin/{branch} 未回写（{why}）——后续 rebase / 重推同分支前先让用户 git fetch origin {branch}。";
 
     // ---- push 无需推送（exit 0；远端已是目标提交） ----
     public static Msg PushUpToDate(string repo, string branch, string sha8) => new(
@@ -320,7 +329,7 @@ internal static class Messages
         "[Sluice·终态]",
         $"""
         git 向 {host} 索要凭据被拒：本环境的 GitHub 凭据只存在 Sluice 闸门内，git 直连拿不到任何凭据。
-        1. push 场景：改用 sluice push --remote origin --refspec <分支>——将弹出批准窗口由用户决定（不要加 --force）；
+        1. push 场景：改用 sluice push --repo <owner>/<repo> --branch <分支>——将弹出批准窗口由用户决定（不要加 --force）；
         2. 不要尝试 gh auth login、device flow、浏览器授权或任何获取/写入凭据的方式；
         3. fetch/pull 公开库无需凭据不受影响；私有库只读请让用户处理（sluice api 可查，读通道无需批准）。
         """,
@@ -910,6 +919,10 @@ internal static class Messages
         ("dispatchrejected", DispatchRejected("HTTP 422：Reference does not exist")),
         ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / *.githubusercontent.com）")),
         ("pushdone", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false)),
+        ("pushdonewb", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false,
+            refsNote: PushRefsWritten("feat/x", "9f3c2a1b"))), // v2.33：回写成功态
+        ("pushdonediv", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false,
+            refsNote: PushRefsDiverged("feat/x", "9f3c2a1b"))), // v2.33：平行重打哨兵态
         ("replayunresolved", PushReplayUnresolved("rustin-beep/Sluice", "feat/demo-motion-d0d1-r2")),
         ("mcppending",  PendingGate("a1b2c3d4e5f60718", 15, 75)),
         ("statuspending", StatusPending("a1b2c3d4e5f60718")),

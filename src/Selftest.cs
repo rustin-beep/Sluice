@@ -50,7 +50,9 @@ internal static class Selftest
         ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
         ("dispatchrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：ref/inputs 校验拒
         ("apiredirected",     ExitCodes.BadRequest, "after_fix"), // v2.7：域外重定向不跟随，明说去向
-        ("pushdone",        ExitCodes.Success,      "—"),          // v2.10：push 成功附"本地引用不回写"提示
+        ("pushdone",        ExitCodes.Success,      "—"),          // v2.10：push 成功附本地引用状态说明
+        ("pushdonewb",      ExitCodes.Success,      "—"),          // v2.33：回写成功态（refs 行=已回写）
+        ("pushdonediv",     ExitCodes.Success,      "—"),          // v2.33：平行重打哨兵态（分叉提示+用户 fetch 指引）
         ("pushbasemissing", ExitCodes.BadRequest,   "after_fix"),  // v2.12：基点不在远端——推基点或换祖先；校验前移零上传
         ("pushtoolarge",    ExitCodes.BadRequest,   "after_fix"),  // v2.12：超限分批（规划期先拦不烧批准）
         ("pushsteprejected",ExitCodes.BadRequest,   "after_fix"),  // v2.12：Other 族渲染服务端原话，分支未动是事实
@@ -83,7 +85,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁 / v2.33 平行链锚点与回写锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -135,6 +137,14 @@ internal static class Selftest
             { fail++; Console.WriteLine("!! 收尾失败版缺\"不影响合并结果\"事实句"); }
             if (name == "dedupblocked" && !sample.Text.Contains("同目标"))
             { fail++; Console.WriteLine("!! dedup 措辞应为\"同目标\"（target 级键是设计裁定，不得声称\"同操作\"）"); }
+            // v2.33：push 成功三态的本地引用状态句——回写成功/分叉哨兵/未回写各有专属措辞，
+            // 缺句即"引用状态不可判"（Bug 2 事故形态：agent 下次推送仍以为要 fetch）
+            if (name == "pushdonewb" && !sample.Text.Contains("已回写"))
+            { fail++; Console.WriteLine("!! 回写成功态缺\"已回写\"句"); }
+            if (name == "pushdonediv" && !sample.Text.Contains("提交对象不在本地"))
+            { fail++; Console.WriteLine("!! 分叉哨兵态缺\"提交对象不在本地\"（平行链信号）句"); }
+            if (name == "pushdone" && !sample.Text.Contains("origin/"))
+            { fail++; Console.WriteLine("!! push 成功消息缺本地 origin/{branch} 引用状态说明"); }
 
             // 设计原则 4：拒绝类消息必含绕行禁止语义（措辞按 §8.2 原文：cooldown 用"绕过"，其余用"重试"）
             if (name is "denied" or "timeout" or "policy" && !sample.Text.Contains("重试"))
@@ -340,7 +350,7 @@ internal static class Selftest
     /// 非限流 403 必 null；429 无论 body 必归档）。</summary>
     private static int PushLogicChecks()
     {
-        Console.WriteLine("--- push 逻辑锁（v2.14/v2.16：基点消歧 / blob 去重 / CI 聋哑 / 限流嗅探 / 消歧适用面）---");
+        Console.WriteLine("--- push 逻辑锁（v2.14/v2.16：基点消歧 / blob 去重 / CI 聋哑 / 限流嗅探 / 消歧适用面；v2.33：新建分支锚点决策）---");
         int fail = 0;
         void Eq<T>(string what, T actual, T expected)
         {
@@ -387,6 +397,17 @@ internal static class Selftest
         Eq("refs/ 前缀豁免", RestPush.NeedsDisambig("refs/tags/v1.2.3"), false);
         Eq("40 位 sha 豁免", RestPush.NeedsDisambig(new string('a', 40)), false);
         Eq("64 位 sha 豁免", RestPush.NeedsDisambig(new string('b', 64)), false);
+
+        // (6) 新建分支锚点决策（v2.33，平行链事故根治）：默认分支头是 HEAD 祖先 → 收窄（复用远端
+        //     原 SHA 不重打）；声明基点恰等于默认头 → 维持声明（锚同物无收窄）；tip 缺失/非祖先
+        //     （分叉或独立历史）→ 维持声明（特性分支意图）/ 全历史兜底。变异自证方向：若把
+        //     DefaultTip 臂改为恒 Declared，PR #4 事故形态（陈旧基点整段重打）将静默回归。
+        Eq("无基点+tip祖先→收窄", RestPush.ResolveNewBranchAnchor(false, false, true), RestPush.NewBranchAnchor.DefaultTip);
+        Eq("陈旧基点+tip祖先→收窄", RestPush.ResolveNewBranchAnchor(true, false, true), RestPush.NewBranchAnchor.DefaultTip);
+        Eq("基点即tip→维持", RestPush.ResolveNewBranchAnchor(true, true, true), RestPush.NewBranchAnchor.Declared);
+        Eq("tip非祖先+有基点→维持(特性分支意图)", RestPush.ResolveNewBranchAnchor(true, false, false), RestPush.NewBranchAnchor.Declared);
+        Eq("tip非祖先+无基点→全历史", RestPush.ResolveNewBranchAnchor(false, false, false), RestPush.NewBranchAnchor.FullHistory);
+        Eq("tip非祖先+基点即tip(同物)→维持", RestPush.ResolveNewBranchAnchor(true, true, false), RestPush.NewBranchAnchor.Declared);
 
         Console.WriteLine(fail == 0 ? "push 逻辑锁通过。" : "push 逻辑锁有不符项（见上）。");
         return fail;

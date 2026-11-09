@@ -119,11 +119,11 @@ internal static class RestPush
         // 与"曾推过远端但 REST 不回写引用"。错误文案附 fetch 正解、弹窗加警示行；有意不 fail-closed：
         // FF 推送无销毁侧（闸门⑤ fail-closed 的理由在此不成立），且批准内容 ⊇ 执行内容（执行以远端现状收窄）
         string FhHint(string what) => !hasTracking && baseSha is null
-            ? $"\n提示：本次因本地无 origin/{branch} 引用走了全历史回溯——若该分支曾推过远端（REST 推送不回写本地引用），git fetch origin {branch} 后重跑即改走增量，可绕开此{what}"
+            ? $"\n提示：本次因本地无 origin/{branch} 引用走了全历史回溯（执行期将尝试以远端默认分支头自动收窄，v2.33）——若该分支曾推过远端（REST 推送不回写本地引用），git fetch origin {branch} 后重跑亦可改走精确增量，可绕开此{what}"
             : "";
         var assumeNewNote = !hasTracking && baseSha is null
             ? $"""
-              ⚠ 本地无 origin/{branch} 引用，按「新建分支·全历史」规划——若该分支远端已存在（如曾用 sluice 推过，REST 不回写本地引用），先 git fetch origin {branch} 重跑可得精确增量；执行发现分支已存在时将以远端现状收窄并做 fast-forward 校验（不销毁任何远端提交）
+              ⚠ 本地无 origin/{branch} 引用，按「新建分支·全历史」规划——执行期将以远端默认分支头自动收窄增量（其为 HEAD 祖先时，远端已有提交复用原 SHA 不重打，平行链防护）；若该分支远端已存在（如曾用 sluice 推过，REST 不回写本地引用），执行发现时将以远端现状收窄并做 fast-forward 校验（不销毁任何远端提交）
 
               """
             : "";
@@ -173,6 +173,25 @@ internal static class RestPush
     }
 
     // ---------- v2.14 纯函数（selftest 锁：决策/分区/判定与 git、网络解耦） ----------
+
+    /// <summary>新建分支执行期锚点（v2.33，平行链事故根治）：Declared=声明基点（含恰等于默认头）；
+    /// DefaultTip=收窄到远端默认分支头；FullHistory=全历史（盲区兜底）。</summary>
+    public enum NewBranchAnchor { Declared, DefaultTip, FullHistory }
+
+    /// <summary>新建分支锚点决策（v2.33 纯函数，selftest 锁）：远端默认分支头是 HEAD 祖先时
+    /// 取沿链最深锚——声明基点落后（本地引用陈旧，REST 不回写+fetch 被封的结构性陈旧）则收窄到
+    /// 默认分支头，远端已有提交复用原 SHA 不重打（重打 GitHub 签名的 squash 提交必丢 gpgsig →
+    /// SHA 分叉 → 平行链吞 PR）；无声明基点的全历史形态同收窄。tip 缺失/非 HEAD 祖先（分叉或
+    /// 独立历史）→ 维持声明（特性分支意图）/ 全历史。收窄 ⊆ 弹窗所示范围（v2.12 先例：
+    /// 批准内容 ⊇ 执行内容，执行以远端现状收窄）。</summary>
+    public static NewBranchAnchor ResolveNewBranchAnchor(bool hasDeclaredBase, bool declaredIsTip, bool tipIsAncestorOfHead) =>
+        (hasDeclaredBase, tipIsAncestorOfHead) switch
+        {
+            (_, false) => hasDeclaredBase ? NewBranchAnchor.Declared : NewBranchAnchor.FullHistory,
+            (true, true) when declaredIsTip => NewBranchAnchor.Declared,
+            _ => NewBranchAnchor.DefaultTip, // 收窄：声明基点陈旧，或全历史形态（无声明基点）
+        };
+
 
     public enum BaseResolution { Fallback, LocalOnly, RemoteOnly, BothSame, Ambiguous }
 
@@ -265,9 +284,10 @@ internal static class RestPush
         catch { return "元数据不可读"; }
     }
 
-    /// <summary>远端默认分支头树的 blob sha 集（recursive）；任一步失败或截断返回 null=放弃去重。
-    /// 3 个 GET：repos/{repo}（default_branch）→ ref/heads/{默认分支}（tip）→ trees/{tip}?recursive=1。</summary>
-    private static async Task<HashSet<string>?> FetchDefaultBranchBlobSet(string token, string repo)
+    /// <summary>远端默认分支头 sha（v2.33 自去重路径拆出）：2 个 GET——repos/{repo}
+    /// （default_branch）→ ref/heads/{默认分支}（tip）。锚点收窄与 blob 去重共用（各调用方
+    /// 拿 tip 自行决定是否再拉树）；任一步失败返回 null，调用方按各自语义退化。</summary>
+    private static async Task<string?> FetchDefaultBranchTip(string token, string repo)
     {
         try
         {
@@ -279,7 +299,18 @@ internal static class RestPush
                 $"repos/{repo}/git/ref/heads/{GitHubApi.RefPath(defBranch)}", token, null);
             if (rst2 != 200) return null;
             var tip = JsonNode.Parse(rbody2)?["object"]?["sha"]?.GetValue<string>();
-            if (string.IsNullOrEmpty(tip)) return null;
+            return tip is { Length: 40 or 64 } ? tip : null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>指定树（默认分支头）的 blob sha 集（recursive）；失败或截断返回 null=放弃去重。
+    /// v2.33 拆分后仅 1 个 GET（trees/{tip}?recursive=1），tip 由 FetchDefaultBranchTip 提供
+    /// （锚点收窄已拉过则复用，免重复往返）。</summary>
+    private static async Task<HashSet<string>?> FetchTreeBlobSet(string token, string repo, string tip)
+    {
+        try
+        {
             var (tst, tbody) = await GitHubApi.SendRawAsync(HttpMethod.Get,
                 $"repos/{repo}/git/trees/{tip}?recursive=1", token, null);
             if (tst != 200) return null;
@@ -401,10 +432,35 @@ internal static class RestPush
         }
         var replay = !isNew && plan.ReplacingSha is not null;
 
+        // v2.33（平行链事故根治）：新建分支的执行期锚点收窄。规划期基点唯一信息源是本地引用
+        // （tracking / --base 消歧），而 REST 推送不回写 + seal 封 fetch 使本地引用结构性陈旧——
+        // 基点落在过远提交上时，远端已有段被整体重打（GitHub 签名的 squash 提交重打必丢 gpgsig
+        // → SHA 分叉 → 平行链吞 PR：单笔提交变 4 提交/154 文件的事故形态）。执行期有远端权威：
+        // 默认分支头是 HEAD 祖先即取为锚，远端已有提交复用原 SHA、不进重打循环；收窄 ⊆ 弹窗
+        // 所示范围（v2.12 先例：批准内容 ⊇ 执行内容，执行以远端现状收窄）。重放通道（replay）
+        // 的锚 = 声明的新基点（语义是"替换旧头"），不收窄。
+        string? defTip = null;
+        var anchor = NewBranchAnchor.FullHistory;
+        if (isNew)
+        {
+            defTip = await FetchDefaultBranchTip(token, plan.Repo);
+            anchor = ResolveNewBranchAnchor(plan.Base is not null, plan.Base == defTip,
+                defTip is not null && GitIsAncestor(plan.RepoPath, defTip, plan.HeadSha));
+            if (anchor == NewBranchAnchor.DefaultTip)
+            {
+                var from = plan.Base is { Length: 40 or 64 } b
+                    ? $"声明基点 {b[..8]}（本地引用陈旧）" : "全历史规划";
+                Console.Error.WriteLine(
+                    $"[Sluice] 锚点收窄：{from} → 远端默认分支头 {defTip![..8]}——远端已有提交复用原 SHA 不重打（平行链防护）");
+            }
+        }
+
         // v2.12（缺陷一处置）：基点/远端头在场校验 + base_tree 解析前移到任何上传之前——原位置在
         // blob 全部上传之后，基点缺失时白传全部 blob 才失败；前移后失败零上传零副作用。
         // 请求数量不变（该 GET 原本就有，只是来得晚）；执行期位置即权威终判（带 token，无私有不可辨问题）
-        string prevCommit = replay ? plan.Base! : isNew ? plan.Base ?? "" : remoteSha;
+        string prevCommit = replay ? plan.Base!
+            : isNew ? (anchor == NewBranchAnchor.DefaultTip ? defTip! : plan.Base ?? "")
+            : remoteSha;
         string prevTree = "";
         if (prevCommit.Length > 0)
         {
@@ -435,9 +491,13 @@ internal static class RestPush
         }
         else if (isNew)
         {
-            // 新建分支：默认全历史；--base 给了增量基点则只推 base..HEAD（存量仓库新分支唯一可行形态）
-            // 长度 40 或 64：SHA-1 与 SHA-256 仓库的对象名（sha-256 漏判会静默退化成全历史重放）
-            if (plan.Base is { Length: 40 or 64 } b)
+            // 新建分支：锚点收窄优先（v2.33，DefaultTip = 远端默认分支头且为 HEAD 祖先，已过决策校验）；
+            // 否则 --base 给了增量基点则只推 base..HEAD（存量仓库新分支唯一可行形态）；
+            // 长度 40 或 64：SHA-1 与 SHA-256 仓库的对象名（sha-256 漏判会静默退化成全历史重放）；
+            // 全无 → 全历史（盲区兜底，弹窗已有 v2.12 警示行）
+            if (anchor == NewBranchAnchor.DefaultTip)
+                range = $"{defTip}..HEAD";
+            else if (plan.Base is { Length: 40 or 64 } b)
             {
                 if (!GitIsAncestor(plan.RepoPath, b, plan.HeadSha))
                     return new(PushResult.Other, "--base 基点不是 HEAD 祖先（非增量），拒绝执行");
@@ -477,7 +537,10 @@ internal static class RestPush
         // N 次 POST，覆盖全历史首推/陈旧基点/平行链等"冗余大头在默认分支"的场景。探不到的
         // （在远端但不在该树，如中断重试的悬空 blob）照传——幂等无害。仅大对象集启用（>25）：
         // 小推送常态全为新 blob，3 个 GET 不回本。truncated/任一步失败 ⇒ 放弃去重全传（退回 v2.13 行为）。
-        HashSet<string>? remoteBlobs = blobs.Count > 25 ? await FetchDefaultBranchBlobSet(token, plan.Repo) : null;
+        // v2.33：tip 拆分复用——锚点段已拉过则免重复 2 GET，只补 trees 1 GET。
+        defTip ??= blobs.Count > 25 ? await FetchDefaultBranchTip(token, plan.Repo) : null;
+        HashSet<string>? remoteBlobs = blobs.Count > 25 && defTip is not null
+            ? await FetchTreeBlobSet(token, plan.Repo, defTip) : null;
         var (upload, skipped) = PartitionBlobs(blobs, remoteBlobs);
         if (skipped > 0)
             Console.Error.WriteLine($"[Sluice] blob 去重：{blobs.Count} 个中 {skipped} 个远端默认分支已有，跳过；实际上传 {upload.Count} 个");
@@ -628,7 +691,34 @@ internal static class RestPush
         fn(parts[4][(tab + 1)..], mode, parts[3], st2, submodule);
     }
 
-    // ---------- 本地 git 封装（全部只读） ----------
+    /// <summary>v2.33（自锁环拆解，Bug 2）：push 成功后 best-effort 回写本地
+    /// refs/remotes/origin/{branch}。REST 推送不回写 + seal 封 fetch 曾使"sluice 自推分支"的
+    /// 增量/重放通道结构性不可达（下次推送仍全历史或撞 NeedFetch/ReplayUnresolved，指引里的
+    /// git fetch 又被自己的封条封死）。回写 = fetch 的引用等价物，发生在 approved+executed 之后，
+    /// 不是写动作，闸门语义不变。返回 (written, whyNot)——whyNot=="diverged" 为平行重打哨兵：
+    /// NewSha 的 commit 对象不在本地库（重打链分叉，服务端算出的 SHA 从未在本地存在），
+    /// update-ref 必拒，此时改走分叉专属提示；其余 whyNot 为原始错误文本。</summary>
+    public static (bool Written, string? WhyNot) TryWriteBackTracking(Plan plan, string newSha)
+    {
+        if (newSha.Length is not (40 or 64)) return (false, "newSha 形态不符");
+        if (!GitExists(plan.RepoPath, newSha)) return (false, "diverged");
+        try
+        {
+            var psi = new ProcessStartInfo("git", $"update-ref refs/remotes/origin/{plan.Branch} {newSha}")
+            {
+                WorkingDirectory = plan.RepoPath, UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+            };
+            using var p = Process.Start(psi);
+            if (p is null || !p.WaitForExit(5000)) return (false, "git update-ref 超时");
+            if (p.ExitCode != 0)
+                return (false, Trunc(p.StandardError.ReadToEnd().Trim()));
+            return (true, null);
+        }
+        catch (Exception ex) { return (false, Trunc(ex.Message)); }
+    }
+
+    // ---------- 本地 git 封装（除上方 v2.33 TryWriteBackTracking 的 refs/remotes/ 回写外，全部只读） ----------
 
     private static string Git(string repoPath, string args)
     {

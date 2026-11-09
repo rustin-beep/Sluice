@@ -392,7 +392,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.32");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.33");
         return 0;
     }
 
@@ -670,20 +670,31 @@ internal static class Program
     {
         // v2.14：去重跳过数入审计（blobs 远端已有未重传——重放/全历史推送的实付成本可追溯）
         var skip = r.SkippedBlobs > 0 ? $"，跳过 {r.SkippedBlobs} blob（远端已有）" : "";
+        // v2.33（Bug 2 自锁环拆解）：成功后 best-effort 回写本地 origin/{branch}——REST 推送从此
+        // 不留陈旧引用，增量/重放通道对 sluice 自推分支可达；NewSha 对象不在本地（平行重打分叉）
+        // 时回写必失败，该失败即哨兵，消息改走分叉提示（fetch 指引保留但点名用户执行）
+        var newSha = r.NewSha ?? plan.HeadSha; // Done 路径服务端必回 sha，兜底仅为可空性收口（内容寻址，二者同物）
+        var (written, whyNot) = RestPush.TryWriteBackTracking(plan, newSha);
+        var refsNote = written
+            ? Messages.PushRefsWritten(plan.Branch, newSha[..8])
+            : whyNot == "diverged"
+                ? Messages.PushRefsDiverged(plan.Branch, newSha[..8])
+                : Messages.PushRefsNotWritten(plan.Branch, whyNot ?? "未知原因");
         Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "approved", consent: TokenStore.ConsentChannel,
             result: plan.ReplacingSha is string old
-                ? $"executed:{r.NewSha}（重放替换 {old[..8]}{skip}）"
-                : $"executed:{r.NewSha}{skip}");
-        // v2.10：换 PushDone 专属模板——REST 推送不回写本地 origin/{branch} 引用，成功消息
-        // 必附 fetch 提示（否则"首次成功 → rebase → 再推必踩"是隐形确定性路径）
-        // NewSha 兜底 HeadSha：Done 路径服务端必回 sha，兜底仅为可空性收口（内容寻址，二者同物）
-        Messages.Write(Messages.PushDone(plan.Repo, plan.Branch, r.NewSha ?? plan.HeadSha, plan.ReplacingSha is not null, r.SkippedBlobs));
+                ? $"executed:{r.NewSha}（重放替换 {old[..8]}{skip}，refs:{(written ? "回写" : whyNot)}）"
+                : $"executed:{r.NewSha}{skip}，refs:{(written ? "回写" : whyNot)}");
+        Messages.Write(Messages.PushDone(plan.Repo, plan.Branch, newSha, plan.ReplacingSha is not null, r.SkippedBlobs, refsNote));
         return ExitCodes.Success;
     }
 
     private static int UpToDate(RestPush.Plan plan)
     {
-        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "up_to_date", consent: TokenStore.ConsentChannel);
+        // v2.33：UpToDate 同步回写（HeadSha 是本地 HEAD 对象必在，回写必成）——远端早已是该
+        // 提交而本地引用缺位的形态（曾用 sluice 推过）借此补齐，增量通道恢复可达
+        var (written, _) = RestPush.TryWriteBackTracking(plan, plan.HeadSha);
+        Audit.Append("push", plan.Repo, AuditTarget(plan), plan.HeadSha[..8], "up_to_date", consent: TokenStore.ConsentChannel,
+            result: written ? "refs:回写" : "refs:未回写");
         Messages.Write(Messages.PushUpToDate(plan.Repo, plan.Branch, plan.HeadSha[..8]));
         return ExitCodes.Success;
     }
