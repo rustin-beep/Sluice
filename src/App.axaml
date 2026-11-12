@@ -1,7 +1,237 @@
 <Application xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="Sluice.GateApp">
+  <!--
+    审批窗视觉层（2026-11-12 重排）：语义色 + 倒计时三档 + op 徽标 + 卡片/banner 样式。
+    纯视觉——不改任何交互语义（默认焦点拒绝 / Enter·Esc=拒绝 / 滚到底解锁 / 倒计时暂停 / 关窗=超时档拒绝）。
+    主题跟随系统：ThemeDictionaries 按实际主题取 Light/Dark 一套。
+  -->
+  <Application.Resources>
+    <ResourceDictionary>
+      <FontFamily x:Key="SluiceFontUi">Segoe UI, Microsoft YaHei UI</FontFamily>
+      <FontFamily x:Key="SluiceFontMono">Cascadia Code, Cascadia Mono, Consolas</FontFamily>
+      <FontFamily x:Key="SluiceFontIcon">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+      <ResourceDictionary.ThemeDictionaries>
+        <ResourceDictionary x:Key="Light">
+          <SolidColorBrush x:Key="SluiceWinBgBrush" Color="#FFF9F9F9"/>
+          <SolidColorBrush x:Key="SluiceSurfaceBrush" Color="#FFFFFFFF"/>
+          <SolidColorBrush x:Key="SluiceCardBgBrush" Color="#FFFCFCFC"/>
+          <SolidColorBrush x:Key="SluiceBorderBrush" Color="#FFE3E3E3"/>
+          <SolidColorBrush x:Key="SluiceBorderStrongBrush" Color="#FFD1D1D1"/>
+          <SolidColorBrush x:Key="SluiceFg2Brush" Color="#FF616161"/>
+          <SolidColorBrush x:Key="SluiceAccentBrush" Color="#FF005FB8"/>
+          <SolidColorBrush x:Key="SluiceDangerBrush" Color="#FFC42B1C"/>
+          <SolidColorBrush x:Key="SluiceDangerHoverBrush" Color="#FFD13438"/>
+          <SolidColorBrush x:Key="SluicePillBgBrush" Color="#FFEFEFEF"/>
+          <SolidColorBrush x:Key="SluicePillFgBrush" Color="#FF4C4C4C"/>
+          <SolidColorBrush x:Key="SluiceWarnBgBrush" Color="#FFFFF1D6"/>
+          <SolidColorBrush x:Key="SluiceWarnFgBrush" Color="#FF8A5A00"/>
+          <SolidColorBrush x:Key="SluiceWarnBarBrush" Color="#FFC77700"/>
+          <SolidColorBrush x:Key="SluiceWarnIconBrush" Color="#FFB36200"/>
+          <SolidColorBrush x:Key="SluiceBannerDBgBrush" Color="#FFFDF3F2"/>
+          <SolidColorBrush x:Key="SluiceBannerDFgBrush" Color="#FFA4262C"/>
+          <SolidColorBrush x:Key="SluiceBdDangerBgBrush" Color="#FFFDE9E7"/>
+          <SolidColorBrush x:Key="SluiceBdDangerFgBrush" Color="#FFC42B1C"/>
+          <SolidColorBrush x:Key="SluiceBdPrBgBrush" Color="#FFE5F1FB"/>
+          <SolidColorBrush x:Key="SluiceBdPrFgBrush" Color="#FF005FB8"/>
+          <SolidColorBrush x:Key="SluiceBdIssueBgBrush" Color="#FFEFEAFB"/>
+          <SolidColorBrush x:Key="SluiceBdIssueFgBrush" Color="#FF6B4FC8"/>
+          <SolidColorBrush x:Key="SluiceBdWfBgBrush" Color="#FFDFF3E8"/>
+          <SolidColorBrush x:Key="SluiceBdWfFgBrush" Color="#FF107C41"/>
+          <SolidColorBrush x:Key="SluiceBdNeutralBgBrush" Color="#FFEDEDED"/>
+          <SolidColorBrush x:Key="SluiceBdNeutralFgBrush" Color="#FF565656"/>
+        </ResourceDictionary>
+        <ResourceDictionary x:Key="Dark">
+          <SolidColorBrush x:Key="SluiceWinBgBrush" Color="#FF202020"/>
+          <SolidColorBrush x:Key="SluiceSurfaceBrush" Color="#FF272727"/>
+          <SolidColorBrush x:Key="SluiceCardBgBrush" Color="#FF2A2A2A"/>
+          <SolidColorBrush x:Key="SluiceBorderBrush" Color="#FF383838"/>
+          <SolidColorBrush x:Key="SluiceBorderStrongBrush" Color="#FF454545"/>
+          <SolidColorBrush x:Key="SluiceFg2Brush" Color="#FFA6A6A6"/>
+          <SolidColorBrush x:Key="SluiceAccentBrush" Color="#FF3B8AE6"/>
+          <SolidColorBrush x:Key="SluiceDangerBrush" Color="#FFD13438"/>
+          <SolidColorBrush x:Key="SluiceDangerHoverBrush" Color="#FFE04348"/>
+          <SolidColorBrush x:Key="SluicePillBgBrush" Color="#FF363636"/>
+          <SolidColorBrush x:Key="SluicePillFgBrush" Color="#FFCFCFCF"/>
+          <SolidColorBrush x:Key="SluiceWarnBgBrush" Color="#FF3D2E10"/>
+          <SolidColorBrush x:Key="SluiceWarnFgBrush" Color="#FFFFC96B"/>
+          <SolidColorBrush x:Key="SluiceWarnBarBrush" Color="#FFE8A33D"/>
+          <SolidColorBrush x:Key="SluiceWarnIconBrush" Color="#FFE8A33D"/>
+          <SolidColorBrush x:Key="SluiceBannerDBgBrush" Color="#FF3A1F1D"/>
+          <SolidColorBrush x:Key="SluiceBannerDFgBrush" Color="#FFFF9C93"/>
+          <SolidColorBrush x:Key="SluiceBdDangerBgBrush" Color="#2ED13438"/>
+          <SolidColorBrush x:Key="SluiceBdDangerFgBrush" Color="#FFFF9C93"/>
+          <SolidColorBrush x:Key="SluiceBdPrBgBrush" Color="#284C9DF0"/>
+          <SolidColorBrush x:Key="SluiceBdPrFgBrush" Color="#FF8CC4FF"/>
+          <SolidColorBrush x:Key="SluiceBdIssueBgBrush" Color="#288B6EF0"/>
+          <SolidColorBrush x:Key="SluiceBdIssueFgBrush" Color="#FFC0B0FF"/>
+          <SolidColorBrush x:Key="SluiceBdWfBgBrush" Color="#30108C50"/>
+          <SolidColorBrush x:Key="SluiceBdWfFgBrush" Color="#FF6FDCA0"/>
+          <SolidColorBrush x:Key="SluiceBdNeutralBgBrush" Color="#FF333333"/>
+          <SolidColorBrush x:Key="SluiceBdNeutralFgBrush" Color="#FFB5B5B5"/>
+        </ResourceDictionary>
+      </ResourceDictionary.ThemeDictionaries>
+    </ResourceDictionary>
+  </Application.Resources>
+
   <Application.Styles>
     <FluentTheme/>
+
+    <!-- ===== 倒计时 pill：>30s 中性 / 16–30s 橙 / ≤15s 红 + 呼吸脉冲 ===== -->
+    <Style Selector="Border.sluice-pill">
+      <Setter Property="CornerRadius" Value="999"/>
+      <Setter Property="Padding" Value="12,3"/>
+      <Setter Property="MinWidth" Value="56"/>
+      <Setter Property="Background" Value="{DynamicResource SluicePillBgBrush}"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Border.sluice-pill TextBlock">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource SluicePillFgBrush}"/>
+      <Setter Property="HorizontalAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Border.sluice-pill.tier-warn">
+      <Setter Property="Background" Value="{DynamicResource SluiceWarnBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-pill.tier-warn TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceWarnFgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-pill.tier-critical">
+      <Setter Property="Background" Value="{DynamicResource SluiceDangerBrush}"/>
+      <Style.Animations>
+        <Animation Duration="0:0:1.2" IterationCount="INFINITE">
+          <KeyFrame Cue="0%">
+            <Setter Property="Opacity" Value="1"/>
+          </KeyFrame>
+          <KeyFrame Cue="50%">
+            <Setter Property="Opacity" Value="0.66"/>
+          </KeyFrame>
+          <KeyFrame Cue="100%">
+            <Setter Property="Opacity" Value="1"/>
+          </KeyFrame>
+        </Animation>
+      </Style.Animations>
+    </Style>
+    <Style Selector="Border.sluice-pill.tier-critical TextBlock">
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+
+    <!-- ===== 顶部时间进度条（颜色随三档变化，值平滑过渡） ===== -->
+    <Style Selector="ProgressBar.sluice-time">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceAccentBrush}"/>
+      <Setter Property="MinHeight" Value="3"/>
+      <Setter Property="Padding" Value="0"/>
+      <Setter Property="Transitions">
+        <Transitions>
+          <DoubleTransition Property="Value" Duration="0:0:0.9"/>
+        </Transitions>
+      </Setter>
+    </Style>
+    <Style Selector="ProgressBar.sluice-time.tier-warn">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceWarnBarBrush}"/>
+    </Style>
+    <Style Selector="ProgressBar.sluice-time.tier-critical">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceDangerBrush}"/>
+    </Style>
+
+    <!-- ===== op 徽标（配色映射见 GateWindow.SetOpBadgeStyle） ===== -->
+    <Style Selector="Border.sluice-op">
+      <Setter Property="CornerRadius" Value="4"/>
+      <Setter Property="Padding" Value="9,2"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Background" Value="{DynamicResource SluiceBdNeutralBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op TextBlock">
+      <Setter Property="FontFamily" Value="{DynamicResource SluiceFontMono}"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBdNeutralFgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-danger">
+      <Setter Property="Background" Value="{DynamicResource SluiceBdDangerBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-danger TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBdDangerFgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-pr">
+      <Setter Property="Background" Value="{DynamicResource SluiceBdPrBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-pr TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBdPrFgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-issue">
+      <Setter Property="Background" Value="{DynamicResource SluiceBdIssueBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-issue TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBdIssueFgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-wf">
+      <Setter Property="Background" Value="{DynamicResource SluiceBdWfBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-op.op-wf TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBdWfFgBrush}"/>
+    </Style>
+
+    <!-- ===== 正文卡片 ===== -->
+    <Style Selector="Border.sluice-card">
+      <Setter Property="Background" Value="{DynamicResource SluiceCardBgBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource SluiceBorderBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+    </Style>
+
+    <!-- ===== banner（警告=红 / 状态=橙） ===== -->
+    <Style Selector="Border.sluice-banner">
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="11,8"/>
+    </Style>
+    <Style Selector="Border.sluice-banner-danger">
+      <Setter Property="Background" Value="{DynamicResource SluiceBannerDBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-banner-danger TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceBannerDFgBrush}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Border.sluice-banner-warn">
+      <Setter Property="Background" Value="{DynamicResource SluiceWarnBgBrush}"/>
+    </Style>
+    <Style Selector="Border.sluice-banner-warn TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceWarnFgBrush}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+
+    <!-- ===== 拒绝=红（默认焦点，误触安全侧） ===== -->
+    <Style Selector="Button.sluice-danger">
+      <Setter Property="Background" Value="{DynamicResource SluiceDangerBrush}"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="CornerRadius" Value="4"/>
+    </Style>
+    <Style Selector="Button.sluice-danger:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource SluiceDangerHoverBrush}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.sluice-danger:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{DynamicResource SluiceDangerBrush}"/>
+      <Setter Property="Foreground" Value="White"/>
+    </Style>
+
+    <!-- ===== 浮动"跳到底部"小按钮 ===== -->
+    <Style Selector="Button.sluice-jump">
+      <Setter Property="Background" Value="{DynamicResource SluiceSurfaceBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource SluiceBorderStrongBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="6"/>
+      <Setter Property="Padding" Value="11,4"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <Style Selector="Button.sluice-jump TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceFg2Brush}"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+    </Style>
+    <Style Selector="Button.sluice-jump:pointerover TextBlock">
+      <Setter Property="Foreground" Value="{DynamicResource SluiceAccentBrush}"/>
+    </Style>
   </Application.Styles>
 </Application>

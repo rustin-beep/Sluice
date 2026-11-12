@@ -32,17 +32,20 @@ public partial class GateWindow : Window
     {
         var req = Gate.Req!;
         OpText.Text = req.Op;
-        RepoText.Text = $"{req.Repo}  {req.Target}";
-        ShaText.Text = req.Sha8;
+        SetOpBadgeStyle(req.Op);
+        RepoText.Text = $"{req.Repo} · {req.Target}";
+        ShaText.Text = $"指纹 {req.Sha8}";
         BodyText.Text = req.Body;
         if (!string.IsNullOrEmpty(req.Warning))
         {
-            WarnText.Text = "⚠ " + req.Warning;
-            WarnText.IsVisible = true;
+            WarnText.Text = req.Warning;
+            WarnBanner.IsVisible = true;
         }
         Title = $"Sluice · 批准请求 · {req.Op}";
 
         DenyBtn.Focus(); // 默认焦点拒绝（§7 误触安全侧）
+        TimeBar.Maximum = Gate.TimeoutSeconds;
+        EvalTimer(); // 立即按 _secondsLeft 渲染倒计时与三档配色（防首秒显示陈旧的"60s"）
         EvaluateScrollEnd();
 
         // timer 恒跑，暂停条件（输入中/滚动中）在 tick 内判断——否则滚动暂停后无人重启。
@@ -81,7 +84,40 @@ public partial class GateWindow : Window
         return null;
     }
 
-    private void EvalTimer() => Countdown.Text = PauseReason() is { } p ? $"{_secondsLeft}s · {p}" : $"{_secondsLeft}s";
+    private void EvalTimer()
+    {
+        Countdown.Text = PauseReason() is { } p ? $"{_secondsLeft}s · {p}" : $"{_secondsLeft}s";
+        UpdateTiers();
+    }
+
+    /// <summary>倒计时三档视觉（>30 常规 / 16–30 橙 / ≤15 红+呼吸脉冲）与顶部进度条——纯样式，不参与超时判定。</summary>
+    private void UpdateTiers()
+    {
+        var tier = _secondsLeft > 30 ? "tier-normal" : _secondsLeft > 15 ? "tier-warn" : "tier-critical";
+        CountPill.Classes.Set("tier-normal", tier == "tier-normal");
+        CountPill.Classes.Set("tier-warn", tier == "tier-warn");
+        CountPill.Classes.Set("tier-critical", tier == "tier-critical");
+        TimeBar.Classes.Set("tier-normal", tier == "tier-normal");
+        TimeBar.Classes.Set("tier-warn", tier == "tier-warn");
+        TimeBar.Classes.Set("tier-critical", tier == "tier-critical");
+        TimeBar.Value = Math.Max(0, _secondsLeft);
+    }
+
+    /// <summary>op 徽标配色（纯视觉，无安全语义）：仓库直改类=红、PR=蓝、issue=紫、workflow=绿、其余=中性。</summary>
+    private void SetOpBadgeStyle(string op)
+    {
+        var cls = op switch
+        {
+            "push" or "branch_delete" => "op-danger",
+            "pr_comment" or "pr_create" or "pr_merge" or "pr_reopen" => "op-pr",
+            "issue_close" => "op-issue",
+            "workflow_dispatch" => "op-wf",
+            _ => "op-neutral",
+        };
+        OpBadge.Classes.Clear();
+        OpBadge.Classes.Add("sluice-op");
+        OpBadge.Classes.Add(cls);
+    }
 
     private void OnGlobalKey(object? sender, KeyEventArgs e)
     {
@@ -181,7 +217,7 @@ public partial class GateWindow : Window
             // 安全无损：取消不产生任何写动作；再次批准仍必须过 Hello（vault 解密同一事件）。
             _closing = false;
             StatusText.Text = "Windows Hello 已取消或未通过——可重新批准，或直接拒绝";
-            StatusText.IsVisible = true;
+            StatusBanner.IsVisible = true;
             Show();
             Activate();
             UpdateApprove();

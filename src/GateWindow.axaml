@@ -1,82 +1,107 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="Sluice.GateWindow"
-        Title="Agent 请求执行对外动作"
-        Width="560" SizeToContent="Height" MaxHeight="820"
+        Title="Sluice"
+        Width="600" SizeToContent="Height" MaxHeight="820"
         WindowStartupLocation="CenterScreen"
-        CanResize="False">
+        CanResize="False"
+        FontFamily="{DynamicResource SluiceFontUi}"
+        Background="{DynamicResource SluiceWinBgBrush}">
 
-  <DockPanel Margin="16">
+  <DockPanel>
 
-    <Grid DockPanel.Dock="Top">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="*"/>
-        <ColumnDefinition Width="Auto"/>
-      </Grid.ColumnDefinitions>
-      <TextBlock Grid.Column="0" Text="Agent 请求执行对外动作" FontWeight="Bold" FontSize="15"/>
-      <TextBlock Grid.Column="1" x:Name="Countdown" Text="60s" FontWeight="Bold" FontSize="15"/>
-    </Grid>
+    <!-- 顶部倒计时进度条：满格=刚弹出；颜色三档随剩余时间变化（样式见 App.axaml） -->
+    <ProgressBar DockPanel.Dock="Top" x:Name="TimeBar" Classes="sluice-time tier-normal"
+                 Height="3" MinHeight="3" Minimum="0" Maximum="60"/>
 
-    <Separator DockPanel.Dock="Top" Margin="0,8"/>
+    <StackPanel Margin="16" Spacing="10">
 
-    <Grid DockPanel.Dock="Top">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="Auto"/>
-        <ColumnDefinition Width="*"/>
-      </Grid.ColumnDefinitions>
-      <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-      </Grid.RowDefinitions>
-      <TextBlock Grid.Row="0" Grid.Column="0" Text="操作" Margin="0,2,16,2" Opacity="0.7"/>
-      <TextBlock Grid.Row="0" Grid.Column="1" x:Name="OpText" Margin="0,2,0,2"/>
-      <TextBlock Grid.Row="1" Grid.Column="0" Text="仓库" Margin="0,2,16,2" Opacity="0.7"/>
-      <TextBlock Grid.Row="1" Grid.Column="1" x:Name="RepoText" Margin="0,2,0,2"/>
-      <TextBlock Grid.Row="2" Grid.Column="0" Text="哈希" Margin="0,2,16,2" Opacity="0.7"/>
-      <TextBlock Grid.Row="2" Grid.Column="1" x:Name="ShaText" Margin="0,2,0,2" FontFamily="Consolas,monospace"/>
-    </Grid>
+      <!-- 标题行：警示图标 + 标题 + 倒计时 pill -->
+      <Grid ColumnDefinitions="*,Auto">
+        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="&#xE7BA;" FontFamily="{DynamicResource SluiceFontIcon}" FontSize="16"
+                     Foreground="{DynamicResource SluiceWarnIconBrush}" VerticalAlignment="Center"/>
+          <TextBlock Text="Agent 请求执行对外动作" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center"/>
+        </StackPanel>
+        <Border Grid.Column="1" x:Name="CountPill" Classes="sluice-pill tier-normal">
+          <TextBlock x:Name="Countdown" Text="60s"/>
+        </Border>
+      </Grid>
 
-    <TextBlock DockPanel.Dock="Top" x:Name="WarnText" TextWrapping="Wrap" FontWeight="Bold"
-               Foreground="#D32F2F" IsVisible="False" Margin="0,6,0,0"/>
+      <!-- 元数据行：op 徽标（按操作类型着色） + 仓库/目标（等宽） + 指纹 -->
+      <Grid ColumnDefinitions="Auto,*,Auto">
+        <Border Grid.Column="0" x:Name="OpBadge" Classes="sluice-op op-neutral">
+          <TextBlock x:Name="OpText"/>
+        </Border>
+        <TextBlock Grid.Column="1" x:Name="RepoText" Margin="8,0,8,0"
+                   FontFamily="{DynamicResource SluiceFontMono}" FontSize="13"
+                   VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+        <TextBlock Grid.Column="2" x:Name="ShaText" FontFamily="{DynamicResource SluiceFontMono}" FontSize="12"
+                   Foreground="{DynamicResource SluiceFg2Brush}" VerticalAlignment="Center"/>
+      </Grid>
 
-    <DockPanel DockPanel.Dock="Top" Margin="0,8,0,4">
-      <DockPanel>
-        <Button DockPanel.Dock="Right" x:Name="JumpToEnd" Content="跳到底部 ▼" FontSize="11"
-                Padding="8,2" Click="OnJumpToEnd"/>
-        <TextBlock Text="正文（批准你所见；长文需滚动到底才可批准）" Opacity="0.7"/>
-      </DockPanel>
-    </DockPanel>
-    <ScrollViewer x:Name="BodyScroll" DockPanel.Dock="Top" MinHeight="120" MaxHeight="500"
-                  VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-      <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="2"/>
-    </ScrollViewer>
-
-    <Separator DockPanel.Dock="Bottom" Margin="0,8"/>
-
-    <!-- UI-2/4：等待 Hello / Hello 取消的可见状态（原来只有按钮变灰，用户不知道 Hello 弹没弹、在哪弹） -->
-    <TextBlock DockPanel.Dock="Bottom" x:Name="StatusText" TextWrapping="Wrap" FontWeight="Bold"
-               Foreground="#E65100" IsVisible="False" Margin="0,6,0,0"/>
-
-    <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12">
-      <Button x:Name="DenyBtn" Content="拒 绝" MinWidth="96" MinHeight="34" Click="OnDeny"/>
-      <Button x:Name="ApproveBtn" Content="批准 → Hello" MinWidth="120" MinHeight="34"
-              Click="OnApprove" IsEnabled="False"/>
-    </StackPanel>
-
-    <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0">
-      <TextBlock Text="拒绝理由（可选，会反馈给 agent）" Opacity="0.7" Margin="0,0,0,4"/>
-      <StackPanel Orientation="Horizontal" Spacing="8">
-        <ComboBox x:Name="PresetBox" MinWidth="140" SelectedIndex="0">
-          <ComboBoxItem Content="不批准"/>
-          <ComboBoxItem Content="目标不对"/>
-          <ComboBoxItem Content="内容需修改"/>
-          <ComboBoxItem Content="我自己处理"/>
-          <ComboBoxItem Content="任务重新讨论"/>
-        </ComboBox>
-        <TextBox x:Name="FreeText" PlaceholderText="自由附言（可选）" Width="330"/>
+      <!-- 正文卡片；底部留白让浮动按钮不遮正文 -->
+      <StackPanel Spacing="5">
+        <TextBlock Text="正文（批准你所见；长文需滚动到底才可批准）" FontSize="12"
+                   Foreground="{DynamicResource SluiceFg2Brush}"/>
+        <Border Classes="sluice-card">
+          <Grid>
+            <ScrollViewer x:Name="BodyScroll" MinHeight="120" MaxHeight="440"
+                          VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+              <TextBlock x:Name="BodyText" TextWrapping="Wrap" Margin="12,10,12,46"/>
+            </ScrollViewer>
+            <Button x:Name="JumpToEnd" Classes="sluice-jump" Click="OnJumpToEnd"
+                    HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,10,10">
+              <StackPanel Orientation="Horizontal" Spacing="5">
+                <TextBlock Text="&#xE70D;" FontFamily="{DynamicResource SluiceFontIcon}" FontSize="10"
+                           VerticalAlignment="Center"/>
+                <TextBlock Text="跳到底部" VerticalAlignment="Center"/>
+              </StackPanel>
+            </Button>
+          </Grid>
+        </Border>
       </StackPanel>
-    </StackPanel>
 
+      <!-- 警告 banner（红底，替代原裸红字） -->
+      <Border x:Name="WarnBanner" Classes="sluice-banner sluice-banner-danger" IsVisible="False">
+        <StackPanel Orientation="Horizontal" Spacing="8">
+          <TextBlock Text="&#xE7BA;" FontFamily="{DynamicResource SluiceFontIcon}" FontSize="14"
+                     Foreground="{DynamicResource SluiceBannerDFgBrush}" VerticalAlignment="Top"/>
+          <TextBlock x:Name="WarnText" TextWrapping="Wrap" VerticalAlignment="Center"/>
+        </StackPanel>
+      </Border>
+
+      <!-- 拒绝理由 -->
+      <StackPanel Spacing="5" Margin="0,2,0,0">
+        <TextBlock Text="拒绝理由（可选，会反馈给 agent）" FontSize="12"
+                   Foreground="{DynamicResource SluiceFg2Brush}"/>
+        <Grid ColumnDefinitions="Auto,*">
+          <ComboBox Grid.Column="0" x:Name="PresetBox" MinWidth="152" SelectedIndex="0">
+            <ComboBoxItem Content="不批准"/>
+            <ComboBoxItem Content="目标不对"/>
+            <ComboBoxItem Content="内容需修改"/>
+            <ComboBoxItem Content="我自己处理"/>
+            <ComboBoxItem Content="任务重新讨论"/>
+          </ComboBox>
+          <TextBox Grid.Column="1" x:Name="FreeText" PlaceholderText="自由附言（可选）" Margin="8,0,0,0"/>
+        </Grid>
+      </StackPanel>
+
+      <!-- UI-2/4：等待 Hello / Hello 取消的可见状态（banner 化） -->
+      <Border x:Name="StatusBanner" Classes="sluice-banner sluice-banner-warn" IsVisible="False">
+        <TextBlock x:Name="StatusText" TextWrapping="Wrap"/>
+      </Border>
+
+      <!-- 按钮行：拒绝=红（默认焦点在此）；批准=accent，未读完禁用 -->
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12" Margin="0,2,0,0">
+        <Button x:Name="DenyBtn" Classes="sluice-danger" Content="拒 绝" MinWidth="96" MinHeight="34" Click="OnDeny"/>
+        <Button x:Name="ApproveBtn" Content="批准 → Hello" MinWidth="132" MinHeight="34" FontWeight="SemiBold"
+                Click="OnApprove" IsEnabled="False"/>
+      </StackPanel>
+
+      <TextBlock Text="Enter / Esc = 拒绝 · 批准需先阅读至正文底部 · 剩 15 秒时任务栏闪烁召回"
+                 HorizontalAlignment="Center" FontSize="11.5" Opacity="0.55"/>
+
+    </StackPanel>
   </DockPanel>
 </Window>
