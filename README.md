@@ -43,15 +43,22 @@ agent ──sluice <verb> / MCP github_write──▶ 批准窗（全文所见 +
 dotnet publish -c Release -r win-x64     # 产物在 bin/Release/net10.0-windows10.0.26100/win-x64/publish/sluice.exe
 ```
 
-初始化四步 + 验证（每步做什么见注释）：
+初始化五步 + 验证（每步做什么见注释）：
 
 ```
 sluice.exe setup [--token-file F]         # ① 配置凭据（交互粘贴或 --token-file 读文件）→ 校验 → Windows Hello 建 vault
-sluice.exe seal --fix                     # ② 封堵侧门：凭据管理器 / gh / git-credentials / SSH / 环境变量
+sluice.exe seal --fix                     # ② 封堵侧门：凭据管理器 / gh / git-credentials / SSH / 环境变量 / repo-local helper 清查
+                                             + 置 GCM 无 UI 封堵键（credential.https://github.com.interactive=never——错门毫秒级死不弹登录窗）
 sluice.exe setup --install                # ③ 装 notice helper + 默认写规则片段进工作区 AGENTS.md（--no-snippet 跳过）
 sluice.exe sentinel-install               # ④ 哨兵：每 5 分钟 seal 预检，违规弹 Windows 通知（封 device flow"当场成功"窗）
+sluice.exe setup --install-hook [all]     # ⑤ 宿主 PreToolUse hook（ZCode/Claude Code）：agent 直推 git/gh 在执行前被 deny，
+                                             秒回指路文案——首错代价从"登录窗+挂起"降为"一条消息"；幂等，exe 路径漂移自动刷新
 sluice.exe doctor                         # 验证：七项只读健康检查（版本戳/vault/config/seal 预检/notice/哨兵/AGENTS 片段）全绿即就绪
 ```
+
+**GCM 登录窗被封堵后，人要交互登录怎么办**（人的逃生口，只写进人文档——agent 可见文案刻意不教绕过）：
+单次放行 `git -c credential.https://github.com.interactive=always <命令>`；当前 shell 放行 `export GCM_INTERACTIVE=always`；
+或开暂停窗 `sluice seal --pause N`（期内封堵键与 notice 一并摘除，可正常交互登录，到期自动恢复）。
 
 日常运维（按需）：
 
@@ -107,6 +114,7 @@ sluice.exe selftest / --version           # 消息表自检 / 构建戳（时间
 | `sluice status <receipt>` | 查 MCP pending 请求的终态 | `github_write` 返回 code=23 时附 receipt（16 位）；拒绝理由原文在此查询；无副作用可间隔重查，终态出现前勿重发同一写操作 |
 | `sluice mcp [--print-config]` | MCP 前门（stdio JSON-RPC） | 单一写工具 `github_write`（action 与上表写动词一一对应）+ `sluice_status`（按 receipt 查终态）；spawn-child 拓扑——server 进程不持凭据，每次调用 spawn CLI 子进程走完整闸门；`--print-config` 打印宿主接入配置 |
 | `sluice seal [--fix]` / `sluice setup --install` / `sluice sentinel-install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 装哨兵 / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice）；哨兵移除 `schtasks /Delete /TN "Sluice Sentinel" /F` |
+| `sluice setup --install-hook [zcode\|claude-code\|all]` / `--uninstall-hook` / `sluice hook-guard` | 宿主 PreToolUse hook 装/卸 / 宿主内部调用 | hook 在**执行前** deny 直推 git/gh 写形态（fail-open 糖，封堵墙仍是 seal/notice/gate）；deny 落审计（op=hook_guard）；宿主会话启动时读配置——装完对新会话生效；幂等 + exe 路径漂移刷新；unseal 善后清单含此项 |
 
 推送序列的 5xx（blob/tree/commit，内容寻址幂等）自动退避重试（2s/8s×3）；update-ref 永不自动重试。
 步骤被服务端拒绝会**原样透传服务端 message**（exit 10，分支未动）；`--base` 基点不在远端在**一切上传之前**拦截（exit 10，零副作用）；blob sha 与内容寻址不符归 20（平台异常，重传安全）。

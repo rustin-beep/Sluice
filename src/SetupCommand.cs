@@ -1,3 +1,6 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
 namespace Sluice;
 
 internal static class SetupCommand
@@ -152,6 +155,8 @@ internal static class SetupCommand
         var v = SealCheck.Run();
         if (v.Count == 0)
         {
+            // 层 A：--fix 在干净环境也确保封堵键在位（生命周期内化——键缺失不是"违规"但属封堵面）
+            if (fix && EnsureInteractiveNever() != 0) return ExitCodes.Internal;
             Console.WriteLine("✓ 环境干净：未发现未封堵的 GitHub 凭据。闸门对绕过路径闭合。");
             return 0;
         }
@@ -172,6 +177,7 @@ internal static class SetupCommand
         Console.WriteLine("执行 --fix …");
         foreach (var action in SealCheck.Fix(v))
             Console.WriteLine($"  - {action}");
+        if (EnsureInteractiveNever() != 0) return ExitCodes.Internal;
         Console.WriteLine();
 
         var after = SealCheck.Run();
@@ -255,8 +261,8 @@ internal static class SetupCommand
                                                           // 批准后以 Begin 返回的实际值为准）
         var body = $"""
             暂停侧门封堵 {minutes} 分钟（至本地约 {UntilLabel(until)}）。
-            期内：git/gh 直推能力恢复（notice helper 摘除、SSH 屏蔽块摘除）；sluice 写操作的 seal 门同步放行。
-            到期：最迟 5 分钟内自动重新封堵（重装 notice + 清理期内新登录的凭据）；提前结束用 sluice seal --resume。
+            期内：git/gh 直推能力恢复（notice helper 摘除、GCM 无 UI 封堵键摘除、SSH 屏蔽块摘除）；sluice 写操作的 seal 门同步放行。
+            到期：最迟 5 分钟内自动重新封堵（重装 notice + 封堵键 + 清理期内新登录的凭据）；提前结束用 sluice seal --resume。
             这是有意的防护降级窗口——期内你重新提供的任何 GitHub 凭据，同用户进程（含 agent）都可静默使用。
             """;
         return RunLocalGated("seal_pause", $"暂停 {minutes} 分钟", body,
@@ -269,6 +275,7 @@ internal static class SetupCommand
             {
                 $"状态：state.json 已记 pause_until（至 {UntilLabel(actual)}）",
                 "notice helper：已摘除（github.com 凭据链回到既有继承）",
+                RemoveInteractiveNever(), // 层 A：暂停窗内 GCM 恢复可交互登录（与摘 notice 同一步骤）
             };
             acts.AddRange(SealCheck.StripSshBlock());
             // 审计 result 与 state.json 值逐字同形态（ToStateString）——哨兵/doctor 的伪造核对靠它对上
@@ -293,6 +300,7 @@ internal static class SetupCommand
         var n = InstallNotice(quiet: true);
         acts.Add(n == 0 ? "notice helper：已确认在位/重装（github.com 链 = [空串断继承, notice]）"
                         : "notice helper：重装失败——请手动 sluice setup --install");
+        if (n == 0) acts.Add($"GCM 无 UI 封堵：已确保在位（{GcmInteractiveKey} = never）");
 
         var viol = SealCheck.Run();
         if (viol.Count > 0)
@@ -321,6 +329,7 @@ internal static class SetupCommand
         var body = """
             卸载 Sluice 的环境侧安装件：
             · 摘除 notice credential helper（github.com 凭据链回到系统默认）
+            · 摘除 GCM 无 UI 封堵键（credential.https://github.com.interactive）
             · 删除哨兵计划任务 "Sluice Sentinel"
             · 摘除 ~/.ssh/config 的 github.com 屏蔽块
             · 清除暂停状态（如有）
@@ -332,7 +341,11 @@ internal static class SetupCommand
             () =>
         {
             Git("config", "--global", "--unset-all", "credential.https://github.com.helper");
-            var acts = new List<string> { "notice helper：已摘除" };
+            var acts = new List<string>
+            {
+                "notice helper：已摘除",
+                RemoveInteractiveNever(), // 层 A：卸载不得留下被静默降级的 git（红线同理）
+            };
             try
             {
                 var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/Delete /TN \"Sluice Sentinel\" /F")
@@ -351,10 +364,49 @@ internal static class SetupCommand
                 善后清单（§6 红线：卸载不得静默回到"全权 token 躺 keyring"）：
                 · vault 与配置仍在 {Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice")}（含加密 token）——彻底清除请手动删除该目录；
                 · 工作区 AGENTS.md 的 Sluice 规则片段（如有）请手动移除标记块；
+                · 宿主 hook 配置（ZCode / Claude Code 的 PreToolUse，如有）用 sluice setup --uninstall-hook 移除——hook 读封堵态放行只是 belt，配置残留本身要被说破；
                 · 重新引入直推凭据时自觉最小化：fine-grained、只读优先、短有效期。
                 """);
             return 0;
         });
+    }
+
+    // ---------- GCM 无 UI 封堵键（spec-guard-20261112 层 A：seal 生命周期内化） ----------
+
+    /// <summary>host 作用域键（外科纪律与 notice 的空串断继承同族：只断 GitHub，不碰其他 host 的
+    /// GCM 交互）。P-探针（2026-11-12，GCM 2.7.3）：置 never 后 git credential fill 得
+    /// "Cannot prompt because user interactivity has been disabled"，毫秒级败、无 UI——错门
+    /// 死得快且不挂起。人的逃生口（git -c credential.https://github.com.interactive=always 或
+    /// GCM_INTERACTIVE=always）只进人文档（spec / README），禁止进任何 agent 可见文案
+    /// （§8 纪律：不教绕过，与 device flow 点名禁令同款理由）。</summary>
+    internal const string GcmInteractiveKey = "credential.https://github.com.interactive";
+
+    /// <summary>确保 GCM 无 UI 封堵键在位（setup --install / seal --fix / seal --resume 三态共用；
+    /// 幂等：--get 已为 never 则不动）。写失败照实报错——fail-closed 方向（宁可装不上也不静默缺键）。</summary>
+    public static int EnsureInteractiveNever(bool quiet = false)
+    {
+        if (GitOut("--get", GcmInteractiveKey).Trim() == "never")
+        {
+            if (!quiet) Console.WriteLine($"[Sluice] GCM 无 UI 封堵键已在位：{GcmInteractiveKey} = never。");
+            return 0;
+        }
+        // 单值键：先清再 add（用户手改过的其他值一并归位——本键生命周期归 seal 管）
+        Git("config", "--global", "--unset-all", GcmInteractiveKey); // 失败=本就不在位
+        if (Git("config", "--global", "--add", GcmInteractiveKey, "never") != 0)
+        {
+            Console.Error.WriteLine($"[Sluice] git config 写入失败（git 不在 PATH？）：{GcmInteractiveKey} = never 未生效——GCM 仍可对 github.com 弹登录窗。");
+            return ExitCodes.Internal;
+        }
+        if (!quiet) Console.WriteLine($"[Sluice] 已置 GCM 无 UI 封堵键（{GcmInteractiveKey} = never）——GCM 对 github.com 拒答不弹窗。");
+        return 0;
+    }
+
+    /// <summary>摘除封堵键（seal --pause / unseal：暂停窗内人可交互登录，与摘 notice helper 同步）。
+    /// 返回善后清单行（调用方汇入 acts）。</summary>
+    internal static string RemoveInteractiveNever()
+    {
+        Git("config", "--global", "--unset-all", GcmInteractiveKey); // 失败=本就不在位
+        return $"GCM 无 UI 封堵：已摘除（{GcmInteractiveKey}）——GCM 恢复可交互登录";
     }
 
     // ---------- sluice setup --install（v2.19，§9 notice 安装器） ----------
@@ -383,6 +435,11 @@ internal static class SetupCommand
         }
         var fwd = exe.Replace('\\', '/');
         const string key = "credential.https://github.com.helper";
+
+        // 层 A（spec-guard-20261112）：封堵键与 notice 同生命周期，且必须在位检查**之前**确保——
+        // "notice 已在位而键缺失"（旧版安装 / pause 摘除后 resume）是漂移形态，早退路径也要治
+        var g = EnsureInteractiveNever(quiet);
+        if (g != 0) return g;
 
         var existing = GitOut("--get-all", key);
         if (NoticeValuePresent(existing, fwd))
@@ -469,7 +526,7 @@ internal static class SetupCommand
         catch { return -1; }
     }
 
-    private static string GitOut(string flag, string key)
+    internal static string GitOut(string flag, string key)
     {
         try
         {
@@ -842,4 +899,223 @@ internal static class SetupCommand
         Show-Toast 'Sluice 哨兵：检测到未封堵的 GitHub 凭据' "运行 sluice seal --fix 处理。$($viol.Replace("`n", ' | '))"
         exit 7
         """;
+
+    // ---------- setup --install-hook / --uninstall-hook（spec-guard-20261112 层 B §2.2，宿主注册表驱动） ----------
+
+    /// <summary>hook 命令值（纯函数，selftest 锁）：exe 绝对路径恒带内层引号——含空格路径的坑与
+    /// 哨兵 /TR 引号（v2.23 P1）同族，配置值经宿主 shell 分词，宁恒引号不赌路径；正斜杠形态
+    /// （与 notice helper 一致）。</summary>
+    internal static string HookGuardCommand(string exe) =>
+        $"\"{exe.Replace('\\', '/')}\" hook-guard";
+
+    /// <summary>宿主注册表（§2.2：不铆钉单一平台，出现等价 PreToolUse-deny 语义的宿主才收）。
+    /// zcode 形状 = hooks.enabled + hooks.events.PreToolUse；claude-code 形状 = hooks.PreToolUse。</summary>
+    private static (string Name, string Path, bool ZcodeShape)[] HookHosts(string home) =>
+    [
+        ("zcode",       Path.Combine(home, ".zcode", "cli", "config.json"), true),
+        ("claude-code", Path.Combine(home, ".claude", "settings.json"),     false),
+    ];
+
+    private static (string Name, string Path, bool ZcodeShape)[]? SelectHookHosts(string sel) => sel switch
+    {
+        "all" => HookHosts(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)),
+        "zcode" or "claude-code" => HookHosts(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile))
+            .Where(h => h.Name == sel).ToArray(),
+        _ => null,
+    };
+
+    public static int InstallHook(string sel)
+    {
+        var hosts = SelectHookHosts(sel);
+        if (hosts is null)
+        {
+            Console.Error.WriteLine($"[Sluice] 用法：sluice setup --install-hook [zcode|claude-code|all]（收到 {sel}）");
+            return ExitCodes.BadRequest;
+        }
+        var exe = Environment.ProcessPath;
+        if (exe is null || !File.Exists(exe))
+        {
+            Console.Error.WriteLine("[Sluice] 无法定位自身 exe，安装中止（未产生任何变更）。");
+            return ExitCodes.Internal;
+        }
+
+        var bad = 0;
+        foreach (var h in hosts)
+            if (InstallHookFor(h, exe) != 0) bad++;
+
+        // 临时件收编（spec §3：产品化接管即删——.sh 内文案与 Messages 单源的漂移面随之消灭）
+        TryDeleteTempHookScript();
+        return bad == 0 ? 0 : ExitCodes.Internal;
+    }
+
+    private static void TryDeleteTempHookScript()
+    {
+        var sh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "hook-guard.sh");
+        if (!File.Exists(sh)) return;
+        try { File.Delete(sh); Console.WriteLine($"[Sluice] 临时件已删除（产品化接管）：{sh}"); }
+        catch (Exception ex) { Console.WriteLine($"⚠ 临时件删除失败（{ex.Message}）——请手动删除 {sh}"); }
+    }
+
+    /// <summary>幂等安装 / exe 路径漂移刷新（notice 的 --unset-all→--add 同纪律）：命中既有
+    /// hook-guard 条目 → 刷新 command 为当前 exe；无 → 追加；顺路摘除临时 .sh 时代的旧条目。</summary>
+    private static int InstallHookFor((string Name, string Path, bool ZcodeShape) host, string exe)
+    {
+        var (name, path, zcodeShape) = host;
+        if (!Directory.Exists(Path.GetDirectoryName(path)!))
+        {
+            Console.WriteLine($"[Sluice] {name}：未检出（配置目录不存在），跳过——装好该宿主后重跑本命令。");
+            return 0;
+        }
+        JsonObject root;
+        try
+        {
+            root = File.Exists(path)
+                ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject
+                  ?? throw new InvalidOperationException("根节点不是 JSON 对象")
+                : new JsonObject();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Sluice] {name}：配置解析失败（{ex.Message}）——该文件未改动，人工核对。");
+            return 1;
+        }
+
+        var pre = EnsurePreToolUseArray(root, zcodeShape);
+        var cmd = HookGuardCommand(exe);
+        var oursPresent = false;
+        var refreshed = false;
+        var legacyTaken = 0;
+
+        for (var i = pre.Count - 1; i >= 0; i--)
+        {
+            if (pre[i] is not JsonObject entry || entry["hooks"] is not JsonArray ha) continue;
+            var touched = false;
+            for (var j = ha.Count - 1; j >= 0; j--)
+            {
+                if (ha[j] is not JsonObject hook || hook["command"]?.GetValue<string>() is not { } c) continue;
+                if (c.Contains("hook-guard.sh", StringComparison.Ordinal))
+                {
+                    ha.RemoveAt(j); legacyTaken++; touched = true; // 临时件条目收编
+                    continue;
+                }
+                if (c.EndsWith(" hook-guard", StringComparison.Ordinal))
+                {
+                    if (c == cmd) { oursPresent = true; continue; }
+                    hook["command"] = cmd;                          // exe 路径漂移 → 刷新
+                    if (zcodeShape) hook["timeoutMs"] = 3000;
+                    refreshed = true; touched = true;
+                }
+            }
+            if (touched && ha.Count == 0) pre.RemoveAt(i); // 壳被摘空 → 条目一并摘
+        }
+
+        if (!oursPresent && !refreshed)
+            pre.Add((JsonNode)NewHookEntry(cmd, zcodeShape)); // JsonNode 转型走非泛型 Add（AOT/trim 告警）
+
+        try { File.WriteAllText(path, root.ToJsonString(Indent)); }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Sluice] {name}：配置写回失败（{ex.Message}）——hook 未装上，该文件可能未变。");
+            return 1;
+        }
+
+        Console.WriteLine(refreshed
+            ? $"[Sluice] {name}：hook 已刷新（exe 路径漂移 → {cmd}；{path}）。"
+            : oursPresent
+                ? $"[Sluice] {name}：hook 已在位，无需改动（{path}）。"
+                : $"[Sluice] {name}：已安装 PreToolUse hook（matcher Bash → {cmd}；{path}）。");
+        if (legacyTaken > 0)
+            Console.WriteLine($"[Sluice] {name}：顺路收编 {legacyTaken} 条临时 hook-guard.sh 旧条目（替换为内置模式）。");
+        Console.WriteLine("[Sluice] 宿主在会话启动时读配置——本命令对已开着的会话不生效，自下一个新会话起拦截生效。");
+        return 0;
+    }
+
+    public static int UninstallHook(string sel)
+    {
+        var hosts = SelectHookHosts(sel);
+        if (hosts is null)
+        {
+            Console.Error.WriteLine($"[Sluice] 用法：sluice setup --uninstall-hook [zcode|claude-code|all]（收到 {sel}）");
+            return ExitCodes.BadRequest;
+        }
+        var bad = 0;
+        foreach (var (name, path, _) in hosts)
+        {
+            if (!File.Exists(path)) { Console.WriteLine($"[Sluice] {name}：无配置文件，跳过。"); continue; }
+            JsonObject root;
+            try { root = JsonNode.Parse(File.ReadAllText(path)) as JsonObject
+                  ?? throw new InvalidOperationException("根节点不是 JSON 对象"); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[Sluice] {name}：配置解析失败（{ex.Message}）——该文件未改动。");
+                bad++;
+                continue;
+            }
+            // 两种宿主形状都摘（卸载不该假设当年装的是哪种形状）
+            var arrays = new List<JsonArray>();
+            if (root["hooks"] is JsonObject hooks)
+            {
+                if (hooks["PreToolUse"] is JsonArray a1) arrays.Add(a1);
+                if (hooks["events"] is JsonObject ev && ev["PreToolUse"] is JsonArray a2) arrays.Add(a2);
+            }
+            var removed = 0;
+            foreach (var arr in arrays)
+                removed += RemoveHookGuardEntries(arr);
+            if (removed > 0)
+            {
+                try { File.WriteAllText(path, root.ToJsonString(Indent)); }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[Sluice] {name}：配置写回失败（{ex.Message}）。");
+                    bad++;
+                    continue;
+                }
+                Console.WriteLine($"[Sluice] {name}：已移除 {removed} 条 hook-guard 配置（{path}）。");
+            }
+            else Console.WriteLine($"[Sluice] {name}：无 hook-guard 配置，无需移除。");
+        }
+        TryDeleteTempHookScript();
+        return bad == 0 ? 0 : ExitCodes.Internal;
+    }
+
+    /// <summary>hook-guard 条目摘除（纯函数，selftest 锁——v0.7.11 实弹抓到的倒数循环 j++ 笔误
+    /// 正是本函数前身）：摘 marker 命中（内置模式 "… hook-guard" 或临时件 "…hook-guard.sh"）的
+    /// hook 对象；hooks 数组摘空则连 matcher 条目一并摘；无关 hook / 无关条目一概不动。
+    /// 返回摘除的 hook 对象数。</summary>
+    internal static int RemoveHookGuardEntries(JsonArray pre)
+    {
+        var removed = 0;
+        for (var i = pre.Count - 1; i >= 0; i--)
+        {
+            if (pre[i] is not JsonObject entry || entry["hooks"] is not JsonArray ha) continue;
+            var touched = false;
+            for (var j = ha.Count - 1; j >= 0; j--)
+                if (ha[j] is JsonObject hook && hook["command"]?.GetValue<string>() is { } c
+                    && (c.EndsWith(" hook-guard", StringComparison.Ordinal)
+                        || c.Contains("hook-guard.sh", StringComparison.Ordinal)))
+                { ha.RemoveAt(j); removed++; touched = true; }
+            if (touched && ha.Count == 0) pre.RemoveAt(i);
+        }
+        return removed;
+    }
+
+    private static JsonSerializerOptions Indent { get; } = new() { WriteIndented = true };
+
+    private static JsonArray EnsurePreToolUseArray(JsonObject root, bool zcodeShape)
+    {
+        var hooks = root["hooks"] as JsonObject ?? (JsonObject)(root["hooks"] = new JsonObject());
+        if (!zcodeShape)
+            return hooks["PreToolUse"] as JsonArray ?? (JsonArray)(hooks["PreToolUse"] = new JsonArray());
+        hooks["enabled"] = true;
+        var events = hooks["events"] as JsonObject ?? (JsonObject)(hooks["events"] = new JsonObject());
+        return events["PreToolUse"] as JsonArray ?? (JsonArray)(events["PreToolUse"] = new JsonArray());
+    }
+
+    private static JsonObject NewHookEntry(string cmd, bool zcodeShape)
+    {
+        var hook = new JsonObject { ["type"] = "command", ["command"] = cmd };
+        if (zcodeShape) { hook["timeoutMs"] = 3000; hook["statusMessage"] = "Sluice guard"; }
+        // 显式 JsonNode 转型走非泛型 Add（泛型 Add<T> 带 RequiresDynamicCode 注解，AOT 告警）
+        return new JsonObject { ["matcher"] = "Bash", ["hooks"] = new JsonArray((JsonNode)hook) };
+    }
 }

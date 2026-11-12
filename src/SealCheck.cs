@@ -122,6 +122,8 @@ internal static partial class SealCheck
 
         v.AddRange(GitConfigViolations());
 
+        v.AddRange(RepoLocalHelperViolations());
+
         return v;
     }
 
@@ -223,6 +225,100 @@ internal static partial class SealCheck
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         yield return Path.Combine(home, ".gitconfig");
         yield return Path.Combine(home, ".config", "git", "config");
+    }
+
+    // ---------- repo-local credential.helper 清查（spec-guard-20261112 层 A 深扫增项） ----------
+
+    /// <summary>全局空串断继承断不掉 local 链：helper 列表按 system→global→local 顺序**拼接**，
+    /// 空串只清它之前出现过的条目——repo-local helper 恰排在空串之后，GCM 可从仓库本地配置
+    /// 回到链里。发现即报违规、人工处置（不知用户为何写它，不自动改）。哨兵上下文（CWD=
+    /// System32）与非 git 目录自然跳过。</summary>
+    private static List<string> RepoLocalHelperViolations()
+    {
+        var v = new List<string>();
+        var cfg = FindRepoGitConfig(new DirectoryInfo(Environment.CurrentDirectory));
+        if (cfg is null) return v;
+        try { v.AddRange(RepoLocalHelperViolationsIn(File.ReadAllLines(cfg))); }
+        catch { /* 不可读 → 按无违规（fail 方向：清查是疑点面，不误拦） */ }
+        return v;
+    }
+
+    /// <summary>gitconfig 行 → 违规（纯函数，selftest 锁）：无 URL 作用域的 [credential] helper
+    /// 对一切 host 生效（含 github.com）→ 违规；[credential "URL"] 仅当 URL 指向 github.com →
+    /// 违规；其他 URL 作用域（如公司 GitLab 专属 helper）不碰。</summary>
+    internal static List<string> RepoLocalHelperViolationsIn(IEnumerable<string> lines)
+    {
+        var v = new List<string>();
+        // 当前 section：null = 非 credential；"" = 无 URL 作用域；"url" = 作用域 URL
+        string? scope = null;
+        foreach (var raw in lines)
+        {
+            var l = raw.Trim();
+            if (l.Length == 0 || l.StartsWith('#') || l.StartsWith(';')) continue;
+            if (l.StartsWith('['))
+            {
+                var head = l.Trim('[', ']').Trim();
+                if (head.Equals("credential", StringComparison.OrdinalIgnoreCase)) scope = "";
+                else if (head.StartsWith("credential ", StringComparison.OrdinalIgnoreCase))
+                    scope = head["credential ".Length..].Trim().Trim('"');
+                else scope = null;
+                continue;
+            }
+            var eq = l.IndexOf('=');
+            if (eq < 0 || scope is null) continue;
+            var k = l[..eq].Trim();
+            if (!k.Equals("helper", StringComparison.OrdinalIgnoreCase)) continue;
+            if (scope.Length == 0 || scope.Contains("github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                var label = scope.Length == 0
+                    ? "[credential]（无 URL 作用域，对一切 host 生效）"
+                    : $"[credential \"{scope}\"]";
+                v.Add($"repo-local：{label} 的 helper = {l[(eq + 1)..].Trim()}" +
+                    "——全局空串断不掉 local 链（拼接序在其后），GCM 可由此回到 github.com；请人工确认后移除");
+            }
+        }
+        return v;
+    }
+
+    /// <summary>向上找仓库 .git（与 git 的解析窗口一致），再定位其 config：常规仓库 .git/config；
+    /// worktree（.git 是文件）读 gitdir 后再读 commondir 指回的主 .git/config。找不到 → null。</summary>
+    private static string? FindRepoGitConfig(DirectoryInfo? dir)
+    {
+        while (dir is not null)
+        {
+            var git = Path.Combine(dir.FullName, ".git");
+            if (Directory.Exists(git))
+            {
+                var c = Path.Combine(git, "config");
+                return File.Exists(c) ? c : null;
+            }
+            if (File.Exists(git))
+            {
+                // worktree/子模块：.git 文件内容 "gitdir: <路径>"
+                string[] body;
+                try { body = File.ReadAllLines(git); } catch { return null; }
+                var gd = body.FirstOrDefault(x => x.StartsWith("gitdir:", StringComparison.OrdinalIgnoreCase))
+                    ?["gitdir:".Length..].Trim();
+                if (gd is null || gd.Length == 0) return null;
+                if (!Path.IsPathRooted(gd)) gd = Path.GetFullPath(Path.Combine(dir.FullName, gd));
+                // worktree：真正的 credential 配置在 commondir 指回的主 .git 里
+                var common = gd;
+                try
+                {
+                    var cdFile = Path.Combine(gd, "commondir");
+                    if (File.Exists(cdFile))
+                    {
+                        var cd = File.ReadAllText(cdFile).Trim();
+                        common = Path.GetFullPath(Path.Combine(gd, cd));
+                    }
+                }
+                catch { /* commondir 不可读 → 就用 gitdir 本身 */ }
+                var cfg2 = Path.Combine(common, "config");
+                return File.Exists(cfg2) ? cfg2 : null;
+            }
+            dir = dir.Parent;
+        }
+        return null;
     }
 
     // ---------- seal --fix ----------

@@ -335,6 +335,17 @@ internal static class Messages
         """,
         ExitCodes.PolicyReject, "change_approach", true);
 
+    // ---- hook-guard deny 文案（spec-guard-20261112 层 B）：宿主 PreToolUse 契约是 stderr + exit 2
+    //      的二值面——exit 2 在宿主侧固定表 deny，无 retry 语义槽位，故不入 §8.2/AllSamples/Expected
+    //      （exit 2 在消息表属 denied/never，会把"改走 sluice"错锁成"禁止换方法"）。文案本体入本
+    //      文件单源（HookGuard 与临时 .sh 替换件共用），与 §8 / AGENTS.md 规则 1 同词表。 ----
+    public static string[] HookGuardDeniedLines() =>
+    [
+        "[Sluice·终态] GitHub 写操作不走直连——宿主 PreToolUse hook 已在执行前拒绝，命令未运行（本次操作未执行）。",
+        "改用：sluice CLI（如 sluice push / sluice pr merge --repo R --number N …）或 github_write 工具（MCP），见 AGENTS.md 规则 1。",
+        "若确属非 GitHub 远端的 push，或只读命令被误拦（git push --dry-run 一并拦，训练面一致）：改用等价只读形式（gh pr view / git log / gh api 不带写方法），或请用户在自己的终端执行。",
+    ];
+
     // ---- not_initialized（exit 8，retry=wait_user） ----
     public static Msg NotInitialized() => new(
         "[Sluice]",

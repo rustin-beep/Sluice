@@ -103,6 +103,11 @@ internal static class Program
             ["setup", "--install"] => SetupCommand.InstallEnv(noSnippet: false),
             ["setup", "--install", "--no-snippet"] => SetupCommand.InstallEnv(noSnippet: true),
             ["setup", "--install-snippet"] => SetupCommand.InstallSnippet(),
+            ["hook-guard"] => HookGuard.Run(), // 宿主 PreToolUse 契约：stdin JSON → exit 0 放行 / exit 2 deny
+            ["setup", "--install-hook"] => SetupCommand.InstallHook("all"),
+            ["setup", "--install-hook", var host] => SetupCommand.InstallHook(host),
+            ["setup", "--uninstall-hook"] => SetupCommand.UninstallHook("all"),
+            ["setup", "--uninstall-hook", var host] => SetupCommand.UninstallHook(host),
             ["sentinel-install"] => SetupCommand.SentinelInstall(),
             ["doctor"] => SetupCommand.Doctor(),
             ["notice", .. var rest] => RunNotice(rest),
@@ -398,6 +403,14 @@ internal static class Program
               sluice status <receipt>                  查 MCP pending 请求的终态（github_write 返回
                                                         code=23 时附 receipt；拒绝理由原文在此，无副作用可重查）
               sluice selftest                           消息表与 exit code 自检
+              sluice setup --install-hook [zcode|claude-code|all]
+                                                        宿主 PreToolUse hook 安装（幂等；exe 路径
+                                                        漂移自动刷新；接管并清理临时 hook-guard.sh）；
+                                                        agent 直推 git/gh 在执行前被 deny 并收到指路
+              sluice setup --uninstall-hook [zcode|claude-code|all]
+                                                        移除宿主 hook 配置（unseal 善后清单同款动作）
+              sluice hook-guard                         宿主内部调用（stdin 工具调用 JSON →
+                                                        exit 0 放行 / exit 2 deny + stderr 指路）
               sluice mcp [--print-config]               MCP 前门（§9.7）：stdio JSON-RPC 服务，
                                                         单一类型化工具 github_write；spawn-child
                                                         拓扑——本进程不持凭据，每次调用绝对路径

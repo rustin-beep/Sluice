@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace Sluice;
 
 /// <summary>§12 V0 验收"终态可判"：§8.2 消息表穷举 + exit code 对齐（tests/selftest 内置为单 exe 原则）。</summary>
@@ -85,7 +87,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁 / v2.33 平行链锚点与回写锁 / v2.34 发现时机锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁 / v2.33 平行链锚点与回写锁 / v2.34 发现时机锁 / v2.36 hook-guard 锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -169,6 +171,7 @@ internal static class Selftest
         fail += PendingDedupChecks();
         fail += ReviewFix232Checks();
         fail += DiscoveryTimingChecks();
+        fail += HookGuardChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
@@ -981,6 +984,124 @@ internal static class Selftest
         Console.WriteLine(fail == 0
             ? "v2.32 审阅修复：AGENTS 三源 / 搜索空页脚 / 代理对截断全对齐。"
             : "v2.32 审阅修复检查有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>
+    /// v2.36 hook-guard 锁（spec-guard-20261112 层 B）：模式矩阵源自 2026-11-12 临时件
+    /// hook-guard.sh 的 29 例实弹矩阵（拦 13 / 放 12 / 未封态 2 / 暂停边界 2）——产品化替换后，
+    /// 矩阵从"脚本现场测试"升为"回归不变量"。另锁：宿主 JSON 提取（fail-open 三态）、notice
+    /// 在位判定（任意路径）、hook 命令引号形态（含空格路径，/TR 引号教训同族）、repo-local
+    /// credential.helper 清查（层 A 深扫增项的判定面）。全部纯函数，零文件系统、零 git。
+    /// </summary>
+    private static int HookGuardChecks()
+    {
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+        void Case(string cmd, bool wantDeny)
+        {
+            var got = HookGuard.DenyCommand(cmd, out _);
+            if (got != wantDeny) { fail++; Console.WriteLine($"!! 矩阵不符：{(wantDeny ? "应拦" : "应放")}「{cmd}」实际{(got ? "拦" : "放")}"); }
+        }
+
+        // 拦（13）：git push 族（含 -C / 分隔符后 / --dry-run 训练面一致）+ gh 登录流与写动词族 + gh api 写方法 + curl 写形态
+        Case("git push", true);
+        Case("git push origin main", true);
+        Case("git -C D:/x push", true);
+        Case("cd /d/code/x && git push", true);
+        Case("git push --dry-run", true);
+        Case("gh auth login", true);
+        Case("gh auth login --web", true);
+        Case("gh pr merge", true);
+        Case("gh issue close", true);
+        Case("gh api -X POST repos/o/r/issues", true);
+        Case("gh api --method=DELETE repos/o/r/comments/1", true);
+        Case("curl -X POST api.github.com/repos/o/r/issues", true);
+        Case("curl -d api.github.com/repos/o/r", true);
+
+        // 放（12）：一切只读 / 无关 / 空命令（echo 内嵌 "git push" 字面量不拦——引号内非命令位）
+        Case("git status", false);
+        Case("git log --oneline -5", false);
+        Case("git fetch origin", false);
+        Case("git clone https://github.com/o/r", false);
+        Case("gh pr view 5", false);
+        Case("gh issue list --limit 30", false);
+        Case("gh auth status", false);
+        Case("gh api repos/o/r/pulls", false);
+        Case("curl https://api.github.com/repos/o/r", false);
+        Case("ls", false);
+        Case("""echo "git push" >> note.md""", false);
+        Case("", false);
+
+        // 未封态（2）：notice 不在位（pause/unseal 摘除后）→ 放行（层是糖，状态跟 sluice 状态机走）
+        if (HookGuard.Decide("git push", noticePresent: false, paused: false, out _)) { fail++; Console.WriteLine("!! 未封态应放行：git push"); }
+        if (HookGuard.Decide("gh auth login", noticePresent: false, paused: false, out _)) { fail++; Console.WriteLine("!! 未封态应放行：gh auth login"); }
+
+        // 暂停边界（2）：未到期 → 放行；过期（paused=false，state 语义在 SealPause）→ 恢复拦截
+        if (HookGuard.Decide("git push", noticePresent: true, paused: true, out _)) { fail++; Console.WriteLine("!! 暂停窗内应放行：git push"); }
+        if (!HookGuard.Decide("git push", noticePresent: true, paused: false, out _)) { fail++; Console.WriteLine("!! 过期暂停应恢复拦截：git push"); }
+
+        // 宿主 JSON 提取（fail-open 三态）：合法 / 缺 tool_input / 垃圾输入
+        if (HookGuard.ExtractCommand("""{"tool_name":"Bash","tool_input":{"command":"git push"}}""") != "git push")
+        { fail++; Console.WriteLine("!! ExtractCommand：合法载荷应取出 command"); }
+        if (HookGuard.ExtractCommand("""{"tool_name":"Bash"}""") is not null)
+        { fail++; Console.WriteLine("!! ExtractCommand：缺 tool_input 应 null（放行）"); }
+        if (HookGuard.ExtractCommand("not json at all") is not null)
+        { fail++; Console.WriteLine("!! ExtractCommand：垃圾输入应 null（放行）"); }
+
+        // notice 在位判定（任意路径——比 doctor 的 ProcessPath 精确匹配宽一档，路径漂移期仍封堵）
+        if (!HookGuard.AnyNoticeHelperPresent("\nD:/old/publish/sluice.exe notice"))
+        { fail++; Console.WriteLine("!! AnyNoticeHelperPresent：任意路径的 notice 值应判在位"); }
+        if (HookGuard.AnyNoticeHelperPresent("D:/x/sluice.exe noticex"))
+        { fail++; Console.WriteLine("!! AnyNoticeHelperPresent：非 notice 值不应误判"); }
+        if (HookGuard.AnyNoticeHelperPresent(""))
+        { fail++; Console.WriteLine("!! AnyNoticeHelperPresent：空输出应判不在位"); }
+
+        // hook 命令引号形态（v2.23 /TR 引号教训同族：恒带内层引号 + 正斜杠）
+        Eq("hook 命令·反斜杠含空格", SetupCommand.HookGuardCommand(@"C:\Users\John Doe\sluice.exe"),
+            "\"C:/Users/John Doe/sluice.exe\" hook-guard");
+        Eq("hook 命令·无空格也恒引号", SetupCommand.HookGuardCommand(@"D:\Sluice\publish\sluice.exe"),
+            "\"D:/Sluice/publish/sluice.exe\" hook-guard");
+
+        // hook 条目摘除（v0.7.11 实弹抓到的倒数循环 j++ 笔误入锁——uninstall 崩溃正是本函数前身）：
+        // 内置模式与临时 .sh 都摘、壳空连条目摘、无关 hook 一概不动
+        var pre = new JsonArray(
+            (JsonNode)new JsonObject
+            {
+                ["matcher"] = "Bash",
+                ["hooks"] = new JsonArray((JsonNode)new JsonObject
+                    { ["type"] = "command", ["command"] = "\"D:/x/sluice.exe\" hook-guard" }),
+            },
+            (JsonNode)new JsonObject
+            {
+                ["matcher"] = "Bash",
+                ["hooks"] = new JsonArray((JsonNode)new JsonObject
+                    { ["type"] = "command", ["command"] = "\"C:/bash.exe\" \"C:/Users/u/hook-guard.sh\"" }),
+            },
+            (JsonNode)new JsonObject
+            {
+                ["matcher"] = "Write",
+                ["hooks"] = new JsonArray((JsonNode)new JsonObject
+                    { ["type"] = "command", ["command"] = "my-linter --check" }),
+            });
+        Eq("摘除数（内置+临时件，无关不动）", SetupCommand.RemoveHookGuardEntries(pre), 2);
+        Eq("存活条目数（两条壳已摘）", pre.Count, 1);
+        Eq("存活条目是无关 hook", pre[0]!["matcher"]!.GetValue<string>(), "Write");
+
+        // repo-local credential.helper 清查（层 A 深扫增项）：判定面三态
+        var vl = SealCheck.RepoLocalHelperViolationsIn("[credential]\n\thelper = manager\n".Split('\n'));
+        if (vl.Count != 1) { fail++; Console.WriteLine("!! repo-local：无 URL 作用域 helper 应报违规"); }
+        var vg = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".Split('\n'));
+        if (vg.Count != 1) { fail++; Console.WriteLine("!! repo-local：github.com 作用域 helper 应报违规"); }
+        var vo = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://gitlab.com\"]\n\thelper = manager\n[user]\n\tname = x\n".Split('\n'));
+        if (vo.Count != 0) { fail++; Console.WriteLine("!! repo-local：其他 host 作用域不应误报"); }
+
+        Console.WriteLine(fail == 0
+            ? "v2.36 hook-guard：29 例矩阵 / JSON 提取 / 在位判定 / 引号形态 / repo-local 清查全对齐。"
+            : "v2.36 hook-guard 检查有不符项（见上）。");
         return fail;
     }
 }
