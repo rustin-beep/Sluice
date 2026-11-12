@@ -85,7 +85,7 @@ internal static class Selftest
 
     public static int Run()
     {
-        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁 / v2.33 平行链锚点与回写锁");
+        Console.WriteLine("Sluice selftest —— §8 消息表穷举 / exit code 对齐 / §9.7 MCP 映射 / §9 面一致锁 / v2.14+v2.16 push 逻辑锁 / v2.17 标签锁 / v2.18 崩溃诊断锁 / v2.23 审阅修复锁 / v2.24 拒绝可见性锁 / v2.26+v2.28 僵尸自曝锁 / v2.27 收割一致锁 / v2.29 issue 清单锁 / v2.30 匿名回退锁 / v2.31 pending 行与去重锁 / v2.32 审阅修复锁 / v2.33 平行链锚点与回写锁 / v2.34 发现时机锁");
         Console.WriteLine();
         var samples = Messages.AllSamples()
             .OrderBy(s => Array.FindIndex(Expected, e => e.Name == s.Name)).ToArray();
@@ -168,11 +168,66 @@ internal static class Selftest
         fail += AnonFallbackChecks();
         fail += PendingDedupChecks();
         fail += ReviewFix232Checks();
+        fail += DiscoveryTimingChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
             : $"FAIL：{fail} 处不符。");
         return fail == 0 ? 0 : 1;
+    }
+
+    /// <summary>v2.34 发现时机锁（incident-deferred-20261109）：①notice 元信息提取——host/path 入审计
+    /// target，username/password 一概不取（遥测补强后 ①' 缺位才能归因到工作区）；②AGENTS.md 可见性
+    /// 解析四态（temp 目录树）——doctor 第七项与 setup --install 工作区判定所依赖的窗口语义。</summary>
+    private static int DiscoveryTimingChecks()
+    {
+        Console.WriteLine("--- 发现时机锁（v2.34：ParseCredentialMeta / ResolveAgentsVisibility）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) notice 元信息：host/path 提取；其余键（凭据形状）一概不取
+        var (h, p) = Program.ParseCredentialMeta(
+            ["protocol=https", "host=github.com", "path=rustin-beep/vivarium.git", "username=alice", "password=secret"]);
+        Eq("host 提取", h, "github.com");
+        Eq("path 提取", p, "rustin-beep/vivarium.git");
+        var (h2, p2) = Program.ParseCredentialMeta(["host=ghe.corp.example"]);
+        Eq("缺省·host 回退", h2, "ghe.corp.example");
+        Eq("缺省·path null", p2, null);
+        var (h3, p3) = Program.ParseCredentialMeta([]);
+        Eq("空输入·host 默认", h3, "github.com");
+
+        // (2) ResolveAgentsVisibility 四态（temp 树）：块在位（含子目录向上）/ 有 AGENTS 无块 / 有 .git 无 AGENTS / 非工作区
+        var root = Path.Combine(Path.GetTempPath(), "sluice-v234-" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            var repoA = Directory.CreateDirectory(Path.Combine(root, "repoA"))!.FullName;
+            Directory.CreateDirectory(Path.Combine(repoA, ".git"));
+            File.WriteAllText(Path.Combine(repoA, "AGENTS.md"), "# 项目\n" + SetupCommand.Snippet);
+            Eq("块在位·根", SetupCommand.ResolveAgentsVisibility(repoA).V, SetupCommand.AgentsVisibility.BlockFound);
+            var sub = Directory.CreateDirectory(Path.Combine(repoA, "sub", "deep"))!.FullName;
+            Eq("块在位·子目录向上", SetupCommand.ResolveAgentsVisibility(sub).V, SetupCommand.AgentsVisibility.BlockFound);
+
+            var repoB = Directory.CreateDirectory(Path.Combine(root, "repoB"))!.FullName;
+            Directory.CreateDirectory(Path.Combine(repoB, ".git"));
+            File.WriteAllText(Path.Combine(repoB, "AGENTS.md"), "# 项目自述，无规则块\n");
+            Eq("有 AGENTS 无块", SetupCommand.ResolveAgentsVisibility(repoB).V, SetupCommand.AgentsVisibility.AgentsWithoutBlock);
+
+            var repoC = Directory.CreateDirectory(Path.Combine(root, "repoC"))!.FullName;
+            Directory.CreateDirectory(Path.Combine(repoC, ".git"));
+            Eq("有 .git 无 AGENTS", SetupCommand.ResolveAgentsVisibility(repoC).V, SetupCommand.AgentsVisibility.RepoWithoutAgents);
+
+            var plain = Directory.CreateDirectory(Path.Combine(root, "plain"))!.FullName;
+            Eq("非工作区", SetupCommand.ResolveAgentsVisibility(plain).V, SetupCommand.AgentsVisibility.NotAWorkspace);
+        }
+        finally { try { Directory.Delete(root, recursive: true); } catch { } }
+
+        Console.WriteLine(fail == 0
+            ? "v2.34 发现时机：notice meta / AGENTS 可见性四态全对齐。"
+            : "v2.34 发现时机检查有不符项（见上）。");
+        return fail;
     }
 
     /// <summary>

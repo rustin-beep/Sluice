@@ -100,7 +100,8 @@ internal static class Program
             ["seal", "--pause", var m] => SetupCommand.SealPauseCmd(m),
             ["seal", "--resume"] => SetupCommand.SealResume(),
             ["unseal"] => SetupCommand.Unseal(),
-            ["setup", "--install"] => SetupCommand.InstallNotice(),
+            ["setup", "--install"] => SetupCommand.InstallEnv(noSnippet: false),
+            ["setup", "--install", "--no-snippet"] => SetupCommand.InstallEnv(noSnippet: true),
             ["setup", "--install-snippet"] => SetupCommand.InstallSnippet(),
             ["sentinel-install"] => SetupCommand.SentinelInstall(),
             ["doctor"] => SetupCommand.Doctor(),
@@ -283,25 +284,44 @@ internal static class Program
     /// 而是"改走 sluice push + 禁止获取凭据"的可行动消息。不持凭据不供凭据（stdout 永不输出
     /// username=/password=）；store/erase 静默成功（无状态可存可清）。每次 get 落审计（op=notice，
     /// result=not_executed）——notice 触发 = 有进程在尝试 git 直连 GitHub，T3 重试风暴的第一手信号。
-    /// 已知边界（§9 原文照录）：`git -c credential.helper=` 显式清空可绕过 notice——T2 形状的行为，不防。
+    /// v2.34 发现时机批（incident-deferred-20261109）：审计 target 补记 git 请求的 path=（哪个仓库
+    /// 在敲门）——此前 83 行 op=notice 全部 target=null，①' 缺位无法归因到工作区。已知边界
+    /// （§9 原文照录）：`git -c credential.helper=` 显式清空可绕过 notice——T2 形状的行为，不防。
     /// </summary>
     private static int RunNotice(string[] rest)
     {
         if (rest.FirstOrDefault() is "store" or "erase") return ExitCodes.Success;
-        var host = "github.com";
+        string host;
+        string? metaPath;
         try
         {
-            // git credential 协议：stdin 为 key=value 行、空行结束。只取 host 指路用；
-            // 其余键（含可能的 username）一概不读不存不回显
+            // git credential 协议：stdin 为 key=value 行、空行结束。元信息提取单源在
+            // ParseCredentialMeta（host 指路 + path 落审计 target）；其余键一概不读不存不回显
+            var lines = new List<string>();
             string? l;
-            while ((l = Console.In.ReadLine()) is not null && l.Length > 0)
-                if (l.StartsWith("host=", StringComparison.Ordinal)) host = l["host=".Length..];
+            while ((l = Console.In.ReadLine()) is not null && l.Length > 0) lines.Add(l);
+            (host, metaPath) = ParseCredentialMeta(lines);
         }
-        catch { /* stdin 不可读（异常调用）→ 默认 host 照常指路 */ }
-        Audit.Append("notice", host, null, null, "notice", result: "not_executed");
+        catch { (host, metaPath) = ("github.com", null); /* stdin 不可读（异常调用）→ 默认 host 照常指路 */ }
+        Audit.Append("notice", host, metaPath, null, "notice", result: "not_executed");
         var m = Messages.Notice(host);
         Messages.Write(m);
         return m.ExitCode;
+    }
+
+    /// <summary>git credential 协议 stdin 的元信息提取（纯函数，selftest 锁）：只取 host=（指路文案用）
+    /// 与 path=（审计 target 用）；其余键（含 username/password）一概不读不存不回显。空输入回退
+    /// 默认 host——notice 的职责是指路，元信息缺失不改变行为。</summary>
+    internal static (string Host, string? Path) ParseCredentialMeta(IEnumerable<string> lines)
+    {
+        var host = "github.com";
+        string? path = null;
+        foreach (var l in lines)
+        {
+            if (l.StartsWith("host=", StringComparison.Ordinal)) host = l["host=".Length..];
+            else if (l.StartsWith("path=", StringComparison.Ordinal)) path = l["path=".Length..];
+        }
+        return (host, path);
     }
 
     private static int Usage()
@@ -392,7 +412,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.33");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.34");
         return 0;
     }
 

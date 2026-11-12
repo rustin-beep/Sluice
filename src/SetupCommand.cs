@@ -93,9 +93,10 @@ internal static class SetupCommand
 
         Console.WriteLine($"已保存 vault：{Path.Combine(dir, "token.bin")}");
         Console.WriteLine();
-        Console.WriteLine("最后两步（承重墙）：");
+        Console.WriteLine("最后三步（承重墙 + 路标）：");
         Console.WriteLine("  1. sluice seal --fix   ——封堵环境里的直连凭据；");
-        Console.WriteLine("  2. sluice setup --install ——安装 notice credential helper（git 直推 GitHub 时得到指引进 sluice 的消息，而非裸错）。");
+        Console.WriteLine("  2. sluice setup --install ——安装 notice credential helper（git 直推 GitHub 时得到指引进 sluice 的消息，而非裸错）+ 当前工作区的 AGENTS.md 规则片段（agent 会话的路标；非 git 目录自动跳过，各工作区在仓库根补跑）；");
+        Console.WriteLine("  3. sluice sentinel-install ——哨兵计划任务（每 5 分钟一扫，device flow 侧门最迟 5 分钟可见）。");
         return 0;
     }
 
@@ -423,6 +424,34 @@ internal static class SetupCommand
     internal static bool NoticeValuePresent(string getAllOutput, string forwardSlashExe) =>
         getAllOutput.Contains($"{forwardSlashExe} notice", StringComparison.Ordinal);
 
+    // ---------- sluice setup --install 扩为环境安装器（v2.34 发现时机批，incident-deferred-20261109） ----------
+
+    /// <summary>
+    /// --install 从单一 notice 安装器扩为环境安装器：notice（②层，承重）成功后，对当前工作区顺带
+    /// 装 §8.4 AGENTS.md 片段（①'层——agent 会话的路标）。缘起：2026-11-08 vivarium 实弹——①层被
+    /// MCP 宿主的 deferred 机制降级（工具 schema 不在请求信封，结构性在场不成立）+ ①'缺位（--install-snippet
+    /// 是独立可选动词，作者自己在活跃工作区也忘了跑），agent 直推 git 撞 notice 才找到门（audit 83 行
+    /// op=notice，簇状分布 = 每个新会话的首次接触都重付一遍发现成本）。修法 = 封门时顺手立路标：
+    /// CWD 是 git 工作区（有 .git）或已有 AGENTS.md 时默认装片段；否则跳过（不在任意目录撒 AGENTS.md），
+    /// 退出阀 --no-snippet。notice 失败即停不装片段（②承重、①'是糖，承重失败时糖无意义）；
+    /// 片段失败不回滚 notice（①'缺位只是发现成本，不是越权面）。
+    /// </summary>
+    public static int InstallEnv(bool noSnippet)
+    {
+        var n = InstallNotice();
+        if (n != 0) return n;
+
+        if (noSnippet) return 0;
+        var cwd = Directory.GetCurrentDirectory();
+        if (!Directory.Exists(Path.Combine(cwd, ".git")) && !File.Exists(Path.Combine(cwd, "AGENTS.md")))
+        {
+            Console.WriteLine("[Sluice] 当前目录非 git 工作区也无 AGENTS.md——片段未装（避免在任意目录建 AGENTS.md）。");
+            Console.WriteLine("[Sluice] 在每个 agent 工作区（仓库根）各跑一次：sluice setup --install-snippet。");
+            return 0;
+        }
+        return InstallSnippet();
+    }
+
     private static int Git(params string[] args)
     {
         try
@@ -523,10 +552,37 @@ internal static class SetupCommand
         return 0;
     }
 
+    internal enum AgentsVisibility { BlockFound, AgentsWithoutBlock, RepoWithoutAgents, NotAWorkspace }
+
+    /// <summary>从 <paramref name="startDir"/> 逐级向上找最近的 AGENTS.md（含标记块与否），搜索窗口
+    /// 止于 .git 边界（与 ZCode 的工作区解析同窗口：CWD→项目根，仓库根本身是窗口终点）。每级先看
+    /// AGENTS.md 再看 .git——根目录两者并存时 AGENTS.md 优先。纯文件系统探测（doctor 与 selftest 共用，
+    /// v2.34 入锁）。不可读的 AGENTS.md 视为无块（fail 方向：提示人工处理）。</summary>
+    internal static (AgentsVisibility V, string? Path) ResolveAgentsVisibility(string startDir)
+    {
+        var dir = new DirectoryInfo(startDir);
+        while (dir is not null)
+        {
+            var agents = Path.Combine(dir.FullName, "AGENTS.md");
+            if (File.Exists(agents))
+            {
+                var hasBlock = false;
+                try { hasBlock = File.ReadAllText(agents).Contains(SnippetBegin, StringComparison.Ordinal); }
+                catch { /* 不可读 → 按无块报，指引人工 */ }
+                return (hasBlock ? AgentsVisibility.BlockFound : AgentsVisibility.AgentsWithoutBlock, agents);
+            }
+            if (Directory.Exists(Path.Combine(dir.FullName, ".git")))
+                return (AgentsVisibility.RepoWithoutAgents, dir.FullName);
+            dir = dir.Parent;
+        }
+        return (AgentsVisibility.NotAWorkspace, null);
+    }
+
     // ---------- sluice doctor（v2.21，V1.5 项：一次性健康汇总） ----------
 
-    /// <summary>六项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / 哨兵任务。
-    /// 全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位（seal --fix / setup --install / sentinel-install）。
+    /// <summary>七项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / 哨兵任务 /
+    /// AGENTS.md 片段（v2.34）。全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位
+    /// （seal --fix / setup --install / setup --install-snippet / sentinel-install）。
     /// v2.23：暂停窗口内语义翻转——notice 摘除是 pause 的预期效果（原建议 setup --install 与暂停语义
     /// 直接冲突，照做=把刚摘的 helper 装回去）；seal 预检显示"暂停中"而非误导性的"无违规"；
     /// 暂停值无对应 seal_pause 审计记录按疑似伪造报红（§14 L11）。</summary>
@@ -622,6 +678,26 @@ internal static class SetupCommand
         }
         catch { taskOk = false; }
         Item(taskOk, "哨兵任务", taskOk ? "已注册（每 5 分钟）" : "未注册——sluice sentinel-install");
+
+        // AGENTS.md 片段（v2.34 发现时机批，§8.4 ①'层）：agent 会话的路标，缺位 = 每个新会话重付
+        // 发现成本（incident-deferred-20261109：①层被宿主 deferred 降级时，①' 是仅存的提示层）。
+        // 非 git 工作区中性跳过（✓ 不冒充红）；暂停窗口不影响本项（片段与凭据封堵正交）。
+        var (av, apath) = ResolveAgentsVisibility(Directory.GetCurrentDirectory());
+        switch (av)
+        {
+            case AgentsVisibility.BlockFound:
+                Item(true, "AGENTS.md 片段", $"在位（{apath}）");
+                break;
+            case AgentsVisibility.AgentsWithoutBlock:
+                Item(false, "AGENTS.md 片段", $"{apath} 无规则标记块——在该仓库根运行 sluice setup --install-snippet");
+                break;
+            case AgentsVisibility.RepoWithoutAgents:
+                Item(false, "AGENTS.md 片段", $"git 工作区（{apath}）无 AGENTS.md——在仓库根运行 sluice setup --install-snippet（新建）");
+                break;
+            default:
+                Item(true, "AGENTS.md 片段", "非 git 工作区，跳过（片段装在 agent 工作区才有效）");
+                break;
+        }
 
         Console.WriteLine(bad == 0 ? "结论：全绿。" : $"结论：{bad} 项需处理（见上 ✗）。");
         return bad == 0 ? 0 : 1;
