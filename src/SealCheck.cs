@@ -92,7 +92,7 @@ internal static partial class SealCheck
 
     // ---------- 预检（§6：凭据管理器 / gh hosts.yml / .git-credentials / 环境变量 / SSH / gitconfig） ----------
 
-    public static List<string> Run()
+    public static List<string> Run(string? repoHint = null)
     {
         if (SealPause.Active) return []; // 暂停窗口内：封堵解除（§6 seal --pause）；到期由 seal 自愈/哨兵恢复
         var v = new List<string>();
@@ -122,7 +122,7 @@ internal static partial class SealCheck
 
         v.AddRange(GitConfigViolations());
 
-        v.AddRange(RepoLocalHelperViolations());
+        v.AddRange(RepoLocalHelperViolations(repoHint));
 
         return v;
     }
@@ -232,21 +232,25 @@ internal static partial class SealCheck
     /// <summary>全局空串断继承断不掉 local 链：helper 列表按 system→global→local 顺序**拼接**，
     /// 空串只清它之前出现过的条目——repo-local helper 恰排在空串之后，GCM 可从仓库本地配置
     /// 回到链里。发现即报违规、人工处置（不知用户为何写它，不自动改）。哨兵上下文（CWD=
-    /// System32）与非 git 目录自然跳过。</summary>
-    private static List<string> RepoLocalHelperViolations()
+    /// System32）与非 git 目录自然跳过。v2.37 审阅 P2-2：扫描面随操作目标——push 传
+    /// <paramref name="repoHint"/>（--repo-path 所指仓库，`sluice push --repo-path B` 在 A 目录
+    /// 下不再漏检 B）；其余（seal/doctor/非 push 写动词）缺省 CWD。</summary>
+    private static List<string> RepoLocalHelperViolations(string? repoHint = null)
     {
         var v = new List<string>();
-        var cfg = FindRepoGitConfig(new DirectoryInfo(Environment.CurrentDirectory));
+        var cfg = FindRepoGitConfig(new DirectoryInfo(repoHint ?? Environment.CurrentDirectory));
         if (cfg is null) return v;
-        try { v.AddRange(RepoLocalHelperViolationsIn(File.ReadAllLines(cfg))); }
+        try { v.AddRange(RepoLocalHelperViolationsIn(File.ReadAllLines(cfg), cfg)); }
         catch { /* 不可读 → 按无违规（fail 方向：清查是疑点面，不误拦） */ }
         return v;
     }
 
     /// <summary>gitconfig 行 → 违规（纯函数，selftest 锁）：无 URL 作用域的 [credential] helper
     /// 对一切 host 生效（含 github.com）→ 违规；[credential "URL"] 仅当 URL 指向 github.com →
-    /// 违规；其他 URL 作用域（如公司 GitLab 专属 helper）不碰。</summary>
-    internal static List<string> RepoLocalHelperViolationsIn(IEnumerable<string> lines)
+    /// 违规；其他 URL 作用域（如公司 GitLab 专属 helper）不碰。<paramref name="cfgPath"/> 进违规
+    /// 文本（人工处置要指到文件）。**空值跳过**（v2.37 审阅 P2-2）：`helper =`（空串）是断继承
+    /// 惯用法——sluice 自己在全局用的同款，是防御不是门。</summary>
+    internal static List<string> RepoLocalHelperViolationsIn(IEnumerable<string> lines, string cfgPath)
     {
         var v = new List<string>();
         // 当前 section：null = 非 credential；"" = 无 URL 作用域；"url" = 作用域 URL
@@ -268,13 +272,15 @@ internal static partial class SealCheck
             if (eq < 0 || scope is null) continue;
             var k = l[..eq].Trim();
             if (!k.Equals("helper", StringComparison.OrdinalIgnoreCase)) continue;
+            var val = l[(eq + 1)..].Trim().Trim('"');
+            if (val.Length == 0) continue; // 空值 = 断继承（sluice 全局同款惯用法），非门
             if (scope.Length == 0 || scope.Contains("github.com", StringComparison.OrdinalIgnoreCase))
             {
                 var label = scope.Length == 0
                     ? "[credential]（无 URL 作用域，对一切 host 生效）"
                     : $"[credential \"{scope}\"]";
-                v.Add($"repo-local：{label} 的 helper = {l[(eq + 1)..].Trim()}" +
-                    "——全局空串断不掉 local 链（拼接序在其后），GCM 可由此回到 github.com；请人工确认后移除");
+                v.Add($"repo-local：{cfgPath} 的 {label} helper = {val}" +
+                    "——全局空串断不掉 local 链（拼接序在其后），GCM 可由此回到 github.com；人工处置面：编辑该文件移除/收窄后重跑 sluice seal 复查");
             }
         }
         return v;
@@ -353,6 +359,11 @@ internal static partial class SealCheck
 
         if (violations.Any(x => x.StartsWith("SSH")))
             done.AddRange(WriteSshBlock());
+
+        // v2.37 审阅 P2-2：repo-local helper 属人工处置面——fix 不自动改（不知用户为何写它），
+        // 如实指路人工编辑 + 复查。此前无此分支 = "文案让跑 --fix、fix 修不了、复查永 7" 的指令环
+        if (violations.Any(x => x.StartsWith("repo-local：", StringComparison.Ordinal)))
+            done.Add("repo-local credential.helper：无法自动处理——按上方 ✗ 行给出的 .git/config 路径人工移除/收窄 helper 后，重跑 sluice seal 复查");
 
         done.Add("环境变量 GH_TOKEN/GITHUB_TOKEN：无法自动清除（随父进程继承）——请从 shell profile / IDE 配置移除");
         done.Add("VS Code GitHub session（如有）：请在 VS Code 内手动登出（仅检测，不自动处理）");

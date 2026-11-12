@@ -637,8 +637,8 @@ internal static class SetupCommand
 
     // ---------- sluice doctor（v2.21，V1.5 项：一次性健康汇总） ----------
 
-    /// <summary>七项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / 哨兵任务 /
-    /// AGENTS.md 片段（v2.34）。全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位
+    /// <summary>八项检查：版本戳 / vault 形态 / config.json / seal 预检 / notice helper / GCM 封堵键
+    ///（v2.37）/ 哨兵任务 / AGENTS.md 片段（v2.34）。全绿 exit 0，有红 exit 1（脚本可判）。只读不修——修的动作各归各位
     /// （seal --fix / setup --install / setup --install-snippet / sentinel-install）。
     /// v2.23：暂停窗口内语义翻转——notice 摘除是 pause 的预期效果（原建议 setup --install 与暂停语义
     /// 直接冲突，照做=把刚摘的 helper 装回去）；seal 预检显示"暂停中"而非误导性的"无违规"；
@@ -722,6 +722,20 @@ internal static class SetupCommand
             Item(noticeIn && !ghBridge, "notice helper", noticeIn
                 ? (ghBridge ? "在位但 gh 桥接条目重现——重跑 setup --install" : "在位（仅作用 github.com）")
                 : "不在位——sluice setup --install");
+
+        // GCM 无 UI 封堵键（v2.37 审阅 P3-6）：键被摘（pause 后崩溃 / 人手动改）不再静默全绿——
+        // 正是"三个月后静默失效"形态。写门不拦（定性：UX 层键非凭据面——侧门另由 notice/seal 面
+        // hold，键缺失的代价是首错回到弹窗挂起，不是凭据泄漏）；drift 由本项报红 +
+        // 下次 --install/--fix 自愈。暂停语义与 notice 项同款三态
+        var interactive = GitOut("--get", GcmInteractiveKey).Trim();
+        if (paused)
+            Item(true, "GCM 封堵键", "已摘除（暂停窗口内预期状态——resume 后自动重装）");
+        else if (expiring)
+            Item(true, "GCM 封堵键", "摘除中——暂停已过期，resume/哨兵将自动重装（≤5 分钟）");
+        else
+            Item(interactive == "never", "GCM 封堵键", interactive == "never"
+                ? "在位（interactive=never，GCM 对 github.com 拒答不弹窗）"
+                : $"不在位（现值「{interactive}」）——sluice seal --fix 重置");
 
         // 哨兵任务
         bool taskOk;
@@ -940,11 +954,24 @@ internal static class SetupCommand
         }
 
         var bad = 0;
+        var anyHooked = false;
         foreach (var h in hosts)
-            if (InstallHookFor(h, exe) != 0) bad++;
+        {
+            var c = InstallHookFor(h, exe, out var hooked);
+            if (c != 0) bad++;
+            anyHooked |= hooked;
+        }
 
-        // 临时件收编（spec §3：产品化接管即删——.sh 内文案与 Messages 单源的漂移面随之消灭）
-        TryDeleteTempHookScript();
+        // 临时件收编（spec §3：产品化接管即删——.sh 内文案与 Messages 单源的漂移面随之消灭）。
+        // v2.37 审阅 P2-3：仅在**装成至少一个宿主且无错**时才删——`--install-hook claude-code`
+        // 而该宿主未装（全部跳过）或配置解析失败时，删脚本 = 拆了旧的没装新的
+        if (bad == 0 && anyHooked) TryDeleteTempHookScript();
+        else
+        {
+            var sh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "hook-guard.sh");
+            if (File.Exists(sh))
+                Console.WriteLine($"[Sluice] 临时件 {sh} 保留（本次未装成任何宿主——收编条件不满足，避免拆旧不装新）。");
+        }
         return bad == 0 ? 0 : ExitCodes.Internal;
     }
 
@@ -957,10 +984,12 @@ internal static class SetupCommand
     }
 
     /// <summary>幂等安装 / exe 路径漂移刷新（notice 的 --unset-all→--add 同纪律）：命中既有
-    /// hook-guard 条目 → 刷新 command 为当前 exe；无 → 追加；顺路摘除临时 .sh 时代的旧条目。</summary>
-    private static int InstallHookFor((string Name, string Path, bool ZcodeShape) host, string exe)
+    /// hook-guard 条目 → 刷新 command 为当前 exe；无 → 追加；顺路摘除临时 .sh 时代的旧条目。
+    /// hooked = 宿主侧确有本 exe 的 hook 在位（新装/刷新/已在位）——临时件收编条件用它。</summary>
+    private static int InstallHookFor((string Name, string Path, bool ZcodeShape) host, string exe, out bool hooked)
     {
         var (name, path, zcodeShape) = host;
+        hooked = false;
         if (!Directory.Exists(Path.GetDirectoryName(path)!))
         {
             Console.WriteLine($"[Sluice] {name}：未检出（配置目录不存在），跳过——装好该宿主后重跑本命令。");
@@ -981,6 +1010,10 @@ internal static class SetupCommand
         }
 
         var pre = EnsurePreToolUseArray(root, zcodeShape);
+        // v2.37 审阅 P3-5：用户显式 hooks.enabled=false = 全局关 hooks——不翻 true（翻了会连带
+        // 激活用户自有的其他 hook 条目）；条目照装（装是明确指令），但如实说破它不会生效
+        var disabled = zcodeShape && root["hooks"]!["enabled"] is JsonValue v
+            && v.TryGetValue<bool>(out var en) && !en;
         var cmd = HookGuardCommand(exe);
         var oursPresent = false;
         var refreshed = false;
@@ -1024,9 +1057,12 @@ internal static class SetupCommand
             : oursPresent
                 ? $"[Sluice] {name}：hook 已在位，无需改动（{path}）。"
                 : $"[Sluice] {name}：已安装 PreToolUse hook（matcher Bash → {cmd}；{path}）。");
+        if (disabled)
+            Console.WriteLine($"[Sluice] {name}：注意 hooks.enabled=false 在位——尊重全局关闭，本次条目不会生效（如需启用请手动改 true）。");
         if (legacyTaken > 0)
             Console.WriteLine($"[Sluice] {name}：顺路收编 {legacyTaken} 条临时 hook-guard.sh 旧条目（替换为内置模式）。");
         Console.WriteLine("[Sluice] 宿主在会话启动时读配置——本命令对已开着的会话不生效，自下一个新会话起拦截生效。");
+        hooked = true;
         return 0;
     }
 
@@ -1063,6 +1099,15 @@ internal static class SetupCommand
                 removed += RemoveHookGuardEntries(arr);
             if (removed > 0)
             {
+                // v2.37 审阅 P3-5：摘空后的骨架清理——空 PreToolUse 数组、空 events、空 hooks
+                // 一并摘；enabled 保留（无从判源——可能先于本安装存在，且空对象无行为影响）
+                if (root["hooks"] is JsonObject hooks2)
+                {
+                    if (hooks2["events"] is JsonObject ev2 && ev2["PreToolUse"] is JsonArray a2 && a2.Count == 0)
+                    { ev2.Remove("PreToolUse"); if (ev2.Count == 0) hooks2.Remove("events"); }
+                    if (hooks2["PreToolUse"] is JsonArray a3 && a3.Count == 0) hooks2.Remove("PreToolUse");
+                    if (hooks2.Count == 0) root.Remove("hooks");
+                }
                 try { File.WriteAllText(path, root.ToJsonString(Indent)); }
                 catch (Exception ex)
                 {
@@ -1106,7 +1151,8 @@ internal static class SetupCommand
         var hooks = root["hooks"] as JsonObject ?? (JsonObject)(root["hooks"] = new JsonObject());
         if (!zcodeShape)
             return hooks["PreToolUse"] as JsonArray ?? (JsonArray)(hooks["PreToolUse"] = new JsonArray());
-        hooks["enabled"] = true;
+        // v2.37 审阅 P3-5：enabled 只在缺省时置 true——显式 false 是用户的全局开关，不覆盖
+        if (hooks["enabled"] is null) hooks["enabled"] = true;
         var events = hooks["events"] as JsonObject ?? (JsonObject)(hooks["events"] = new JsonObject());
         return events["PreToolUse"] as JsonArray ?? (JsonArray)(events["PreToolUse"] = new JsonArray());
     }

@@ -989,10 +989,13 @@ internal static class Selftest
 
     /// <summary>
     /// v2.36 hook-guard 锁（spec-guard-20261112 层 B）：模式矩阵源自 2026-11-12 临时件
-    /// hook-guard.sh 的 29 例实弹矩阵（拦 13 / 放 12 / 未封态 2 / 暂停边界 2）——产品化替换后，
-    /// 矩阵从"脚本现场测试"升为"回归不变量"。另锁：宿主 JSON 提取（fail-open 三态）、notice
-    /// 在位判定（任意路径）、hook 命令引号形态（含空格路径，/TR 引号教训同族）、repo-local
-    /// credential.helper 清查（层 A 深扫增项的判定面）。全部纯函数，零文件系统、零 git。
+    /// hook-guard.sh 的 29 例实弹矩阵——产品化替换后，矩阵从"脚本现场测试"升为"回归不变量"。
+    /// v2.37 审阅处置批（P2-1/P3-7/P2-2）扩：正则改分词语义（命令位锚定）后的补例
+    /// （分隔符后随 / -X 紧贴 / gh api -f 隐式 POST / push 不在子命令位 / gh 不在命令位 /
+    /// 前导空格 / env / 带值选项 -c / 多行）、暂停窗内仍拦的语义翻转、repo-local 空值不误报。
+    /// 另锁：宿主 JSON 提取（fail-open 三态）、notice 在位判定（任意路径）、hook 命令引号形态
+    /// （含空格路径，/TR 引号教训同族）、repo-local credential.helper 清查判定面。全部纯函数，
+    /// 零文件系统、零 git。
     /// </summary>
     private static int HookGuardChecks()
     {
@@ -1022,6 +1025,19 @@ internal static class Selftest
         Case("curl -X POST api.github.com/repos/o/r/issues", true);
         Case("curl -d api.github.com/repos/o/r", true);
 
+        // v2.37 审阅补例（7）：漏拦修复（分隔符后随命令 / -X 紧贴 / gh api -f 隐式 POST）与
+        // 误拦修复（push 不在子命令位 / gh 不在命令位 / 前导空格 / 分隔符后的 gh）
+        Case("git push; git status", true);
+        Case("curl -XPOST https://api.github.com/repos/o/r/issues", true);
+        Case("gh api -f title=x repos/o/r/issues", true);
+        Case("git log --grep push", false);
+        Case("""echo "gh pr merge" >> note.md""", false);
+        Case("  git push", true);
+        Case("cd /d/x && gh pr merge", true);
+        Case("env git push", true);          // spec §2.3 原形态（分词版回归）
+        Case("git -c http.proxy=x push", true); // 带值全局选项 -c 后子命令位仍是 push
+        Case("ls\ngit push", true);          // 多行脚本：换行即段界
+
         // 放（12）：一切只读 / 无关 / 空命令（echo 内嵌 "git push" 字面量不拦——引号内非命令位）
         Case("git status", false);
         Case("git log --oneline -5", false);
@@ -1036,13 +1052,15 @@ internal static class Selftest
         Case("""echo "git push" >> note.md""", false);
         Case("", false);
 
-        // 未封态（2）：notice 不在位（pause/unseal 摘除后）→ 放行（层是糖，状态跟 sluice 状态机走）
+        // 未封态（2）：notice 不在位且非暂停（unseal）→ 放行（层是糖，状态跟 sluice 状态机走）
         if (HookGuard.Decide("git push", noticePresent: false, paused: false, out _)) { fail++; Console.WriteLine("!! 未封态应放行：git push"); }
         if (HookGuard.Decide("gh auth login", noticePresent: false, paused: false, out _)) { fail++; Console.WriteLine("!! 未封态应放行：gh auth login"); }
 
-        // 暂停边界（2）：未到期 → 放行；过期（paused=false，state 语义在 SealPause）→ 恢复拦截
-        if (HookGuard.Decide("git push", noticePresent: true, paused: true, out _)) { fail++; Console.WriteLine("!! 暂停窗内应放行：git push"); }
+        // 暂停边界（v2.37 审阅 P3-7 修订）：暂停窗内**仍拦**（GCM 已恢复交互，agent 直推 =
+        // 登录窗 + 挂起原样复发；人登录走自己终端不经宿主）；过期/未暂停 + notice 在位照拦
+        if (!HookGuard.Decide("git push", noticePresent: true, paused: true, out _)) { fail++; Console.WriteLine("!! 暂停窗内仍应拦：git push"); }
         if (!HookGuard.Decide("git push", noticePresent: true, paused: false, out _)) { fail++; Console.WriteLine("!! 过期暂停应恢复拦截：git push"); }
+        if (!HookGuard.Decide("gh auth login", noticePresent: false, paused: true, out _)) { fail++; Console.WriteLine("!! 暂停窗内仍应拦：gh auth login（notice 已摘但暂停未过期）"); }
 
         // 宿主 JSON 提取（fail-open 三态）：合法 / 缺 tool_input / 垃圾输入
         if (HookGuard.ExtractCommand("""{"tool_name":"Bash","tool_input":{"command":"git push"}}""") != "git push")
@@ -1091,17 +1109,21 @@ internal static class Selftest
         Eq("存活条目数（两条壳已摘）", pre.Count, 1);
         Eq("存活条目是无关 hook", pre[0]!["matcher"]!.GetValue<string>(), "Write");
 
-        // repo-local credential.helper 清查（层 A 深扫增项）：判定面三态
-        var vl = SealCheck.RepoLocalHelperViolationsIn("[credential]\n\thelper = manager\n".Split('\n'));
-        if (vl.Count != 1) { fail++; Console.WriteLine("!! repo-local：无 URL 作用域 helper 应报违规"); }
-        var vg = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".Split('\n'));
+        // repo-local credential.helper 清查（层 A 深扫增项；v2.37 审阅 P2-2 增空值锁）：
+        // 判定面四态——无作用域/github.com 作用域报违规（文本须带 config 路径，人工指路要用），
+        // 其他 host 作用域不碰，空值（断继承惯用法，sluice 全局同款）不误报
+        var vl = SealCheck.RepoLocalHelperViolationsIn("[credential]\n\thelper = manager\n".Split('\n'), @"D:\repo\.git\config");
+        if (vl.Count != 1 || !vl[0].Contains(@"D:\repo\.git\config")) { fail++; Console.WriteLine("!! repo-local：无 URL 作用域 helper 应报违规且文本带 config 路径"); }
+        var vg = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://github.com\"]\n\thelper = !gh auth git-credential\n".Split('\n'), "cfg");
         if (vg.Count != 1) { fail++; Console.WriteLine("!! repo-local：github.com 作用域 helper 应报违规"); }
-        var vo = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://gitlab.com\"]\n\thelper = manager\n[user]\n\tname = x\n".Split('\n'));
+        var vo = SealCheck.RepoLocalHelperViolationsIn("[credential \"https://gitlab.com\"]\n\thelper = manager\n[user]\n\tname = x\n".Split('\n'), "cfg");
         if (vo.Count != 0) { fail++; Console.WriteLine("!! repo-local：其他 host 作用域不应误报"); }
+        var ve = SealCheck.RepoLocalHelperViolationsIn("[credential]\n\thelper =\n\thelper = \"\"\n".Split('\n'), "cfg");
+        if (ve.Count != 0) { fail++; Console.WriteLine("!! repo-local：空值 helper（断继承惯用法）不应误报"); }
 
         Console.WriteLine(fail == 0
-            ? "v2.36 hook-guard：29 例矩阵 / JSON 提取 / 在位判定 / 引号形态 / repo-local 清查全对齐。"
-            : "v2.36 hook-guard 检查有不符项（见上）。");
+            ? "v2.36+v2.37 hook-guard：40 例矩阵（29 基线 + 审阅补例）/ JSON 提取 / 在位判定 / 引号形态 / repo-local 清查全对齐。"
+            : "v2.36+v2.37 hook-guard 检查有不符项（见上）。");
         return fail;
     }
 }

@@ -513,7 +513,9 @@ internal static class Program
             Messages.Write(Messages.NotInitialized());
             return ExitCodes.NotInitialized;
         }
-        var violations = SealCheck.Run();
+        // v2.37 审阅 P2-2：repo-local 深扫随操作目标（--repo-path 所指仓库）而非 CWD——
+        // push 是唯一与本地仓库交互的写动词，别处照旧 CWD
+        var violations = SealCheck.Run(repoPath);
         if (violations.Count > 0)
         {
             Audit.Append("push", repo, branch, null, "seal_violation");
