@@ -1,3 +1,4 @@
+#if WINDOWS
 using System.Runtime.InteropServices;
 
 namespace Sluice;
@@ -109,3 +110,19 @@ internal sealed class InputFilter : IDisposable
         Installed.Dispose();
     }
 }
+#else
+namespace Sluice;
+
+/// <summary>
+/// Linux 叶（v2.38）：LL 钩子是 Win32 概念，Linux 无用户态等价物——Install() 为 no-op。
+/// T1.5 主防线本就是 IConsent 同意因子（口令——agent 点得动按钮打不出口令），钩子在 §7 里
+/// 本就定性为"第二道、门槛性质"；X11 注入残余面 §14 L15 入册，Wayland 下注入不成立。
+/// 调用点零改动：Program.cs 的 9 处 using 照旧，Linux 下拿到本空实现。
+/// </summary>
+internal sealed class InputFilter : IDisposable
+{
+    public static InputFilter Install() => new();
+    public static int DroppedCount => 0;
+    public void Dispose() { }
+}
+#endif

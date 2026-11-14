@@ -14,6 +14,9 @@ public partial class GateWindow : Window
     private bool _closing;
     private DateTime? _lastScrollAt; // UI-1：最后一次滚动时间——10s 内暂停倒计时
     private bool _alerted;            // C4：超时前召回提示只发一次
+#if !WINDOWS
+    private bool _passVisible;        // Linux 强档（v2.38）：口令面板已展开——批准动作转移到 PassBox 回车
+#endif
 
     public GateWindow()
     {
@@ -26,6 +29,13 @@ public partial class GateWindow : Window
         FreeText.GotFocus += (_, _) => EvalTimer();
         FreeText.LostFocus += (_, _) => EvalTimer();
         FreeText.TextChanged += (_, _) => EvalTimer();
+        // Linux 强档（v2.38）：口令输入同样暂停倒计时（在场证明与拒绝附言同位）
+        PassBox.GotFocus += (_, _) => EvalTimer();
+        PassBox.LostFocus += (_, _) => EvalTimer();
+        PassBox.TextChanged += (_, _) => EvalTimer();
+#if !WINDOWS
+        PassBox.KeyDown += OnPassKey;
+#endif
     }
 
     private void OnOpened()
@@ -42,6 +52,10 @@ public partial class GateWindow : Window
             WarnBanner.IsVisible = true;
         }
         Title = $"Sluice · 批准请求 · {req.Op}";
+#if !WINDOWS
+        // v2.38 Linux：召回文案去掉任务栏闪烁（Wayland 禁抢焦点 = L9 既有关联，urgency 补位缓办）
+        FootNote.Text = "Enter / Esc = 拒绝 · 批准需先阅读至正文底部";
+#endif
 
         DenyBtn.Focus(); // 默认焦点拒绝（§7 误触安全侧）
         TimeBar.Maximum = Gate.TimeoutSeconds;
@@ -51,7 +65,7 @@ public partial class GateWindow : Window
         // timer 恒跑，暂停条件（输入中/滚动中）在 tick 内判断——否则滚动暂停后无人重启。
         // UI-1：滚到底是批准的前置条件，惩罚阅读时间与 §7 自相矛盾；10s 无滚动自动恢复，
         // 误触滚轮不会无限阻塞（agent 弹窗等待、token 浪费）。LL 钩子丢弃 injected 鼠标，
-        // agent 无法伪造滚动利用暂停。
+        // agent 无法伪造滚动利用暂停（Linux 无钩子，滚动暂停的注入利用面 = §14 L15 同款残余）。
         _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _timer.Tick += OnTick;
         _timer.Start();
@@ -66,8 +80,11 @@ public partial class GateWindow : Window
         {
             // C4：剩 15 秒召回（提示音 + 闪任务栏）——用户暂离时有一次被叫回来的机会
             _alerted = true;
+#if WINDOWS
             try { MessageBeep(MB_ICONEXCLAMATION); } catch { }
             FlashTaskbar();
+#endif
+            // Linux 叶（v2.38）：无 user32——通知/任务栏 urgent 补位为 §14 L9/L17 缓办项，本 tick 静默
         }
         if (_secondsLeft <= 0)
         {
@@ -76,10 +93,11 @@ public partial class GateWindow : Window
         }
     }
 
-    /// <summary>倒计时暂停原因（null = 运行中）：输入拒绝理由中 / 10 秒内滚动过。</summary>
+    /// <summary>倒计时暂停原因（null = 运行中）：输入拒绝理由中 / Linux 口令输入中 / 10 秒内滚动过。</summary>
     private string? PauseReason()
     {
         if (FreeText.IsFocused || !string.IsNullOrEmpty(FreeText.Text)) return "输入中";
+        if (PassPanel.IsVisible && (PassBox.IsFocused || !string.IsNullOrEmpty(PassBox.Text))) return "输入中";
         if (_lastScrollAt is { } t && (DateTime.Now - t).TotalSeconds < 10) return "阅读中";
         return null;
     }
@@ -121,6 +139,8 @@ public partial class GateWindow : Window
 
     private void OnGlobalKey(object? sender, KeyEventArgs e)
     {
+        // Linux 口令面板（v2.38）：口令框聚焦时回车 = 校验口令（OnPassKey），不进全局拒绝
+        if (e.Key == Key.Enter && PassBox.IsFocused) return;
         if (e.Key is Key.Enter or Key.Escape) // Enter/Esc = 拒绝（§7）
         {
             e.Handled = true;
@@ -149,8 +169,18 @@ public partial class GateWindow : Window
 
     private void UpdateApprove()
     {
+        // 口令面板展开后（Linux）批准入口转移到 PassBox 回车
+#if WINDOWS
         ApproveBtn.IsEnabled = _scrolledToEnd;
-        ApproveBtn.Content = _scrolledToEnd ? "批准 → Hello" : "批准（先滚到底部）";
+#else
+        ApproveBtn.IsEnabled = _scrolledToEnd && !_passVisible;
+#endif
+        ApproveBtn.Content = !_scrolledToEnd ? "批准（先滚到底部）"
+#if WINDOWS
+            : "批准 → Hello";
+#else
+            : TokenStore.IsSilentVault ? "批 准" : "批准 → 输口令";
+#endif
     }
 
     private void OnJumpToEnd(object? sender, RoutedEventArgs e)
@@ -176,21 +206,41 @@ public partial class GateWindow : Window
     private async void OnApprove(object? sender, RoutedEventArgs e)
     {
         if (_closing || !ApproveBtn.IsEnabled) return;
-        _closing = true; // 冻结窗口交互，等待 Hello
+
+#if !WINDOWS
+        // Linux 强档（v2.38）：首次批准点击展开口令面板——口令即批准事件与解密因子（等价
+        // Hello"点得动按钮按不了指纹"的 T1.5 主防线）。终端读口令被禁（MCP spawn 的 stdin
+        // 被重定向，agent 可喂——PassConsent 面纪律），窗口内 PasswordBox 是唯一门控入口。
+        // 面板展开后批准动作转移到 PassBox 回车；拒绝随时可用；倒计时继续（输入暂停见 PauseReason）。
+        if (!_passVisible && !TokenStore.IsSilentVault)
+        {
+            _passVisible = true;
+            PassPanel.IsVisible = true;
+            ApproveBtn.IsEnabled = false;
+            StatusText.Text = "输入 vault 口令完成批准（口令即批准事件与解密因子；输错可重试）";
+            StatusBanner.IsVisible = true;
+            PassBox.Focus();
+            return;
+        }
+#endif
+
+        _closing = true; // 冻结窗口交互，等待同意因子
         ApproveBtn.IsEnabled = false;
         DenyBtn.IsEnabled = false;
         _timer?.Stop();
         Countdown.Text = $"{_secondsLeft}s";
 
-        // D1（2026-10-31，hello:false）：静默 vault（SLCV2）无需签名派生——批准点击即批准事件，
-        // 不弹 Hello。注入点击仍被 InputFilter 拦（LLMHF_INJECTED）；此路径的降级前提见 Gate.HelloEnabled 注释。
-        if (TokenStore.IsDpapiVault)
+        // D1（2026-10-31，hello:false）：静默 vault 无需签名派生——批准点击即批准事件，
+        // 不弹同意因子。Windows 注入点击仍被 InputFilter 拦（LLMHF_INJECTED）；Linux 无钩子
+        //（L15 残余）——静默档本就是 owner 显式降级。降级前提见 Gate.HelloEnabled 注释。
+        if (TokenStore.IsSilentVault)
         {
             Gate.Result = new Gate.Outcome.Approved([]);
             CloseWindow();
             return;
         }
 
+#if WINDOWS
         // UI-2/3（2026-10-30 实测修订）：Hello 系统凭据 UI **不是 TOPMOST 且 Z 序在调用者
         // 窗口之下**——本窗在前必遮 Hello（置顶版实测：Hello 恰在批准窗下面）。正解是
         // 弹 Hello 前隐藏本窗；Activate 先行确保 sluice 是前台（credential UI 定位跟随
@@ -229,10 +279,54 @@ public partial class GateWindow : Window
         }
         Gate.Result = new Gate.Outcome.Approved(sig);
         CloseWindow(); // 批准已成，无需再展示窗口
+#endif
     }
 
-    // ---------- C4：超时前召回（提示音 + 任务栏闪烁——user32 直调，不引 System.Windows.Extensions 包） ----------
+#if !WINDOWS
+    /// <summary>Linux 口令面板回车 = 校验口令（口令已在手，PBKDF2+回环验证在后台线程——
+    /// 600k 迭代 ~0.3s 不冻结 UI）。输错 ≠ 取消：清空回面板重试（镜像 UI-4 Hello 取消流）；
+    /// Esc = 拒绝（与全局键一致）。文件损坏异常如实上抛 = 内部错误面（Crashed 收敛）。</summary>
+    private async void OnPassKey(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape) { e.Handled = true; Deny(); return; }
+        if (e.Key != Key.Enter) return;
+        e.Handled = true;
+        var pass = PassBox.Text ?? "";
+        if (pass.Length == 0 || _closing) return;
 
+        _closing = true; // 冻结，等待校验
+        PassBox.IsEnabled = false;
+        DenyBtn.IsEnabled = false;
+        _timer?.Stop();
+        Countdown.Text = $"{_secondsLeft}s";
+        StatusText.Text = "校验口令…";
+        StatusBanner.IsVisible = true;
+
+        var challenge = Gate.Req!.VaultChallenge;
+        byte[]? sig = await System.Threading.Tasks.Task.Run(() => PassConsent.SignVerified(challenge, pass));
+        if (sig is null)
+        {
+            // 口令不正确 ≠ 拒绝请求：回面板重试（每次重试 = 一次 PBKDF2 + 用户亲手输入——
+            // 暴力破解速率被人工输入节奏限死，且 agent 本就不该碰得到这个框）
+            _closing = false;
+            PassBox.IsEnabled = true;
+            PassBox.Clear();
+            StatusText.Text = "口令不正确——可重输，或直接拒绝";
+            StatusBanner.IsVisible = true;
+            DenyBtn.IsEnabled = true;
+            _timer?.Start();
+            EvalTimer();
+            PassBox.Focus();
+            return;
+        }
+        Gate.Result = new Gate.Outcome.Approved(sig);
+        CloseWindow(); // 批准已成（口令 = 批准事件 + 解密因子，单次事件两用）
+    }
+#endif
+
+    // ---------- C4：超时前召回（提示音 + 任务栏闪烁——user32 直调，不引 System.Windows.Extensions包） ----------
+
+#if WINDOWS
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool MessageBeep(uint uType);
     private const uint MB_ICONEXCLAMATION = 0x30;
@@ -256,6 +350,7 @@ public partial class GateWindow : Window
         };
         try { FlashWindowEx(ref fi); } catch { }
     }
+#endif
 
     private void CloseWindow()
     {

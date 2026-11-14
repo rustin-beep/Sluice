@@ -54,11 +54,13 @@ internal static class Gate
     }
 
     /// <summary>
-    /// D1（2026-10-31 用户决策）：config.json "hello": false 时 vault 走 DPAPI 静默格式（SLCV2），
-    /// 批准点击即批准事件，不再弹 Windows Hello。默认 true = 原行为（Hello 签名派生密钥，一次
-    /// 生物事件 = 解锁 + 授权）。这是 owner 显式的防护降级：批准事件从生物事件降为桌面事件、
-    /// vault 从 Hello 派生降为同用户可静默解密（并发 agent/后台进程不被 sluice 阻塞，注入输入仅剩
-    /// InputFilter 用户态拦截）。agent 也可改此文件，但改 false = 降低自身防护（自伤侧），无防篡改必要。
+    /// D1（2026-10-31 用户决策）：config.json "hello": false 时 vault 走静默降级格式
+    /// （Windows = SLCV2/DPAPI；Linux v2.38 = SLCF1/0600 明文文件），批准点击即批准事件，
+    /// 不再要求同意因子。默认 true = 强档（Windows = Hello 签名派生密钥，一次生物事件 = 解锁+授权；
+    /// Linux = 口令签名派生密钥，一次口令输入 = 解锁+授权——等价 T1.5 主防线）。这是 owner 显式的
+    /// 防护降级：批准事件从到场因子降为桌面事件、vault 降为同用户可静默读取（并发 agent/后台进程
+    /// 不被 sluice 阻塞；Windows 另有 InputFilter 用户态拦截，Linux 无——§14 L15）。agent 也可改此
+    /// 文件，但改 false = 降低自身防护（自伤侧），无防篡改必要。
     /// </summary>
     public static bool HelloEnabled { get; } = ReadHello();
 
@@ -132,7 +134,8 @@ internal static class Gate
                 try { Console.Error.WriteLine($"[Sluice] gate 线程异常详情：{detail}"); } catch { }
             }
         });
-        t.SetApartmentState(ApartmentState.STA);
+        // v2.38 Linux：STA 是 Win32 概念（Unix 上 SetApartmentState 无意义）——Windows 面保持原行为
+        if (OperatingSystem.IsWindows()) t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
         return Result ?? new Outcome.TimedOut();

@@ -2,16 +2,25 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows10.0.26100</TargetFramework>
+    <!-- v2.38 Linux 移植批：多目标——net10.0（Linux，-r linux-x64）+ net10.0-windows10.0.26100
+         （Windows，-r win-x64；-windows 后缀供 WinRT 投影 = HelloConsent 专用）。平台差异全部收口
+         在叶（Consent/TokenStore/InputFilter/SealCheck/哨兵，见 §1.5），WINDOWS 符号圈住 Windows 叶。 -->
+    <TargetFrameworks>net10.0;net10.0-windows10.0.26100</TargetFrameworks>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <AssemblyName>sluice</AssemblyName>
     <RootNamespace>Sluice</RootNamespace>
     <InvariantGlobalization>false</InvariantGlobalization>
     <!-- 探针定稿：NativeAOT（启动 ~100ms，exe 19MB）；AOT 隐含 trimming -->
     <PublishAot>true</PublishAot>
-    <Version>0.7.12</Version>
+    <Version>0.8.1</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows10.0.26100'">
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <DefineConstants>$(DefineConstants);WINDOWS</DefineConstants>
+    <!-- Linux 上构建（restore 会评估全部 TFM）：允许评估 windows TFM，无需 Windows 机器在场 -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
 
   <!-- B2（2026-10-30 实战）：构建时间戳 + git sha 内嵌为 AssemblyMetadata，
@@ -22,6 +31,10 @@
   <Target Name="EmbedBuildInfo" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <BuildTimestampUtc>$([System.DateTime]::UtcNow.ToString("yyyy-MM-dd HH:mm"))UTC</BuildTimestampUtc>
+      <!-- v2.38：plan-lite 文档版本构建期解析（与 CI 戳校验同正则口径：首个 vN.N-lite）——
+           Program.cs 原硬编码 v2.35 在 v2.36/v2.37 两批连续漏更（人工步骤结构性会漏），
+           自此文档版本变更自动随构建走，CI 断言恒可满足 -->
+      <PlanLiteDocV>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)/plan-lite.md')), 'v[0-9]+\.[0-9]+-lite').Value)</PlanLiteDocV>
     </PropertyGroup>
     <Exec Command="git rev-parse --short=8 HEAD" ConsoleToMSBuild="true" IgnoreExitCode="true" StandardOutputImportance="low">
       <Output TaskParameter="ConsoleOutput" PropertyName="GitSha8" />
@@ -44,6 +57,10 @@
       <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
         <_Parameter1>SluiceGitSha</_Parameter1>
         <_Parameter2>$(GitSha8)</_Parameter2>
+      </AssemblyAttribute>
+      <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+        <_Parameter1>SluicePlanLite</_Parameter1>
+        <_Parameter2>$(PlanLiteDocV)</_Parameter2>
       </AssemblyAttribute>
     </ItemGroup>
   </Target>

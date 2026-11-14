@@ -87,19 +87,27 @@
         </Grid>
       </StackPanel>
 
-      <!-- UI-2/4：等待 Hello / Hello 取消的可见状态（banner 化） -->
+      <!-- UI-2/4：等待同意因子 / 因子取消的可见状态（banner 化） -->
       <Border x:Name="StatusBanner" Classes="sluice-banner sluice-banner-warn" IsVisible="False">
         <TextBlock x:Name="StatusText" TextWrapping="Wrap"/>
       </Border>
 
+      <!-- Linux 强档口令面板（v2.38）：批准点击后展开——口令即批准事件与解密因子（等价 Hello 的
+           批准后生物验证）。Windows 构建下永不展开；KeyDown 处理器在代码后置按平台挂接。 -->
+      <StackPanel x:Name="PassPanel" Spacing="6" IsVisible="False" Margin="0,2,0,0">
+        <TextBlock Text="输入 vault 口令完成批准（回车确认；输错可重试，拒绝随时可用）" FontSize="12"
+                   Foreground="{DynamicResource SluiceFg2Brush}"/>
+        <TextBox x:Name="PassBox" PasswordChar="●" PlaceholderText="vault 口令" MinHeight="32"/>
+      </StackPanel>
+
       <!-- 按钮行：拒绝=红（默认焦点在此）；批准=accent，未读完禁用 -->
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="12" Margin="0,2,0,0">
         <Button x:Name="DenyBtn" Classes="sluice-danger" Content="拒 绝" MinWidth="96" MinHeight="34" Click="OnDeny"/>
-        <Button x:Name="ApproveBtn" Content="批准 → Hello" MinWidth="132" MinHeight="34" FontWeight="SemiBold"
+        <Button x:Name="ApproveBtn" Content="批 准" MinWidth="132" MinHeight="34" FontWeight="SemiBold"
                 Click="OnApprove" IsEnabled="False"/>
       </StackPanel>
 
-      <TextBlock Text="Enter / Esc = 拒绝 · 批准需先阅读至正文底部 · 剩 15 秒时任务栏闪烁召回"
+      <TextBlock x:Name="FootNote" Text="Enter / Esc = 拒绝 · 批准需先阅读至正文底部 · 剩 15 秒时任务栏闪烁召回"
                  HorizontalAlignment="Center" FontSize="11.5" Opacity="0.55"/>
 
     </StackPanel>

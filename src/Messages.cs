@@ -155,8 +155,8 @@ internal static class Messages
     /// 必须显式自曝换重启，不得继续按旧语义服务写门。</summary>
     public static Msg ServerStale() => new(
         "[Sluice·终态]",
-        """
-        Sluice MCP 服务器已过期：磁盘上的 sluice.exe 已被更新，本进程仍在按旧版语义运行——
+        $"""
+        Sluice MCP 服务器已过期：磁盘上的 {Platform.BinName} 已被更新，本进程仍在按旧版语义运行——
         继续使用会丢失用户决策结果（含拒绝理由）。
         本次调用未执行，无任何副作用。
         请把本消息原文转告用户：重启本会话（或重连 MCP server）后重新发起同一操作即可。
@@ -306,7 +306,7 @@ internal static class Messages
     public static Msg ConsentFailed(string op, string target) => new(
         "[Sluice·终态]",
         $"""
-        用户未通过 Windows Hello（取消或连续失败）。本次操作未执行，无任何变更。
+        用户未通过{Platform.ConsentName}（取消或连续失败）。本次操作未执行，无任何变更。
         不要重试；等用户口头让你再试时，重新运行同一命令（{op} → {target}）。
         """,
         ExitCodes.ConsentFailed, "wait_user", true);
@@ -419,13 +419,13 @@ internal static class Messages
         """,
         ExitCodes.HttpFailed, "retry_ok", true);
 
-    // 匿名读 401/403：资源需要认证——agent 可自行修正（加 --auth 重跑，届时弹 Hello）
+    // 匿名读 401/403：资源需要认证——agent 可自行修正（加 --auth 重跑，届时要求同意因子）
     public static Msg ApiAuthRequired(string path, int st) => new(
         "[Sluice]",
         $"""
         api GET {path} → HTTP {st}：资源需要认证（私有或受限），匿名读不可用。
         本次未产生任何副作用（响应体已输出到 stdout）。
-        修正：加 --auth 参数重新运行同一命令（将弹出 Windows Hello 验证身份后带 token 重读）。
+        修正：加 --auth 参数重新运行同一命令（将通过{Platform.ConsentName}验证身份后带 token 重读）。
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
@@ -794,6 +794,16 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
+    // ---- comment edit 被服务端拒绝（exit 10，retry=after_fix；v2.39：评论勘误。旧正文未被动过） ----
+    public static Msg CommentEditRejected(string target, string detail) => new(
+        "[Sluice·终态]",
+        $"""
+        comment_edit → {target} 被服务端拒绝：{detail}。常见原因：--comment-id 不是本仓库的评论（404）；不是 token 所属账户发表的评论（GitHub 只允许作者修改，403/404）；token 无 Issues 写权限。
+        本次操作未执行，GitHub 上没有产生任何变更——评论旧正文原样保留。
+        修正：核对评论 id（评论链接 #issuecomment-<id> 的数字部分；sluice api "repos/<owner/repo>/issues/comments/<id>" 可读该评论）后重跑同一命令；他人的评论不能改，正解是再发一条新评论。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
     // ---- pr review 被服务端拒绝（exit 10，retry=after_fix；v2.11：APPROVE 自批禁令在此说破） ----
     public static Msg PrReviewRejected(string target, string detail) => new(
         "[Sluice·终态]",
@@ -921,6 +931,7 @@ internal static class Messages
         ("issuereopenrejected", IssueReopenRejected("rustin-beep/Sluice#369", "HTTP 422：Issue is locked")),
         ("issuelabelrejected", IssueLabelRejected("rustin-beep/Sluice#409", "HTTP 404：Label does not exist")),
         ("preditrejected", PrEditRejected("rustin-beep/Sluice#383", "HTTP 403：Resource not accessible by personal access token")),
+        ("commenteditrejected", CommentEditRejected("rustin-beep/Vitro#issuecomment-2601234567", "HTTP 404：Not Found")), // v2.39：旧正文未动，核对 id 后重跑
         ("prreviewrejected", PrReviewRejected("rustin-beep/Vitro#390", "HTTP 422：Can not approve your own pull request")),
         ("tagrejected", TagRejected("rustin-beep/Sluice·v0.6.0", "HTTP 422：Reference already exists")),
         ("releaserejected", ReleaseRejected("rustin-beep/Sluice·v0.6.0", "HTTP 422：already_exists")),

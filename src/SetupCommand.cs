@@ -52,26 +52,39 @@ internal static class SetupCommand
 
         if (Gate.HelloEnabled)
         {
+            var p = TokenStore.NewParams();
+#if WINDOWS
             Console.WriteLine();
             Console.WriteLine("下一步将弹出 Windows Hello：创建/打开 vault 密钥并签名。");
             Console.WriteLine("这次验证会加密你的 token；此后每次写操作解密时都需要同样的生物验证（批准即解密）。");
-            var p = TokenStore.NewParams();
             var sig = await HelloConsent.SignForSetupAsync(p.Challenge);
             if (sig is null)
             {
                 Console.WriteLine("Windows Hello 未通过，setup 未完成（未保存任何内容）。");
                 return 1;
             }
-
+#else
+            // Linux 强档（v2.38）：口令 = 同意因子（等价 Hello 生物事件的"agent 无从合成"位）。
+            // 两次掩码输入设口令 → 签名挑战；此后每次批准在批准窗内输口令（批准即解密）。
+            var sig = await PassConsent.SignForSetupAsync(p.Challenge, p.Salt);
+            if (sig is null)
+                return 1; // 未输入/两次不一致/过短——文案已由 PassConsent 给出
+#endif
             TokenStore.Save(p, pat, sig);
         }
         else
         {
-            // D1（2026-10-31）：config hello:false——vault 直接存 DPAPI 静默格式，setup 全程无 Hello。
-            // 代价：token 同用户进程可静默解密（owner 显式降级，见 Gate.HelloEnabled 注释）；
-            // 改回 true 后重跑 setup 即恢复 Hello 派生格式。
+            // D1（2026-10-31）：config hello:false——vault 直接存静默格式，setup 全程无同意因子。
+            // 代价：token 同用户进程可静默读取（owner 显式降级，见 Gate.HelloEnabled 注释）；
+            // 改回 true 后重跑 setup 即恢复强档格式。Windows = DPAPI 包封；Linux = 0600 明文文件
+            //（§1.5 ITokenStore 预案，同 L1 让步级）。
+#if WINDOWS
             TokenStore.SaveDpapi(pat);
             Console.WriteLine("config hello:false——vault 已存为静默格式（DPAPI），批准不再需要 Windows Hello。");
+#else
+            TokenStore.Save0600(pat);
+            Console.WriteLine("config hello:false——vault 已存为静默格式（0600 明文文件），批准不再需要口令。");
+#endif
         }
 
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice");
@@ -108,8 +121,9 @@ internal static class SetupCommand
     /// conhost 下无换行 Console.Write 不刷新显示（实测：提示行根本不出现），
     /// 且行缓冲 ReadLine 会把 PAT 明文留在屏幕滚动缓冲——逐字符读两个问题一起解决。
     /// stdin 被重定向（管道/脚本）时回退 ReadLine。
+    /// v2.38 起 internal：Linux 口令叶（PassConsent 控制台面）复用同一读取器。
     /// </summary>
-    private static string ReadSecret()
+    internal static string ReadSecret()
     {
         if (Console.IsInputRedirected)
             return Console.ReadLine()?.Trim() ?? "";
@@ -326,11 +340,17 @@ internal static class SetupCommand
     public static int Unseal()
     {
         if (!TokenStore.Exists) { Messages.Write(Messages.NotInitialized()); return ExitCodes.NotInitialized; }
-        var body = """
+        var sentinelLine =
+#if WINDOWS
+            "· 删除哨兵计划任务 \"Sluice Sentinel\"";
+#else
+            "· 停用并删除哨兵 systemd 用户定时器（sluice-sentinel.timer）";
+#endif
+        var body = $"""
             卸载 Sluice 的环境侧安装件：
             · 摘除 notice credential helper（github.com 凭据链回到系统默认）
             · 摘除 GCM 无 UI 封堵键（credential.https://github.com.interactive）
-            · 删除哨兵计划任务 "Sluice Sentinel"
+            {sentinelLine}
             · 摘除 ~/.ssh/config 的 github.com 屏蔽块
             · 清除暂停状态（如有）
             vault（token.bin）与 config.json 保留，不自动删除。
@@ -346,6 +366,7 @@ internal static class SetupCommand
                 "notice helper：已摘除",
                 RemoveInteractiveNever(), // 层 A：卸载不得留下被静默降级的 git（红线同理）
             };
+#if WINDOWS
             try
             {
                 var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/Delete /TN \"Sluice Sentinel\" /F")
@@ -354,6 +375,9 @@ internal static class SetupCommand
                 acts.Add("哨兵：计划任务已删除");
             }
             catch { acts.Add("哨兵：任务删除失败——请手动 schtasks /Delete /TN \"Sluice Sentinel\" /F"); }
+#else
+            acts.AddRange(SentinelTearDown());
+#endif
             acts.AddRange(SealCheck.StripSshBlock());
             SealCheck.SealPause.Clear();
             acts.Add("暂停状态：已清除（如有）");
@@ -430,7 +454,7 @@ internal static class SetupCommand
         {
             // gitconfig 的 helper 值经 shell 分词——含空格路径需引号转义，宁拒不装错
             Console.Error.WriteLine($"[Sluice] 发布路径含空格（{exe}），helper 值转义易错，安装中止。");
-            Console.Error.WriteLine("[Sluice] 请把 sluice.exe 发布/复制到无空格路径后重跑 setup --install。");
+            Console.Error.WriteLine($"[Sluice] 请把 {Platform.BinName} 发布/复制到无空格路径后重跑 setup --install。");
             return ExitCodes.Internal;
         }
         var fwd = exe.Replace('\\', '/');
@@ -656,17 +680,28 @@ internal static class SetupCommand
         var v = typeof(Program).Assembly.GetName().Version;
         Console.WriteLine($"  · sluice v{v?.ToString(3)} · {Program.BuildStamp}");
 
-        // vault：存在性 + 形态（V1 Hello 派生 / SLCV2 静默）
+        // vault：存在性 + 形态（V1 同意因子派生 / 静默降级档）
         if (!TokenStore.Exists)
             Item(false, "vault", "token.bin 不存在——运行 sluice setup");
-        else if (TokenStore.IsDpapiVault)
-            Item(true, "vault", "SLCV2 静默格式（DPAPI，批准=桌面点击，§14 L1 让步在册）");
+        else if (TokenStore.IsSilentVault)
+            Item(true, "vault",
+#if WINDOWS
+                "SLCV2 静默格式（DPAPI，批准=桌面点击，§14 L1 让步在册）");
+#else
+                "SLCF1 静默格式（0600 明文文件，批准=桌面点击，§14 L1 让步在册）");
+#endif
         else
         {
             try
             {
                 var ch = TokenStore.PeekChallenge();
-                Item(ch.Length > 0, "vault", ch.Length > 0 ? "V1 Hello 派生格式（批准=Windows Hello）" : "V1 格式但挑战缺失——重跑 setup");
+                Item(ch.Length > 0, "vault", ch.Length > 0
+#if WINDOWS
+                    ? "V1 Hello 派生格式（批准=Windows Hello）"
+#else
+                    ? "V1 口令派生格式（批准=批准窗内输口令）"
+#endif
+                    : "V1 格式但挑战缺失——重跑 setup");
             }
             catch (Exception ex) { Item(false, "vault", $"读取异常（{ex.GetType().Name}）——重跑 setup"); }
         }
@@ -737,18 +772,29 @@ internal static class SetupCommand
                 ? "在位（interactive=never，GCM 对 github.com 拒答不弹窗）"
                 : $"不在位（现值「{interactive}」）——sluice seal --fix 重置");
 
-        // 哨兵任务
+        // 哨兵任务（Windows = schtasks 计划任务；Linux = systemd 用户定时器）
         bool taskOk;
         try
         {
+#if WINDOWS
             var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/Query /TN \"Sluice Sentinel\"")
             { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+#else
+            var psi = new System.Diagnostics.ProcessStartInfo("systemctl", "--user is-enabled sluice-sentinel.timer")
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+#endif
             using var p = System.Diagnostics.Process.Start(psi)!;
             p.WaitForExit(15000);
             taskOk = p.ExitCode == 0;
         }
         catch { taskOk = false; }
-        Item(taskOk, "哨兵任务", taskOk ? "已注册（每 5 分钟）" : "未注册——sluice sentinel-install");
+        Item(taskOk, "哨兵任务", taskOk
+#if WINDOWS
+            ? "已注册（每 5 分钟）" : "未注册——sluice sentinel-install");
+#else
+            ? "已注册（每 5 分钟，systemd 用户定时器）"
+            : "未注册——sluice sentinel-install（需 systemd；WSL 需 /etc/wsl.conf [boot] systemd=true）");
+#endif
 
         // AGENTS.md 片段（v2.34 发现时机批，§8.4 ①'层）：agent 会话的路标，缺位 = 每个新会话重付
         // 发现成本（incident-deferred-20261109：①层被宿主 deferred 降级时，①' 是仅存的提示层）。
@@ -791,7 +837,7 @@ internal static class SetupCommand
             Console.Error.WriteLine("[Sluice] 无法定位自身 exe，安装中止（未产生任何变更）。");
             return ExitCodes.Internal;
         }
-
+#if WINDOWS
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice");
         Directory.CreateDirectory(dir);
         var ps1 = Path.Combine(dir, "sentinel.ps1");
@@ -827,7 +873,83 @@ internal static class SetupCommand
             注意：哨兵是检测不是阻止——最迟 5 分钟看见（§6 device flow 时间窗）。
             """);
         return 0;
+#else
+        // Linux 叶（v2.38）：systemd 用户定时器 + notify-send——架构镜像 schtasks + ps1 + toast。
+        // systemd 不可用（WSL 未开 systemd 等）→ 如实失败并指路，不静默降级。
+        var dataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice");
+        Directory.CreateDirectory(dataDir);
+        var sh = Path.Combine(dataDir, "sentinel.sh");
+        File.WriteAllText(sh, SentinelShScript.Replace("__EXE__", exe));
+        // 0755：timer 以本用户跑 service，service 跑脚本——属主可执行即可，组/他只读
+#pragma warning disable CA1416 // Linux 叶在 #if !WINDOWS 内；net10.0 TFM 声明全平台可达引发误报
+        File.SetUnixFileMode(sh, System.IO.UnixFileMode.UserRead | System.IO.UnixFileMode.UserWrite
+            | System.IO.UnixFileMode.UserExecute | System.IO.UnixFileMode.GroupRead | System.IO.UnixFileMode.GroupExecute
+            | System.IO.UnixFileMode.OtherRead | System.IO.UnixFileMode.OtherExecute);
+#pragma warning restore CA1416
+        Console.WriteLine($"[Sluice] 已写入哨兵脚本：{sh}");
+
+        var unitDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "systemd", "user");
+        Directory.CreateDirectory(unitDir);
+        File.WriteAllText(Path.Combine(unitDir, "sluice-sentinel.service"), SentinelUnitServiceText(sh));
+        File.WriteAllText(Path.Combine(unitDir, "sluice-sentinel.timer"), SentinelUnitTimerText());
+        Console.WriteLine($"[Sluice] 已写入 unit 文件：{unitDir}/sluice-sentinel.{{service,timer}}");
+
+        var rl = SystemCapture("--user daemon-reload");
+        var en = rl != 0 ? rl : SystemCapture("--user enable --now sluice-sentinel.timer");
+        if (en != 0)
+        {
+            Console.Error.WriteLine($"[Sluice] systemd 用户定时器启用失败（daemon-reload/enable exit {en}）。");
+            Console.Error.WriteLine("[Sluice] 请确认 systemd 可用（WSL：/etc/wsl.conf 加 [boot]\\nsystemd=true 后 wsl --shutdown 重启）；");
+            Console.Error.WriteLine("[Sluice] unit 与脚本已写好，恢复 systemd 后重跑 sluice sentinel-install。");
+            return ExitCodes.Internal;
+        }
+
+        Console.WriteLine("""
+            [Sluice] 已启用 systemd 用户定时器 sluice-sentinel.timer（每 5 分钟）。
+            违规时 notify-send 弹通知并写 sentinel.log；处理：sluice seal --fix。
+            移除：systemctl --user disable --now sluice-sentinel.timer
+            注意：哨兵是检测不是阻止——最迟 5 分钟看见（§6 device flow 时间窗）。
+            """);
+        return 0;
+#endif
     }
+
+#if !WINDOWS
+    /// <summary>卸载侧：停用定时器 + 删 unit 文件 + daemon-reload（unseal 用；sentinel.sh 保留——
+    /// 与 Windows 侧不删 sentinel.ps1 同款残留形态）。逐项如实回报，失败不掩。</summary>
+    private static List<string> SentinelTearDown()
+    {
+        var acts = new List<string>();
+        var unitDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "systemd", "user");
+        _ = SystemCapture("--user disable --now sluice-sentinel.timer"); // 未装/已停 → 非零，照删文件
+        try
+        {
+            File.Delete(Path.Combine(unitDir, "sluice-sentinel.service"));
+            File.Delete(Path.Combine(unitDir, "sluice-sentinel.timer"));
+            _ = SystemCapture("--user daemon-reload");
+            acts.Add("哨兵：systemd 定时器已停用并删除 unit 文件");
+        }
+        catch (Exception ex)
+        {
+            acts.Add($"哨兵：unit 文件删除失败（{ex.Message}）——请手动 systemctl --user disable --now sluice-sentinel.timer 并删 {unitDir}/sluice-sentinel.*");
+        }
+        return acts;
+    }
+
+    /// <summary>systemctl 捕获式执行（doctor/uninstall 共用；失败 = 非零退出码）。</summary>
+    private static int SystemCapture(string args)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("systemctl", args)
+            { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            using var p = System.Diagnostics.Process.Start(psi)!;
+            p.WaitForExit(15000);
+            return p.ExitCode;
+        }
+        catch { return -1; }
+    }
+#endif
 
     /// <summary>哨兵 /TR 值：-File 路径恒带引号（LOCALAPPDATA 常含空格——Windows 用户名含空格即中招）。
     /// 形态入 selftest 锁（v2.23：v2.20 缺的正是这层引号，含空格机器上任务静默失败）。</summary>
@@ -838,6 +960,94 @@ internal static class SetupCommand
     /// 存为 Command/Arguments 两个字段，实弹验证见 SentinelInstall 注释）。转义入 selftest 锁。</summary>
     internal static string SchtasksCreateArgs(string tr) =>
         $"/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"{tr.Replace("\"", "\\\"")}\"";
+
+    // ---------- 哨兵 Linux 叶文本（v2.38；纯函数两 TFM 皆编，selftest 锁——沿 SentinelTr 先例） ----------
+
+    /// <summary>service unit（oneshot 跑哨兵脚本；ExecStart 恒带引号——与 HookGuardCommand/SentinelTr
+    /// 同族"宁恒引号不赌路径"纪律，systemd 支持 ExecStart 首参数引号包裹；SuccessExitStatus=7——
+    /// 违规轮以 7 退出是**检测成功**而非服务故障，不标红 job 免误报噪音，信号由 sentinel.log/toast 承载）。
+    /// 文本入 selftest 锁。</summary>
+    internal static string SentinelUnitServiceText(string scriptPath) => $"""
+        [Unit]
+        Description=Sluice Sentinel seal preflight (plan-lite §6)
+
+        [Service]
+        Type=oneshot
+        ExecStart="{scriptPath}"
+        SuccessExitStatus=7
+        """;
+
+    /// <summary>timer unit：OnUnitActiveSec=5min 对齐 schtasks /SC MINUTE /MO 5；Persistent 补错过的
+    /// 停机窗口（WSL 常态关机，重开后立即补跑一次）。文本入 selftest 锁。</summary>
+    internal static string SentinelUnitTimerText() => """
+        [Unit]
+        Description=Sluice Sentinel timer (5 min)
+
+        [Timer]
+        OnBootSec=2min
+        OnUnitActiveSec=5min
+        AccuracySec=30s
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+        """;
+
+    /// <summary>哨兵脚本 Linux 叶（__EXE__ 由安装器替换为绝对路径）。逐句镜像 sentinel.ps1 语义：
+    /// 日志 1MB 滚动（保留一代）；notify-send 不可用则降级写日志；暂停窗口未到期 → 审计交叉核对
+    /// （§14 L11，needle = "pause_until &lt;ISO8601Z&gt;"，与 ToStateString 逐字同形态）后静默放行、
+    /// 无对应 seal_pause 记录 = 疑似伪造 → 告警；已过期 → seal --resume 自愈 + 通知；正常 → seal
+    /// 预检，exit 7 时提取 ✗ 行通知。POSIX sh（非 bash）——dash 兼容，无 bash 依赖。</summary>
+    private const string SentinelShScript = """
+        #!/bin/sh
+        # Sluice 哨兵 Linux 叶（§6）——由 sluice sentinel-install 生成；检测逻辑单源在 sluice seal
+        EXE='__EXE__'
+        DIR="${XDG_DATA_HOME:-$HOME/.local/share}/Sluice"
+        LOG="$DIR/sentinel.log"
+        # 日志滚动（超 1MB 改名 .1，保留一代）——违规持续期间每 5 分钟全量追加，无上限会失控
+        if [ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 1048576 ]; then mv -f "$LOG" "$LOG.1"; fi
+
+        toast() {
+          # systemd 用户服务的 PATH 受限——command -v 找不到时退绝对路径再试一次（装了 libnotify-bin 即在）
+          NS=$(command -v notify-send 2>/dev/null || echo /usr/bin/notify-send)
+          if [ -x "$NS" ]; then
+            "$NS" -a Sluice -u critical "$1" "$2" && return 0
+          fi
+          echo "$(date -Is) toast 失败：notify-send 不可用（libnotify-bin）" >> "$LOG"
+        }
+
+        # 暂停窗口（seal --pause）：未到期 → 交叉核对审计后静默放行；已过期 → seal --resume 自愈 + 通知
+        STATE="$DIR/state.json"
+        if [ -f "$STATE" ]; then
+          UNTIL=$(sed -n 's/.*"pause_until"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATE" 2>/dev/null)
+          if [ -n "$UNTIL" ]; then
+            NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            if [ "$UNTIL" \> "$NOW" ]; then
+              # state.json 同用户可写——伪造未来时间戳即可静音哨兵；pause_until 值须有逐字同形态的
+              # seal_pause 审计记录（ToStateString），无对应记录 = 疑似伪造 → 告警（抬门槛非建信任）
+              if grep -Fq "pause_until $UNTIL" "$DIR/audit.jsonl" 2>/dev/null; then exit 0; fi
+              echo "$(date -Is) 疑似伪造暂停：state.json 记 $UNTIL，audit.jsonl 无对应 seal_pause 审计记录" >> "$LOG"
+              toast 'Sluice 哨兵：暂停状态可疑' 'state.json 的暂停无对应 seal_pause 审计记录——疑似被同用户进程伪造。运行 sluice seal --resume 立即恢复封堵。'
+              exit 0
+            fi
+            OUT=$("$EXE" seal --resume 2>&1)
+            echo "$(date -Is) 暂停到期，自动恢复：
+        $OUT" >> "$LOG"
+            toast 'Sluice：暂停窗口结束' '已自动重新封堵（notice 重装 + seal --fix）。残留请看 sentinel.log。'
+            exit 0
+          fi
+        fi
+
+        OUT=$("$EXE" seal 2>&1)
+        RC=$?
+        [ "$RC" -ne 7 ] && exit 0
+        VIOL=$(printf '%s\n' "$OUT" | grep '✗')
+        [ -z "$VIOL" ] && VIOL='检测到未封堵的 GitHub 凭据（详见 sentinel.log）'
+        echo "$(date -Is) seal violations:
+        $OUT" >> "$LOG"
+        toast 'Sluice 哨兵：检测到未封堵的 GitHub 凭据' "运行 sluice seal --fix 处理。$(printf '%s' "$VIOL" | tr '\n' '|')"
+        exit 7
+        """;
 
     /// <summary>哨兵脚本（__EXE__ 由安装器替换为绝对路径）。UTF-8 控制台先设好否则 ✗ 行匹配乱码；
     /// toast 双路：BurntToast 模块（装了就用）→ WinRT 原生（PowerShell AUMID，零依赖兜底）。

@@ -44,6 +44,7 @@ internal static class Selftest
         ("issuereopenrejected", ExitCodes.BadRequest, "after_fix"), // v2.11：PR 误用/权限/锁定透传
         ("issuelabelrejected", ExitCodes.BadRequest, "after_fix"), // v2.17：未知名 404/编号不存在/权限——当前标签原样保留
         ("preditrejected",    ExitCodes.BadRequest, "after_fix"), // v2.11：旧值未动，核对后重跑
+        ("commenteditrejected", ExitCodes.BadRequest, "after_fix"), // v2.39：旧正文未动，核对评论 id 后重跑；他人评论不能改（正解再发一条）
         ("prreviewrejected",  ExitCodes.BadRequest, "after_fix"), // v2.11：APPROVE 自批 422 说破 → 改 RQC/COMMENT
         ("tagrejected",       ExitCodes.BadRequest, "after_fix"), // v2.13：Reference already exists → 用既有 tag 勿重试
         ("releaserejected",   ExitCodes.BadRequest, "after_fix"), // v2.13：already_exists → 查既有 release；未发通知未触发 webhook
@@ -172,11 +173,83 @@ internal static class Selftest
         fail += ReviewFix232Checks();
         fail += DiscoveryTimingChecks();
         fail += HookGuardChecks();
+        fail += LinuxPortChecks();
 
         Console.WriteLine(fail == 0
             ? "PASS：全部消息可单读终判，exit code 与 §8.3 对齐。"
             : $"FAIL：{fail} 处不符。");
         return fail == 0 ? 0 : 1;
+    }
+
+    /// <summary>v2.38 Linux 移植锁：①PassKdf 签名链契约（确定性 / 口令敏感 / 32B / 迭代数常量——
+    /// 迭代数变了 = KDF 换代 = vault 需重建，必须显式改锁而非静默漂移）；②gh hosts.yml 双平台候选
+    /// （Windows gh 写 %APPDATA%\GitHub CLI\，Linux gh 写 ~/.config/gh\——BCL ApplicationData 映射）；
+    /// ③哨兵 systemd unit 文本（ExecStart 恒引号——与 HookGuardCommand/SentinelTr 同族"宁恒引号"
+    /// 纪律；5min 周期与 schtasks 面对齐）；④平台展示名单源（BinName/ConsentName）。</summary>
+    private static int LinuxPortChecks()
+    {
+        Console.WriteLine("--- v2.38 Linux 移植锁（PassKdf / hosts.yml 候选 / 哨兵 unit 文本 / 平台名单源）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) PassKdf 契约
+        var salt = Convert.FromHexString("a1b2c3d4".PadRight(64, '0'));
+        var challenge = Convert.FromHexString("e5f6a7b8".PadRight(64, '1'));
+        var s1 = PassKdf.Sign(challenge, "correct horse", salt);
+        var s2 = PassKdf.Sign(challenge, "correct horse", salt);
+        Eq("签名长度 32B（HMAC-SHA256）", s1.Length, 32);
+        Eq("同输入确定性（SLCV1 解密可复现的前提）", s2.SequenceEqual(s1), true);
+        Eq("口令敏感（换口令必换签名）",
+            PassKdf.Sign(challenge, "wrong horse", salt).SequenceEqual(s1), false);
+        Eq("迭代数常量 600k（换代须显式改锁）", PassKdf.Pbkdf2Iterations, 600_000);
+
+        // (2) gh hosts.yml 双平台候选
+        var cands = SealCheck.GhHostsCandidates();
+        Eq("候选数", cands.Count, 2);
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+#if WINDOWS
+        Eq("Windows 候选（%APPDATA%\\GitHub CLI\\hosts.yml）", cands[0], Path.Combine(appData, "GitHub CLI", "hosts.yml"));
+#else
+        Eq("Linux 候选（~/.config/gh/hosts.yml）", cands[1], Path.Combine(appData, "gh", "hosts.yml"));
+#endif
+
+        // (3) 哨兵 systemd unit 文本（逐字锁——改文本 = 改行为面，评审可见）
+        Eq("service unit·ExecStart 恒引号", SetupCommand.SentinelUnitServiceText("/home/u/.local/share/Sluice/sentinel.sh"), """
+            [Unit]
+            Description=Sluice Sentinel seal preflight (plan-lite §6)
+
+            [Service]
+            Type=oneshot
+            ExecStart="/home/u/.local/share/Sluice/sentinel.sh"
+            SuccessExitStatus=7
+            """);
+        Eq("timer unit·5min 对齐 schtasks 面", SetupCommand.SentinelUnitTimerText(), """
+            [Unit]
+            Description=Sluice Sentinel timer (5 min)
+
+            [Timer]
+            OnBootSec=2min
+            OnUnitActiveSec=5min
+            AccuracySec=30s
+            Persistent=true
+
+            [Install]
+            WantedBy=timers.target
+            """);
+
+        // (4) 平台展示名单源（文案参数化的两侧锚点）
+#if WINDOWS
+        Eq("BinName·Windows", Platform.BinName, "sluice.exe");
+        Eq("ConsentName·Windows", Platform.ConsentName, "Windows Hello");
+#else
+        Eq("BinName·Linux", Platform.BinName, "sluice");
+        Eq("ConsentName·Linux", Platform.ConsentName, "口令");
+#endif
+        Console.WriteLine(fail == 0 ? "v2.38 Linux 移植：KDF 契约 / 候选路径 / 哨兵 unit / 名单源全对齐。" : $"v2.38 Linux 移植锁：{fail} 处不符。");
+        return fail;
     }
 
     /// <summary>v2.34 发现时机锁（incident-deferred-20261109）：①notice 元信息提取——host/path 入审计
@@ -675,7 +748,7 @@ internal static class Selftest
     [
         "pr_comment", "pr_create", "pr_review", "push", "api", "pr_merge", "branch_delete",
         "pr_reopen", "issue_close", "workflow_dispatch",
-        "issue_create", "pr_close", "issue_reopen", "pr_edit", "tag_create", "release_create",
+        "issue_create", "pr_close", "issue_reopen", "pr_edit", "comment_edit", "tag_create", "release_create",
         "issue_label",
     ];
 

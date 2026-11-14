@@ -2,6 +2,8 @@
 # 面一致锁（§9 ↔ CLI 写动词表 ↔ MCP actions）/ push 逻辑锁。不碰 vault、不弹 gate、
 # 不打真 API，runner 可直接跑；红线不变——live 行为（vault/302/真 API）仍靠人工 dogfood。
 # exe 用 find 定位而非硬编码 TFM 路径：TFM/RID 变更不破 CI。
+# v2.38 multi-target 后：aot job 需 -f 钉住 windows TFM（否则双 TFM 全发且 find 产物不确定）；
+# selftest job 的 find 加 -path '*windows*' 同理；新增 selftest-linux job（net10.0 面）。
 name: ci
 
 on:
@@ -26,8 +28,26 @@ jobs:
       - name: selftest (JIT)
         shell: bash
         run: |
-          exe="$(find bin/Release -name sluice.exe | head -1)"
+          exe="$(find bin/Release -path '*windows*' -name sluice.exe | head -1)"
           [ -n "$exe" ] || { echo "!! 未找到 sluice.exe"; exit 1; }
+          "$exe" selftest
+
+  # v2.38 Linux 移植批：Linux 面同套 selftest（multi-target 后第二平台进回归防线）。
+  # 纯函数锁全离线；LinuxPortChecks 在 Linux TFM 下按平台分支断言（hosts.yml 候选/名单源）。
+  selftest-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet build -c Release -f net10.0
+      - name: selftest (JIT, linux)
+        shell: bash
+        run: |
+          exe="$(find bin/Release -name sluice -type f | head -1)"
+          [ -n "$exe" ] || { echo "!! 未找到 sluice"; exit 1; }
+          chmod +x "$exe"
           "$exe" selftest
 
   # master 专属：AOT 是发布形态，"每批 selftest PASS JIT+AOT"双跑纪律由此自动化；
@@ -41,7 +61,7 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - run: dotnet publish -c Release -r win-x64
+      - run: dotnet publish -c Release -f net10.0-windows10.0.26100 -r win-x64
       - name: 戳校验 + selftest (AOT)
         shell: bash
         run: |

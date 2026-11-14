@@ -1,12 +1,12 @@
 # Sluice — GitHub 写操作事件闸门
 
-一个 Windows 单文件 CLI（.NET 10 NativeAOT，~19MB，零第三方运行时依赖）：把 agent/人的一切
-GitHub **写**操作收进一扇「批准窗 + Windows Hello（可选）+ 审计」的闸门，同时把环境里的
-旁门凭据封堵干净——**没有批准事件，就没有写动作**。
+一个 Windows / Linux 单文件 CLI（.NET 10 NativeAOT，~19–25MB，零第三方运行时依赖）：把 agent/人的一切
+GitHub **写**操作收进一扇「批准窗 + 同意因子（Windows Hello / Linux 口令，可选降级）+ 审计」的闸门，
+同时把环境里的旁门凭据封堵干净——**没有批准事件，就没有写动作**。
 
 ```
 agent ──sluice <verb> / MCP github_write──▶ 批准窗（全文所见 + 注入输入过滤 + 倒计时）
-                          └─批准▶ Hello 指纹（或静默 vault 点击即批）▶ vault 解 PAT ▶ REST 执行 ▶ audit.jsonl
+                          └─批准▶ 同意因子（Hello 指纹 / Linux 口令；静默 vault 点击即批）▶ vault 解 PAT ▶ REST 执行 ▶ audit.jsonl
 旁路 ──git push / gh / curl──▶ seal 封堵（无凭据可用）+ notice 指引回到 sluice
 ```
 
@@ -14,7 +14,7 @@ agent ──sluice <verb> / MCP github_write──▶ 批准窗（全文所见 +
 
 1. **批准你所见**——弹窗展示将被发布的全文/替换对象/丢弃清单，长文必须滚到底才亮批准键；
 2. **能力缺席优于拦截**——fine-grained PAT 只授权指定仓库，本地配置不是墙，服务端 403 才是；
-3. **读有日志、写有审计**——`sluice api` / `sluice issue list` 读全量落审计，写操作逐条落 `%LOCALAPPDATA%\Sluice\audit.jsonl`。
+3. **读有日志、写有审计**——`sluice api` / `sluice issue list` 读全量落审计，写操作逐条落审计文件（Windows `%LOCALAPPDATA%\Sluice\audit.jsonl`；Linux `~/.local/share/Sluice/audit.jsonl`）。
 
 ## 适用场景：先判断你需不需要
 
@@ -35,26 +35,33 @@ agent ──sluice <verb> / MCP github_write──▶ 批准窗（全文所见 +
 
 ## 快速上手
 
-**支持平台**：Windows 10/11 x64（已实现并实弹运行）。Linux 未实现——UI 与核心逻辑约 2/3 可移植、平台叶接口（IConsent/ISeal/ITokenStore）已预留，移植是填空题非重构（plan-lite §1.5）；macOS 不在目标内。
+**支持平台**：Windows 10/11 x64 + **Linux x64（v0.8.0 落地并 WSL 实弹）**——同源 multi-target，平台差异收口在叶：同意因子 Windows=Hello / Linux=批准窗口令（T1.5 等价：agent 点得动按钮打不出口令）；降级档 `config hello:false`（Windows=DPAPI 静默 / Linux=0600 文件，点击即批）；哨兵 Windows=schtasks+toast / Linux=systemd 用户定时器+notify-send。macOS 不在目标内（plan-lite §1.5）。
 
-前置：.NET 10 SDK + MSVC C++ 生成工具（NativeAOT 链接需要）；GitHub **fine-grained PAT**（不是 classic）。暂无预编译下载件，从源码构建：
+前置：.NET 10 SDK；Windows 另需 MSVC C++ 生成工具、Linux 另需 `clang zlib1g-dev libicu-dev` 及 X11 系运行库（`libx11-6 libxkbcommon-x11-0 libgbm1 libegl1 libfontconfig1`）；GitHub **fine-grained PAT**（不是 classic）。暂无预编译下载件，从源码构建：
 
 ```
-dotnet publish -c Release -r win-x64     # 产物在 bin/Release/net10.0-windows10.0.26100/win-x64/publish/sluice.exe
+dotnet publish -c Release -f net10.0-windows10.0.26100 -r win-x64   # Windows → …/win-x64/publish/sluice.exe
+dotnet publish -c Release -f net10.0 -r linux-x64                   # Linux/WSL → …/linux-x64/publish/sluice（AOT ~24.5MB，启动 ~16ms）
 ```
+
+Linux 批准窗需图形会话（X11/Wayland；WSL 用 WSLg）。哨兵需 systemd（WSL 在 `/etc/wsl.conf` 加 `[boot]` `systemd=true` 后 `wsl --shutdown` 重启）。
 
 初始化五步 + 验证（每步做什么见注释）：
 
 ```
-sluice.exe setup [--token-file F]         # ① 配置凭据（交互粘贴或 --token-file 读文件）→ 校验 → Windows Hello 建 vault
-sluice.exe seal --fix                     # ② 封堵侧门：凭据管理器 / gh / git-credentials / SSH / 环境变量 / repo-local helper 清查
+sluice setup [--token-file F]             # ① 配置凭据（交互粘贴或 --token-file 读文件）→ 校验 → 建 vault
+                                             （Windows 弹 Hello；Linux 设口令——此后每次批准在窗内输入，口令即解密因子）
+sluice seal --fix                         # ② 封堵侧门：凭据存储 / gh / git-credentials / netrc / SSH / 环境变量 / repo-local helper 清查
                                              + 置 GCM 无 UI 封堵键（credential.https://github.com.interactive=never——错门毫秒级死不弹登录窗）
-sluice.exe setup --install                # ③ 装 notice helper + 默认写规则片段进工作区 AGENTS.md（--no-snippet 跳过）
-sluice.exe sentinel-install               # ④ 哨兵：每 5 分钟 seal 预检，违规弹 Windows 通知（封 device flow"当场成功"窗）
-sluice.exe setup --install-hook [all]     # ⑤ 宿主 PreToolUse hook（ZCode/Claude Code）：agent 直推 git/gh 在执行前被 deny，
+sluice setup --install                    # ③ 装 notice helper + 默认写规则片段进工作区 AGENTS.md（--no-snippet 跳过）
+sluice sentinel-install                   # ④ 哨兵：每 5 分钟 seal 预检，违规弹通知（Windows 计划任务+toast / Linux systemd 定时器+notify-send；
+                                             封 device flow"当场成功"窗）
+sluice setup --install-hook [all]         # ⑤ 宿主 PreToolUse hook（ZCode/Claude Code）：agent 直推 git/gh 在执行前被 deny，
                                              秒回指路文案——首错代价从"登录窗+挂起"降为"一条消息"；幂等，exe 路径漂移自动刷新
-sluice.exe doctor                         # 验证：八项只读健康检查（版本戳/vault/config/seal 预检/notice/GCM 封堵键/哨兵/AGENTS 片段）全绿即就绪
+sluice doctor                             # 验证：八项只读健康检查（版本戳/vault/config/seal 预检/notice/GCM 封堵键/哨兵/AGENTS 片段）全绿即就绪
 ```
+
+（Windows 下二进制名 `sluice.exe`，Linux 为 `sluice`；下同。）
 
 **GCM 登录窗被封堵后，人要交互登录怎么办**（人的逃生口，只写进人文档——agent 可见文案刻意不教绕过）：
 单次放行 `git -c credential.https://github.com.interactive=always <命令>`；当前 shell 放行 `export GCM_INTERACTIVE=always`；
@@ -63,19 +70,19 @@ sluice.exe doctor                         # 验证：八项只读健康检查（
 日常运维（按需）：
 
 ```
-sluice.exe seal --pause N / --resume      # 暂停封堵 N 分钟（批准窗门控，期内直推开放）/ 立即恢复
-sluice.exe unseal                         # 卸载环境侧安装件（notice/哨兵/SSH 块；善后清单打印）
-sluice.exe setup --install-snippet        # 单独装/刷新 AGENTS.md 规则片段（标记块幂等，重跑=刷新，手改会被覆盖）
-sluice.exe selftest / --version           # 消息表自检 / 构建戳（时间 + sha[+dirty] + plan-lite 版本）——排障先看版本
+sluice seal --pause N / --resume      # 暂停封堵 N 分钟（批准窗门控，期内直推开放）/ 立即恢复
+sluice unseal                         # 卸载环境侧安装件（notice/哨兵/SSH 块；善后清单打印）
+sluice setup --install-snippet        # 单独装/刷新 AGENTS.md 规则片段（标记块幂等，重跑=刷新，手改会被覆盖）
+sluice selftest / --version           # 消息表自检 / 构建戳（时间 + sha[+dirty] + plan-lite 版本）——排障先看版本
 ```
 
-**首次写操作会发生什么**：任何写动词（如 `sluice comment …`）弹出批准窗——展示将发布的全文，长文滚到底才解锁批准键，倒计时内 Enter / Esc / 关窗均按拒绝处理；批准再过 Windows Hello 指纹（或静默 vault 的桌面点击即批），随后 REST 执行并在 `audit.jsonl` 落一行。读操作（`sluice api` / `sluice issue list`）零交互、不弹窗。被拒时消息自带事实句与 retry 语义（见文末 exit 表）。
+**首次写操作会发生什么**：任何写动词（如 `sluice comment …`）弹出批准窗——展示将发布的全文，长文滚到底才解锁批准键，倒计时内 Enter / Esc / 关窗均按拒绝处理；批准再过同意因子（Windows=Hello 指纹；Linux=窗内输入 vault 口令；静默降级 vault 则桌面点击即批），随后 REST 执行并在 `audit.jsonl` 落一行。读操作（`sluice api` / `sluice issue list`）零交互、不弹窗。被拒时消息自带事实句与 retry 语义（见文末 exit 表）。
 
 ### PAT 权限矩阵（fine-grained，按用到的动词开）
 
 | 动词 | Repository permissions |
 |---|---|
-| `comment` / `issue create` / `issue close` / `issue reopen` / `issue label` | **Issues: Read and write** |
+| `comment` / `comment edit` / `issue create` / `issue close` / `issue reopen` / `issue label` | **Issues: Read and write** |
 | `push` / `tag create` / `release create` | **Contents: Read and write**（tag 走 git/refs、release 走 releases 端点，同 Contents 面） |
 | `pr create` / `pr reopen` / `pr close` / `pr edit` / `review` | **Pull requests: Read and write** |
 | `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
@@ -94,6 +101,7 @@ sluice.exe selftest / --version           # 消息表自检 / 构建戳（时间
 | 命令 | 作用 | 备注 |
 |---|---|---|
 | `sluice comment --repo O/R --number N --body-file F` | 在 issue/PR 下评论 | 正文全文入窗 |
+| `sluice comment edit --repo O/R --comment-id ID --body-file F` | 修改已发表的评论 | 评论 id = 评论链接 `#issuecomment-<id>` 的数字部分；弹窗披露旧值→新值（写覆盖纪律）；只能改 token 所属账户自己的评论（GitHub 只允许作者改评） |
 | `sluice push --repo O/R --branch B [--repo-path D] [--base REF]` | 纯 REST 推送本地 HEAD | 新分支给 `--base origin/master` 做增量基点；**已有分支 + `--base` = 重放式更新**（原地替换旧头，弹窗明示丢弃清单）；`--force` 与主干推送永禁；多请求序列，调用方超时给 ≥300s；成功后 best-effort 回写本地 `refs/remotes/origin/<B>`（此前 REST 推送不回写，本地引用结构性陈旧） |
 | `sluice pr create --repo O/R --base B --head H --title T --body-file F` | 建 PR | |
 | `sluice pr merge --repo O/R --number N [--method merge\|squash\|rebase] [--delete-head]` | 合并 PR | 服务端 merge，天然尊重分支保护与 required checks |
@@ -113,7 +121,7 @@ sluice.exe selftest / --version           # 消息表自检 / 构建戳（时间
 | `sluice api <api-path> [--auth]` | GET 只读 | 公开数据匿名零交互；匿名撞 401/403/404/429 且静默 vault（hello:false）时自动带凭据复读一次（独立配额 5000/h，公开库几乎总能读通）；`--auth` 首请求即带凭据；logs 等端点 302→CDN 自动跟随（仅 GitHub 域 ≤3 跳）；每次调用入读审计 |
 | `sluice status <receipt>` | 查 MCP pending 请求的终态 | `github_write` 返回 code=23 时附 receipt（16 位）；拒绝理由原文在此查询；无副作用可间隔重查，终态出现前勿重发同一写操作 |
 | `sluice mcp [--print-config]` | MCP 前门（stdio JSON-RPC） | 单一写工具 `github_write`（action 与上表写动词一一对应）+ `sluice_status`（按 receipt 查终态）；spawn-child 拓扑——server 进程不持凭据，每次调用 spawn CLI 子进程走完整闸门；`--print-config` 打印宿主接入配置 |
-| `sluice seal [--fix]` / `sluice setup --install` / `sluice sentinel-install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 装哨兵 / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice）；哨兵移除 `schtasks /Delete /TN "Sluice Sentinel" /F` |
+| `sluice seal [--fix]` / `sluice setup --install` / `sluice sentinel-install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 装哨兵 / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice）；哨兵移除——Windows `schtasks /Delete /TN "Sluice Sentinel" /F`，Linux `systemctl --user disable --now sluice-sentinel.timer` |
 | `sluice setup --install-hook [zcode\|claude-code\|all]` / `--uninstall-hook` / `sluice hook-guard` | 宿主 PreToolUse hook 装/卸 / 宿主内部调用 | hook 在**执行前** deny 直推 git/gh 写形态（fail-open 糖，封堵墙仍是 seal/notice/gate）；**暂停窗内仍拦**（agent 直推会撞恢复交互的 GCM 重演挂起；人交互登录走自己终端不经宿主）；deny 落审计（op=hook_guard）；宿主会话启动时读配置——装完对新会话生效；幂等 + exe 路径漂移刷新；unseal 善后清单含此项 |
 
 推送序列的 5xx（blob/tree/commit，内容寻址幂等）自动退避重试（2s/8s×3）；update-ref 永不自动重试。
@@ -154,11 +162,11 @@ sluice.exe selftest / --version           # 消息表自检 / 构建戳（时间
 而「自动把 git push 改写走 sluice」= 让错误路径偶尔能走通，属被砍的 shim 一族，不做（见 plan-lite §2）。
 封堵负责「绕不过」，发现靠片段 + 失败信息 + 你偶尔出手关掉登录窗。
 
-## config.json（`%LOCALAPPDATA%\Sluice\config.json`）
+## config.json（Windows `%LOCALAPPDATA%\Sluice\config.json`；Linux `~/.local/share/Sluice/config.json`）
 
 | 键 | 默认 | 语义 |
 |---|---|---|
-| `"hello": false` | `true` | **静默 vault（SLCV2/DPAPI）**：批准点击即批准事件，不再弹 Windows Hello；`--auth` 读零交互。旧 vault 在下次批准时自动迁移（= 最后一次指纹）。**回滚须改回 `true` 并重跑 `setup`**（只改配置不恢复指纹）。降级语义：同用户进程可静默解密，见 plan-lite §14 L1 |
+| `"hello": false` | `true` | **静默 vault**：批准点击即批准事件，不再要求同意因子（Windows=SLCV2/DPAPI，Linux=SLCF1/0600 文件）；`--auth` 读零交互。旧 vault 在下次批准时自动迁移（= 最后一次指纹/口令）。**回滚须改回 `true` 并重跑 `setup`**（只改配置不恢复到场因子）。降级语义：同用户进程可静默读取 vault，见 plan-lite §14 L1 |
 | `"gate_timeout_sec"` | 60 | 批准窗倒计时，夹 [30,600] |
 | `"mcp_pending_sec"` | 15 | MCP 前门未决等待上限，夹 [5,55]——必须小于宿主工具超时（实测 ~30s），到点回 exit 23 + receipt |
 | `"proxy"` | 无 | 显式非 MITM 代理隧道（如 `http://127.0.0.1:7890`） |

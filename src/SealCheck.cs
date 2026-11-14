@@ -90,29 +90,36 @@ internal static partial class SealCheck
         }
     }
 
-    // ---------- 预检（§6：凭据管理器 / gh hosts.yml / .git-credentials / 环境变量 / SSH / gitconfig） ----------
+    // ---------- 预检（§6：凭据管理器 / gh hosts.yml / .git-credentials / netrc / 环境变量 / SSH / gitconfig） ----------
 
     public static List<string> Run(string? repoHint = null)
     {
         if (SealPause.Active) return []; // 暂停窗口内：封堵解除（§6 seal --pause）；到期由 seal 自愈/哨兵恢复
         var v = new List<string>();
 
+#if WINDOWS
         foreach (var (target, _) in CredEnum())
             if (target.Contains("github", StringComparison.OrdinalIgnoreCase))
                 v.Add($"凭据管理器：{target}");
+#endif
 
-        var hostsYml = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "GitHub CLI", "hosts.yml");
-        if (File.Exists(hostsYml))
+        foreach (var hostsYml in GhHostsCandidates())
         {
+            if (!File.Exists(hostsYml)) continue;
             var txt = File.ReadAllText(hostsYml);
             if (txt.Contains("oauth_token", StringComparison.Ordinal))
-                v.Add("gh：hosts.yml 含 oauth_token（gh 已登录）");
+                v.Add($"gh：{hostsYml} 含 oauth_token（gh 已登录）");
         }
 
         var gitCred = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".git-credentials");
         if (File.Exists(gitCred))
             v.Add("git：~/.git-credentials 明文凭据文件存在");
+
+        // v2.38 Linux 批：netrc 是文档从未覆盖的真侧门（curl -n / ftp 一族直读明文凭据）；
+        // 仅当含 github 条目才算违规——多用途文件，不做自动处置（同 SSH 键的"检测不删"定性）。
+        var netrc = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".netrc");
+        if (File.Exists(netrc) && File.ReadAllText(netrc).Contains("github", StringComparison.OrdinalIgnoreCase))
+            v.Add("netrc：~/.netrc 含 github 条目（curl -n 一族可直读明文凭据）——请人工移除该条目");
 
         foreach (var name in new[] { "GH_TOKEN", "GITHUB_TOKEN" })
             if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(name)))
@@ -127,11 +134,42 @@ internal static partial class SealCheck
         return v;
     }
 
+    /// <summary>gh hosts.yml 候选路径（v2.38 Linux 批）：Windows gh 写 %APPDATA%\GitHub CLI\，
+    /// Linux gh 写 ~/.config/gh\（ApplicationData 的 BCL 映射恰是 ~/.config，拼 "gh" 即命中）。
+    /// 纯路径函数，selftest 锁。</summary>
+    internal static List<string> GhHostsCandidates()
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        return
+        [
+            Path.Combine(appData, "GitHub CLI", "hosts.yml"),
+            Path.Combine(appData, "gh", "hosts.yml"),
+        ];
+    }
+
+    /// <summary>非阻断警示（v2.38 Linux 批）：不构成违规但值得主人知道的疑点面。
+    /// 与 Run() 的契约不同——Advisories 不拦写、不进 exit 7，只在 seal 展示与 doctor 出现。</summary>
+    public static List<string> Advisories()
+    {
+        var a = new List<string>();
+#if !WINDOWS
+        // §14 L16：libsecret/keyring 枚举缓办——存在性警示代替枚举。keyring 目录是桌面 Linux
+        // 常态（wifi 等），做成违规会全面误拦写操作，故走 advisory 通道。
+        var keyringDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "keyrings");
+        if (Directory.Exists(keyringDir))
+            a.Add($"keyring：{keyringDir} 存在——Linux 版暂不枚举 keyring 条目（§14 L16 缓办项）；如存有 GitHub 凭据请手动清理");
+#endif
+        return a;
+    }
+
     [GeneratedRegex(@"(ghp_[A-Za-z0-9]{8}|gho_[A-Za-z0-9]{8}|github_pat_[A-Za-z0-9_]{8})")]
     private static partial Regex TokenPattern();
 
     // 凭据管理器走 CredEnumerateW：cmdkey /list 输出是本地化文本（中文系统为"目标:"），
     // 文本解析在非英文系统必坏（实测 2026-10-29）；API 拿到的本就是 Unicode 目标名。
+    // v2.38 起整块圈在 WINDOWS 符号内——Linux 无凭据管理器，等价面（keyring）见 Advisories/L16。
+#if WINDOWS
     private static List<(string Target, int Type)> CredEnum()
     {
         var result = new List<(string, int)>();
@@ -181,6 +219,7 @@ internal static partial class SealCheck
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CredDeleteW(string targetName, int type, int flags);
+#endif
 
     private static string SshDir => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ssh");
@@ -333,17 +372,18 @@ internal static partial class SealCheck
     {
         var done = new List<string>();
 
+#if WINDOWS
         foreach (var (target, type) in CredEnum())
             if (target.Contains("github", StringComparison.OrdinalIgnoreCase))
             {
                 var ok = CredDeleteW(target, type, 0);
                 done.Add(ok ? $"凭据管理器：已删除 {target}" : $"凭据管理器：删除失败（{target}）——请手动删除");
             }
+#endif
 
-        var hostsYml = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "GitHub CLI", "hosts.yml");
-        if (File.Exists(hostsYml))
+        foreach (var hostsYml in GhHostsCandidates())
         {
+            if (!File.Exists(hostsYml)) continue;
             var bak = hostsYml + ".sluice-bak";
             File.Move(hostsYml, bak, overwrite: true);
             done.Add($"gh：hosts.yml 已改名 → {bak}（gh 已登出；如需恢复改名回来）");
@@ -364,6 +404,10 @@ internal static partial class SealCheck
         // 如实指路人工编辑 + 复查。此前无此分支 = "文案让跑 --fix、fix 修不了、复查永 7" 的指令环
         if (violations.Any(x => x.StartsWith("repo-local：", StringComparison.Ordinal)))
             done.Add("repo-local credential.helper：无法自动处理——按上方 ✗ 行给出的 .git/config 路径人工移除/收窄 helper 后，重跑 sluice seal 复查");
+
+        // v2.38：netrc 与环境变量同定性——多用途/继承面，无法安全自动改，指路人工处置
+        if (violations.Any(x => x.StartsWith("netrc：", StringComparison.Ordinal)))
+            done.Add("netrc：~/.netrc 是多用途文件不自动改——人工移除 github 相关条目后重跑 sluice seal 复查");
 
         done.Add("环境变量 GH_TOKEN/GITHUB_TOKEN：无法自动清除（随父进程继承）——请从 shell profile / IDE 配置移除");
         done.Add("VS Code GitHub session（如有）：请在 VS Code 内手动登出（仅检测，不自动处理）");
