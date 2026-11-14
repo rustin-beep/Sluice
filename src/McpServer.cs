@@ -107,7 +107,7 @@ internal static class McpServer
     /// v2.11 将 comment 更名 pr_comment——§9.7"与 §9 写 op 一一对应"的字面承诺自此零例外）。</summary>
     internal static readonly string[] Actions =
     [
-        "pr_comment", "push", "pr_create", "pr_merge", "pr_reopen", "pr_close", "pr_edit",
+        "pr_comment", "comment_edit", "push", "pr_create", "pr_merge", "pr_reopen", "pr_close", "pr_edit",
         "issue_create", "issue_close", "issue_reopen", "pr_review",
         "tag_create", "release_create", "branch_delete", "workflow_dispatch", "issue_label",
     ];
@@ -116,6 +116,7 @@ internal static class McpServer
     internal static readonly Dictionary<string, string[]> AllowedFields = new()
     {
         ["pr_comment"]        = ["repo", "number", "body"],
+        ["comment_edit"]      = ["repo", "comment_id", "body"],
         ["push"]              = ["repo", "branch", "repo_path", "base"],
         ["pr_create"]         = ["repo", "base", "head", "title", "body"],
         ["pr_merge"]          = ["repo", "number", "method", "delete_head"],
@@ -139,7 +140,7 @@ internal static class McpServer
     /// </summary>
     private const string ToolDescription =
         """
-        GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论、推送、创建/合并/重开/关闭/编辑 PR、
+        GitHub 写操作闸门（Sluice）。本机所有 GitHub 写操作——评论（发表与修改）、推送、创建/合并/重开/关闭/编辑 PR、
         评审 PR、创建/关闭/重开 issue、设置标签、打 tag、发布 release、删除分支、触发 workflow——必须且只能经此
         工具执行；环境内无其他可用凭据，直接 git push / gh / GitHub API 调用必然失败且违反纪律。
         调用会弹出本机批准窗口，由用户人工批准或拒绝（无响应自动拒绝）。返回的 text 是终态说明，
@@ -161,10 +162,11 @@ internal static class McpServer
           "type": "object",
           "required": ["action", "repo"],
           "properties": {
-            "action":       { "type": "string", "enum": ["pr_comment","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","tag_create","release_create","branch_delete","workflow_dispatch","issue_label"], "description": "写操作类型" },
+            "action":       { "type": "string", "enum": ["pr_comment","comment_edit","push","pr_create","pr_merge","pr_reopen","pr_close","pr_edit","issue_create","issue_close","issue_reopen","pr_review","tag_create","release_create","branch_delete","workflow_dispatch","issue_label"], "description": "写操作类型" },
             "repo":         { "type": "string", "description": "目标仓库 owner/name" },
             "number":       { "type": "integer", "description": "issue/PR 编号（pr_comment/pr_merge/pr_reopen/pr_close/pr_edit/issue_close/issue_reopen/pr_review/issue_label 必填）" },
-            "body":         { "type": "string", "description": "正文全文（pr_comment/pr_create/issue_create/release_create 必填；pr_edit/pr_review 可选）" },
+            "comment_id":   { "type": "integer", "description": "评论 id（comment_edit 必填——评论链接 #issuecomment-<id> 的数字部分；新正文整体替换该评论全文，只能改本 token 账户发表的评论）" },
+            "body":         { "type": "string", "description": "正文全文（pr_comment/comment_edit/pr_create/issue_create/release_create 必填；pr_edit/pr_review 可选）" },
             "title":        { "type": "string", "description": "标题（pr_create/issue_create 必填；pr_edit 可选——勘误）" },
             "labels":       { "type": "array", "items": { "type": "string" }, "description": "标签名清单（issue_create 可选：创建时携带；issue_label 必填：整组替换——现有标签凡不在清单者都将被摘除，批准窗会列摘除清单；名字须为仓库已有标签，未知名预检拦下）" },
             "base":         { "type": "string", "description": "pr_create：base 分支名；push：增量基点/重放式更新基点（如 origin/master）" },
@@ -457,6 +459,11 @@ internal static class McpServer
                 Opt("--repo", Str("repo")); Opt("--number", Num("number"));
                 if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
                 break;
+            case "comment_edit":
+                list.AddRange(["comment", "edit"]);
+                Opt("--repo", Str("repo")); Opt("--comment-id", Num("comment_id"));
+                if (Has("body")) { list.Add("--body-file"); list.Add(bodyPath); }
+                break;
             case "push":
                 list.Add("push");
                 Opt("--repo", Str("repo")); Opt("--branch", Str("branch"));
@@ -584,7 +591,7 @@ internal static class McpServer
     private static (string Text, int Code) SpawnCli(string[] argv)
     {
         var receipt = Guid.NewGuid().ToString("N")[..16];
-        var psi = new ProcessStartInfo(Environment.ProcessPath ?? "sluice.exe")
+        var psi = new ProcessStartInfo(Environment.ProcessPath ?? Platform.BinName)
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
@@ -706,7 +713,7 @@ internal static class McpServer
 
     private static void PrintConfig()
     {
-        var exe = Environment.ProcessPath ?? "sluice.exe";
+        var exe = Environment.ProcessPath ?? Platform.BinName;
         // 手动转义（路径只需 \\ 与 "）：JsonSerializer.Serialize<T> 在 NativeAOT 下有 IL3050（零警告纪律）
         var exeJson = "\"" + exe.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         var cfg = $$"""

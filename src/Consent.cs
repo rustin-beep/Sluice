@@ -1,3 +1,4 @@
+#if WINDOWS
 using Windows.Security.Cryptography;
 
 namespace Sluice;
@@ -6,18 +7,8 @@ namespace Sluice;
 /// IConsent 的 Windows 叶（§1.5）：Hello KeyCredential 签名。
 /// P7 实测：NCRYPT_SILENT_FLAG 下签名返回 NTE_SILENT_CONTEXT——静默签名不存在，
 /// RequestSignAsync 的 UI 门即批准事件；签名同时是 vault 解密因子（§5）。
+/// v2.38 起整文件圈在 WINDOWS 符号内（WinRT 投影随 -windows TFM）；接口与异常在 Consent.Shared.cs。
 /// </summary>
-internal interface IConsent
-{
-    Task<byte[]?> SignAsync(byte[] challenge);
-}
-
-/// <summary>
-/// vault 文件在而 Hello 密钥缺失/不可用（系统重置 Hello 数据、更换账户等）。
-/// 与"用户取消"（null 返回）分开归因：这不是用户意愿，重试无用，需重跑 setup。
-/// </summary>
-public sealed class VaultKeyMissingException(string msg) : Exception(msg);
-
 internal sealed class HelloConsent : IConsent
 {
     private const string KeyName = "SluiceVault";
@@ -62,3 +53,4 @@ internal sealed class HelloConsent : IConsent
         return sig;
     }
 }
+#endif

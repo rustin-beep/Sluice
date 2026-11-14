@@ -26,6 +26,24 @@ internal static class Program
         catch { return "sluice build (unknown)"; }
     }
 
+    /// <summary>plan-lite 文档版本（v2.38 起构建期注入：csproj 从 plan-lite.md 解析首个 vN.N-lite——
+    /// 与 CI 戳校验同正则口径；原 Program 硬编码在 v2.36/v2.37 两批连续漏更，人工步骤结构性会漏）。
+    /// 形如 "v2.39-lite"，掐 -lite 尾使用。v2.40 审阅 P3-1/P3-2：null 安全（不再靠异常落兜底，
+    /// 零新警告）；兜底恒哨兵 "v0.0"——键缺失/为空/异常（异常构建）时 --version 自报 v0.0，
+    /// CI 戳校验必红。兜底若与文档同值，注入失效会被断言放行——恰是 v2.36/v2.37 连红的形态。</summary>
+    internal static string PlanLiteVersion()
+    {
+        try
+        {
+            var v = System.Reflection.CustomAttributeExtensions
+                .GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>(typeof(Program).Assembly)
+                .FirstOrDefault(m => m.Key == "SluicePlanLite")?.Value?.Trim();
+            if (v is not null && v.EndsWith("-lite", StringComparison.Ordinal)) v = v[..^"-lite".Length];
+            return v is not null && v.Length >= 2 && v[0] == 'v' ? v : "v0.0";
+        }
+        catch { return "v0.0"; }
+    }
+
     [STAThread]
     public static int Main(string[] args)
     {
@@ -63,6 +81,7 @@ internal static class Program
     internal static readonly (string Verb, string Op, Func<string[], int> Run)[] WriteVerbs =
     [
         ("comment",          "pr_comment",       RunComment),
+        ("comment edit",     "comment_edit",     RunCommentEdit),
         ("push",             "push",             RunPush),
         ("pr create",        "pr_create",        RunPrCreate),
         ("pr merge",         "pr_merge",         RunPrMerge),
@@ -331,21 +350,25 @@ internal static class Program
 
     private static int Usage()
     {
-        Console.WriteLine("""
+        Console.WriteLine($$"""
             sluice — GitHub 写操作事件闸门
 
             用法：
-              sluice setup [--token-file F]             配置凭据（粘贴 fine-grained PAT + Windows Hello 建 vault）
+              sluice setup [--token-file F]             配置凭据（粘贴 fine-grained PAT + {{Platform.ConsentName}} 建 vault）
               sluice seal [--fix]                       侧门自查 / 封堵（凭据管理器、gh、git-credentials、SSH、环境变量）
-              sluice comment --repo O/R --number N --body-file F   在 issue/PR 下发表评论（经批准 + Hello）
+              sluice comment --repo O/R --number N --body-file F   在 issue/PR 下发表评论（经批准 + {{Platform.ConsentName}}）
+              sluice comment edit --repo O/R --comment-id ID --body-file F
+                                                        修改已发表的评论（经批准；--comment-id 为评论 id，
+                                                        即评论链接 #issuecomment-<id> 的数字部分；弹窗披露
+                                                        旧值→新值；只能改 token 所属账户自己的评论）
               sluice push --repo O/R --branch B [--repo-path D] [--base REF]
-                                                        推送本地 HEAD 到远端分支（REST，经批准 + Hello；
+                                                        推送本地 HEAD 到远端分支（REST，经批准 + {{Platform.ConsentName}}；
                                                         --base：新建分支给增量基点（如 origin/master）；
                                                         已有分支给新基点 = 重放式更新（原地替换旧头，
                                                         PR 原地 rebase 更新，弹窗明示丢弃清单）。
                                                         多请求序列，调用方超时应给 ≥300s）
               sluice pr create --repo O/R --base B --head H --title T --body-file F
-                                                        创建 PR（经批准 + Hello）
+                                                        创建 PR（经批准 + {{Platform.ConsentName}}）
               sluice pr merge --repo O/R --number N [--method merge|squash|rebase] [--delete-head]
                                                         合并 PR（服务端 merge API：天然尊重分支保护与
                                                         required checks；--delete-head 合并后删 head 分支）
@@ -425,7 +448,7 @@ internal static class Program
     {
         // 版本号来自 csproj <Version>（2026-10-30 评审：升版不打印等于没升）；构建戳另含时间+git sha(+dirty)
         var v = typeof(Program).Assembly.GetName().Version;
-        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite v2.35");
+        Console.WriteLine($"sluice v{v?.ToString(3) ?? "?"} · {BuildStamp} · plan-lite {PlanLiteVersion()}");
         return 0;
     }
 
@@ -594,7 +617,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("push", $"{repo}@{branch}", Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "consent_failed", consent: "hello_failed");
+                Audit.Append("push", repo, AuditTarget(plan), plan.HeadSha[..8], "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("push", $"{repo}@{branch}"));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -909,7 +932,7 @@ internal static class Program
     private static (int St, System.Text.Json.Nodes.JsonNode? Json, bool Authed) TryReadMeta(string path)
     {
         var (st, json) = ReadMetaOnce(path, null);
-        if (json is not null || st is not (403 or 404) || !TokenStore.Exists || !TokenStore.IsDpapiVault)
+        if (json is not null || st is not (403 or 404) || !TokenStore.Exists || !TokenStore.IsSilentVault)
             return (st, json, Authed: false);
         try
         {
@@ -975,7 +998,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout(op, msgTarget, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append(op, repo, auditTarget, sha, "consent_failed", consent: "hello_failed");
+                Audit.Append(op, repo, auditTarget, sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed(op, msgTarget));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -1150,7 +1173,7 @@ internal static class Program
                 return ExitCodes.Timeout;
 
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("pr_comment", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("pr_comment", repo, $"#{number}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("pr_comment", target));
                 return ExitCodes.ConsentFailed;
 
@@ -1220,6 +1243,84 @@ internal static class Program
         return ExitCodes.BadRequest;
     }
 
+    // ---------- sluice comment edit（V1.8 · v2.39：评论勘误——pr_comment 发表形态的修改闭环，
+    //             agent 勘误此前只能网页。写覆盖披露 pr_edit 同族：匿名预读旧正文，
+    //             弹窗列旧值摘要（字符数+指纹+120 字预览）→新值全文，指纹混入新旧两侧） ----------
+
+    private static int RunCommentEdit(string[] args)
+    {
+        string? repo = null, bodyFile = null;
+        long commentId = 0;
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? Next() => i + 1 < args.Length ? args[++i] : null;
+            switch (args[i])
+            {
+                case "--repo":
+                    repo = Next();
+                    if (repo is null) return ErrMissing("comment_edit", "--repo");
+                    break;
+                case "--comment-id":
+                    var v = Next();
+                    if (v is null || !long.TryParse(v, out commentId) || commentId <= 0)
+                        return ErrBad("--comment-id 需要正整数（评论 id——评论链接 #issuecomment-<id> 的数字部分）");
+                    break;
+                case "--body-file":
+                    bodyFile = Next();
+                    if (bodyFile is null) return ErrMissing("comment_edit", "--body-file");
+                    break;
+                default:
+                    return ErrUnknownArg(args[i]);
+            }
+        }
+        if (repo is null || commentId <= 0 || bodyFile is null)
+            return ErrBad("comment_edit 缺少 --repo / --comment-id / --body-file（示例：sluice comment edit --repo owner/repo --comment-id 1234567890 --body-file x.md；评论 id 为评论链接 #issuecomment-<id> 的数字部分）");
+        if (!IsRepoName(repo)) return ErrBad($"--repo 应为 owner/name 形式，收到：{repo}");
+        if (!File.Exists(bodyFile))
+            return ErrBad($"--body-file 不存在：{bodyFile}");
+        if (!TryPreflight("comment_edit", repo, $"comment:{commentId}", out var pre)) return pre;
+
+        string newBody;
+        try { newBody = File.ReadAllText(bodyFile, System.Text.Encoding.UTF8); }
+        catch (Exception ex) { return ErrBad($"无法读取 --body-file：{ex.Message}"); }
+
+        // 写覆盖披露（pr_edit 同族）：旧正文必须露面——匿名预读（TryReadMeta 单源，静默 vault 复读同沾）；
+        // 评论 id 全局唯一，归属的 issue/PR 由预读 html_url 披露（v2.40 审阅 P3-9：只亮 #issuecomment-<id>
+        // 时批准人看不见挂在哪个编号下）
+        var (metaSt, cm, _) = TryReadMeta($"repos/{repo}/issues/comments/{commentId}");
+        string? oldBody = cm?["body"]?.GetValue<string>();
+        string? oldUrl = cm?["html_url"]?.GetValue<string>();
+        var warn404 = metaSt == 404
+            ? "\n⚠ 匿名预读 404：评论不存在，或私有库对匿名读不可见——两者不可区分，存在性由服务端执行时判定"
+            : "";
+        var oldDigest = oldBody is null ? "不可读或为空" : $"{oldBody.Length} 字符，指纹 {Sha8(oldBody)}";
+        var oldPreview = oldBody is { Length: > 0 }
+            ? (oldBody.Length <= 120 ? oldBody : oldBody[..120] + "……") : "（空）";
+        var sha = Sha8($"{repo}#comment{commentId}:edit:{(oldBody is null ? "-" : Sha8(oldBody))}|{Sha8(newBody)}");
+        var target = $"{repo}#issuecomment-{commentId}";
+        var window = $"""
+            评论：{target}（归属：{oldUrl ?? "不可读——挂在哪个 issue/PR 下请自行核对"}）
+            正文（旧，{oldDigest}）：{oldPreview}
+            正文（新，{newBody.Length} 字符）：
+            {newBody}{warn404}
+            """;
+        var patch = new System.Text.Json.Nodes.JsonObject();
+        patch["body"] = newBody;
+        return RunGatedOp("comment_edit", repo, $"comment:{commentId}", target, sha, window,
+            metaSt == 404 ? "匿名预读 404：评论不存在或私有库匿名不可见，存在性由服务端执行时终判"
+                : oldBody is null ? "旧正文不可读（旧值无法披露），编辑对象请自行核对" : null,
+            a => ExecuteGated(a, "comment_edit", repo, $"comment:{commentId}", target, sha,
+                HttpMethod.Patch, $"repos/{repo}/issues/comments/{commentId}", patch.ToJsonString(),
+                b => GitHubApi.HtmlUrlOf(b) ?? target,
+                (st, detail) =>
+                {
+                    Audit.Append("comment_edit", repo, $"comment:{commentId}", sha,
+                        st == 403 ? "forbidden" : st == 404 ? "not_found" : "comment_edit_rejected",
+                        consent: TokenStore.ConsentChannel, result: detail);
+                    Messages.Write(Messages.CommentEditRejected(target, detail));
+                }));
+    }
+
     // ---------- sluice api（§9 v2.2 读通道：GET-only，默认匿名，读审计落行） ----------
 
     private static int RunApi(string[] args)
@@ -1281,11 +1382,13 @@ internal static class Program
             return false;
         }
         byte[]? sig = null;
-        if (!TokenStore.IsDpapiVault)
+        if (!TokenStore.IsSilentVault)
         {
             try
             {
-                sig = new HelloConsent().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
+                // v2.38 平台叶：Windows=Hello（控制台进程弹 WinRT 凭据 UI）；Linux=终端掩码口令
+                //（用户自己的终端，同信任级；stdin 被重定向时读到什么都验不过——fail-closed）
+                sig = ConsentLeaf.Create().SignAsync(TokenStore.PeekChallenge()).GetAwaiter().GetResult();
             }
             catch (VaultKeyMissingException ex)
             {
@@ -1296,7 +1399,7 @@ internal static class Program
             }
             if (sig is null)
             {
-                Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: "hello_failed");
+                Audit.Append("api_read", "api.github.com", path, null, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed(op, path));
                 exitCode = ExitCodes.ConsentFailed;
                 return false;
@@ -1403,7 +1506,7 @@ internal static class Program
     {
         var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
         if (token is not null || notSent || st == 0 || !AnonReadShouldFallback(st)
-            || !TokenStore.Exists || !TokenStore.IsDpapiVault)
+            || !TokenStore.Exists || !TokenStore.IsSilentVault)
             return (st, body, notSent, reason, token, Fallback: false);
         Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B anon");
         Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {st}），静默 vault 带凭据复读一次（走独立配额）");
@@ -1730,7 +1833,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("pr_create", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("pr_create", repo, $"{@base}←{head}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("pr_create", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -1930,7 +2033,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("pr_merge", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("pr_merge", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("pr_merge", repo, $"#{number}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("pr_merge", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -2167,7 +2270,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("branch_delete", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("branch_delete", repo, branch, sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("branch_delete", repo, branch, sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("branch_delete", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -2372,7 +2475,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("pr_reopen", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("pr_reopen", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("pr_reopen", repo, $"#{number}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("pr_reopen", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -2556,7 +2659,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("issue_close", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("issue_close", repo, $"#{number}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("issue_close", repo, $"#{number}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("issue_close", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
@@ -3450,7 +3553,7 @@ internal static class Program
                 Messages.Write(Messages.Timeout("workflow_dispatch", target, Gate.TimeoutSeconds));
                 return ExitCodes.Timeout;
             case Gate.Outcome.ConsentFailed:
-                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "consent_failed", consent: "hello_failed");
+                Audit.Append("workflow_dispatch", repo, $"{workflow}@{@ref}", sha, "consent_failed", consent: TokenStore.ConsentFailedLabel);
                 Messages.Write(Messages.ConsentFailed("workflow_dispatch", target));
                 return ExitCodes.ConsentFailed;
             case Gate.Outcome.VaultKeyMissing vk:
