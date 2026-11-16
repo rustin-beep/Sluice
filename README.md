@@ -118,7 +118,7 @@ sluice selftest / --version           # 消息表自检 / 构建戳（时间 + s
 | `sluice release create --repo O/R --tag V --body-file F [--target <分支\|sha>] [--name N] [--prerelease]` | 发布 release | target 以批准期解析的 sha 锚定（杜绝隐式建 tag 的 TOCTOU）；发布即通知 watchers |
 | `sluice workflow dispatch --repo O/R --workflow W --ref B [--inputs-file F]` | 手动触发 workflow | W=id 或 .yml 文件名；F=JSON 对象对应 inputs；需 PAT Actions:RW |
 | `sluice branch delete --repo O/R --branch B` | 删远端分支 ref | 弹窗会披露「将连带关闭其上的开放 PR」；commits 保留可重建 |
-| `sluice api <api-path> [--auth]` | GET 只读 | 公开数据匿名零交互；匿名撞 401/403/404/429 且静默 vault（hello:false）时自动带凭据复读一次（独立配额 5000/h，公开库几乎总能读通）；`--auth` 首请求即带凭据；logs 等端点 302→CDN 自动跟随（仅 GitHub 域 ≤3 跳）；每次调用入读审计 |
+| `sluice api <api-path> [--auth] [--accept <media-type>] [--output <文件> \| --binary] [--allow-mitm-read]` | GET 只读 | 公开数据匿名零交互；匿名撞 401/403/404/429 且静默 vault（hello:false）时自动带凭据复读一次（独立配额 5000/h，公开库几乎总能读通）；`--auth` 首请求即带凭据；logs/tarball 等 302→CDN/codeload 自动跟随（仅 GitHub 域 ≤3 跳）；`--output`/`--binary` 流式下载（大文件不攒内存；`--output` 临时文件原子替换，失败不留半截）；终端遇二进制默认拒绝；release asset 加 `--accept application/octet-stream`；`--allow-mitm-read` 为最后手段（仅匿名读、需 config `allow_mitm_read:true`、信任 Steam++ 本地证书、永不用于写，审计记 `mitm:Steam++`）；每次调用入读审计（真实字节数 + final host） |
 | `sluice status <receipt>` | 查 MCP pending 请求的终态 | `github_write` 返回 code=23 时附 receipt（16 位）；拒绝理由原文在此查询；无副作用可间隔重查，终态出现前勿重发同一写操作 |
 | `sluice mcp [--print-config]` | MCP 前门（stdio JSON-RPC） | 单一写工具 `github_write`（action 与上表写动词一一对应）+ `sluice_status`（按 receipt 查终态）；spawn-child 拓扑——server 进程不持凭据，每次调用 spawn CLI 子进程走完整闸门；`--print-config` 打印宿主接入配置 |
 | `sluice seal [--fix]` / `sluice setup --install` / `sluice sentinel-install` / `sluice selftest` / `sluice --version` | 自查 / 装 notice helper / 装哨兵 / 自检 / 版本戳 | notice 只作用 github.com（其他 host 的 helper 不受影响），卸载 `git config --global --unset-all credential.https://github.com.helper`；每次 git 索凭据触发都落审计（op=notice）；哨兵移除——Windows `schtasks /Delete /TN "Sluice Sentinel" /F`，Linux `systemctl --user disable --now sluice-sentinel.timer` |
@@ -169,9 +169,15 @@ sluice selftest / --version           # 消息表自检 / 构建戳（时间 + s
 | `"hello": false` | `true` | **静默 vault**：批准点击即批准事件，不再要求同意因子（Windows=SLCV2/DPAPI，Linux=SLCF1/0600 文件）；`--auth` 读零交互。旧 vault 在下次批准时自动迁移（= 最后一次指纹/口令）。**回滚须改回 `true` 并重跑 `setup`**（只改配置不恢复到场因子）。降级语义：同用户进程可静默读取 vault，见 plan-lite §14 L1 |
 | `"gate_timeout_sec"` | 60 | 批准窗倒计时，夹 [30,600] |
 | `"mcp_pending_sec"` | 15 | MCP 前门未决等待上限，夹 [5,55]——必须小于宿主工具超时（实测 ~30s），到点回 exit 23 + receipt |
-| `"proxy"` | 无 | 显式非 MITM 代理隧道（如 `http://127.0.0.1:7890`） |
+| `"proxy"` | 无 | 显式非 MITM 代理隧道（如 Clash/v2ray 的 `http://127.0.0.1:7890`）；也可用环境变量 `SLUICE_PROXY`。优先级：config > `SLUICE_PROXY` >（`use_env_proxy` ? 系统代理 : 直连） |
+| `"use_env_proxy"` | `false` | 显式选择是否继承系统/环境代理（`HTTPS_PROXY`/`HTTP_PROXY`/系统代理）。默认 `false`：避免 Steam++ 这类本地 TLS 终结者被默认带入 |
+| `"allow_mitm_read"` | `false` | **最后手段**：与 CLI `--allow-mitm-read` 组成双钥匙，只允许 `sluice api` 匿名读信任 Steam++/Watt Toolkit 本地证书；禁 `--auth`、禁静默 vault 回退、永不用于写。响应完整性由本地代理决定，审计记 `mitm_read` / `mitm:Steam++`（未命中时为 `mitm:attempt`） |
 
-网络防线内置：api.github.com 走 DoH 直连（系统 hosts 失效，与本地加速器共存）+ 证书 issuer 白名单（DigiCert/Sectigo/Microsoft TLS）。
+网络防线内置：`api.github.com` 走 DoH 直连（系统 hosts 失效）；`codeload`/CDN 保留系统解析（国内 hosts 加速 IP 可用），证书 issuer 白名单（DigiCert/Sectigo/Microsoft TLS）在 TLS 层兜底。
+
+**国内代理共存**：Steam++/Watt Toolkit 是本地 TLS MITM，Sluice 默认不信任其证书——写操作和 `--auth` 读的 token 会被代理读到。推荐让 Steam++ 继续服务 git/浏览器，Sluice 走 DoH 直连；若 API 直连被墙，给 Sluice 显式配置 Clash/v2ray 的 HTTP CONNECT（TLS 端到端），不要指向 Steam++ 的 `57307/443`。直连失败且代理是确定性证书问题时，消息为 exit 24 / `wait_user`：不要重试，按 issuer 指引处理后重跑。
+
+只有确实只剩 Steam++ 一条路时，才用**双钥匙匿名读例外**：`config.json` 设 `"allow_mitm_read": true`，并在命令加 `--allow-mitm-read`。它只对 `sluice api` 匿名读生效（不发送任何 token、不触发静默 vault 回退、永不用于写），响应完整性由本地代理决定；审计行带 `mitm_read` / `mitm:Steam++`。大文件仍建议 `--output`/`--binary` 流式下载。
 
 ## 出错怎么办（exit code 速查）
 
@@ -190,10 +196,11 @@ sluice selftest / --version           # 消息表自检 / 构建戳（时间 + s
 | 8 | 未初始化 / vault 损坏 | wait_user |
 | 9 | 凭据失效/越权 | wait_user（用户重跑 setup） |
 | 10 | 用法错/服务端拒（多数带正解指引） | after_fix |
-| 20 | 连接失败（请求未发出）/ api GET 超时 | retry_ok（30s 间隔） |
+| 20 | 连接失败（请求未发出）/ api GET 超时 / 流式下载半截中断 | retry_ok（30s 间隔；GET 远端无副作用） |
 | 21 | **结果未知**（请求已发出） | wait_user（先查证勿盲重发） |
 | 22 | GitHub 限流（服务端等待分钟数透传，"本次操作未执行"） | wait_until（按窗口等待后重跑） |
 | 23 | **MCP pending**（批准窗未决即回，非终态；附 receipt） | wait_until——约 15s 后 `sluice status <receipt>` / `sluice_status` 查终态；终态前重发会被去重并入原回执 |
+| 24 | **网络层确定性失败**（证书/本地 MITM；请求未发出） | wait_user——不要重试；按 issuer 指引关闭劫持或改用非 MITM 代理后重跑 |
 
 ## 更多
 

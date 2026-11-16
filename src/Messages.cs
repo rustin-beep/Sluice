@@ -23,6 +23,7 @@ internal static class ExitCodes
     public const int Unknown = 21;
     public const int RateLimitWait = 22;
     public const int PendingGate = 23; // v2.25：MCP 前门"批准窗未决"——人还在决策，非终态
+    public const int EnvBlocked = 24;  // v2.41：网络层确定性失败（证书/本地 MITM）——wait_user，禁止重试
 }
 
 internal static class Messages
@@ -227,14 +228,24 @@ internal static class Messages
     /// <summary>v2.31：http_failed 收割入族——同步路径本就是 20/retry_ok（请求未发出、无任何副作用，
     /// "间隔 30 秒可重试"），收割此前落 StatusOther/21/wait_user"勿重发"，同一决策两条路径指引相反
     /// （E0 实弹回执 14fb4b0f：agent 收割到 wait_user，而同步语义可直接重试）。detail 为 v2.31 起
-    /// 随审计行的网络层描述（≤v0.7.5 旧行仅 "not_sent"，渲染为空）。</summary>
-    public static Msg StatusHttpFailed(string op, string target, string detail) => new(
-        "[Sluice·终态]",
-        $"""
-        终态已查得：{op} → {target} 网络层失败，请求未发出，无任何副作用{(detail.Length > 0 ? $"（{detail}）" : "")}。
-        与同步路径同语义：可间隔 30 秒后重发同一操作；连续 3 次失败则报告用户。
-        """,
-        ExitCodes.HttpFailed, "retry_ok", true);
+    /// 随审计行的网络层描述（≤v0.7.5 旧行仅 "not_sent"，渲染为空）。
+    /// v2.41：证书/本地 MITM 是确定性错误——与同步路径同判，wait_user 且不引导重试。</summary>
+    public static Msg StatusHttpFailed(string op, string target, string detail) =>
+        GitHubApi.IsDeterministicNetFailure(detail)
+            ? new Msg(
+                "[Sluice·终态]",
+                $"""
+                终态已查得：{op} → {target} 网络层失败，请求未发出，无任何副作用——确定性环境错误（证书/本地 MITM）：重试结果相同，不要重发同一操作，也不要换命令重试；请转告用户处理后重跑。
+                详情：{detail}
+                """,
+                ExitCodes.EnvBlocked, "wait_user", true)
+            : new Msg(
+                "[Sluice·终态]",
+                $"""
+                终态已查得：{op} → {target} 网络层失败，请求未发出，无任何副作用{(detail.Length > 0 ? $"（{detail}）" : "")}。
+                与同步路径同语义：可间隔 30 秒后重发同一操作；连续 3 次失败则报告用户。
+                """,
+                ExitCodes.HttpFailed, "retry_ok", true);
 
     /// <summary>v2.32（审阅 P1 对偶面）：abandoned 收割——入闸后早退（ErrBad/BadRequest 一族
     /// 不落行，Main 的水位兜底补本行）。事实：未开窗、未执行、无任何副作用；after_fix 同
@@ -373,14 +384,29 @@ internal static class Messages
         """,
         ExitCodes.BadRequest, "after_fix", true);
 
-    // ---- http_failed（exit 20，retry=retry_ok；请求未发出） ----
-    public static Msg HttpFailed(string reason) => new(
-        "[Sluice]",
-        $"""
-        GitHub 连接失败（请求未发出，无任何副作用）：{reason}。
-        可间隔 30 秒后重试同一命令；连续 3 次失败则报告用户。
-        """,
-        ExitCodes.HttpFailed, "retry_ok", true);
+    // ---- http_failed（exit 20；请求未发出。抖动 retry_ok / 证书确定性 wait_user——v2.41） ----
+    public static Msg HttpFailed(string reason)
+    {
+        // 根因文本可能自带中文句号（.NET 本地化消息），模板再加一个会叠成"。。"。
+        var detail = reason.TrimEnd(' ', '。', '.');
+        return GitHubApi.IsDeterministicNetFailure(reason)
+            ? new Msg(
+                "[Sluice·终态]",
+                $"""
+                GitHub 连接失败（请求未发出，无任何副作用）：确定性环境错误（证书/本地 MITM）——重试结果相同，不要重试本操作，也不要换命令重试。
+                处理：关闭本地代理劫持，或改用非 MITM 隧道代理（config.json.proxy / SLUICE_PROXY）后由用户重跑。
+                详情：{detail}
+                """,
+                ExitCodes.EnvBlocked, "wait_user", true)
+            : new Msg(
+                "[Sluice]",
+                $"""
+                GitHub 连接失败（请求未发出，无任何副作用）：{detail}。
+                可间隔 30 秒后重试同一命令；连续 3 次失败则报告用户。
+                若使用本地代理：先确认代理进程仍在运行；HTTPS_PROXY / SLUICE_PROXY / config.json.proxy 指向死代理时重试不会好转。
+                """,
+                ExitCodes.HttpFailed, "retry_ok", true);
+    }
 
     // ---- unknown（exit 21，retry=wait_user；请求已发出但结果不明） ----
     public static Msg Unknown(string reason) => new(
@@ -882,10 +908,30 @@ internal static class Messages
         "[Sluice]",
         $"""
         api GET {path} → 重定向，且不可跟随（{detail}）。
-        本次未产生任何副作用（响应体已输出到 stdout）。sluice 仅跟随 api.github.com / *.githubusercontent.com 域内的重定向（≤3 跳）。
+        本次未产生任何副作用（响应体已输出到 stdout）。sluice 仅跟随 HTTPS 的 api.github.com / codeload.github.com / *.githubusercontent.com 域内重定向（≤3 跳）。
         修正：此类资源请经浏览器或按响应体/Location 提示处理；不要尝试把绝对 URL 传给 sluice api。
         """,
         ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- api 读通道二进制响应 + stdout 是终端：拒绝直出（v2.41；避免二进制被当文本损坏） ----
+    public static Msg ApiBinaryNeedsOutput(string path, int st, string contentType) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → HTTP {st}，content-type={contentType} 是二进制；stdout 是终端，已拒绝直接输出（避免乱码/控制字符）。
+        本次未产生任何副作用（未写出任何内容）。
+        修正：用 --output <文件> 写入文件，或加 --binary 显式输出到 stdout/管道。
+        """,
+        ExitCodes.BadRequest, "after_fix", true);
+
+    // ---- api 读通道流式下载中断（exit 20/retry_ok；GET 远端无副作用，本地输出可能不完整） ----
+    public static Msg ApiDownloadInterrupted(string path, long bytes, string reason) => new(
+        "[Sluice]",
+        $"""
+        api GET {path} → 下载中断（已写出 {bytes} 字节）：{reason}
+        远端无副作用（GET）；本地输出可能不完整。--output 走临时文件，失败不会留下半截目标文件。
+        可重跑同一命令；连续 3 次失败则报告用户。
+        """,
+        ExitCodes.HttpFailed, "retry_ok", true);
 
     // ---- selftest 数据源：渲染全部消息样例 ----
     public static (string Name, Msg Sample)[] AllSamples() =>
@@ -903,6 +949,7 @@ internal static class Messages
         ("credexp",   CredentialExpired("HTTP 401")),
         ("badreq",    BadRequest("pr_comment 缺少 --number")),
         ("httpfail",  HttpFailed("could not resolve host / TLS 握手失败")),
+        ("httpfailtls", HttpFailed("证书颁发者校验失败——检测到 Steam++/Watt Toolkit 的本地 MITM 证书（实际 issuer：C=CN, O=BeyondDimension, CN=SteamTools Certificate）；不要重试。")),
         ("unknown",   Unknown("超时/连接中断/HTTP 5xx")),
         ("internal1", Internal(afterExecutionStarted: false)),
         ("internal2", Internal(afterExecutionStarted: true)),
@@ -939,7 +986,9 @@ internal static class Messages
         ("dispatchforbidden", DispatchForbidden("rustin-beep/Vitro", "ci.yml", "HTTP 403：Resource not accessible by personal access token")),
         ("dispatchnotfound", DispatchNotFound("rustin-beep/Vitro", "noci.yml")),
         ("dispatchrejected", DispatchRejected("HTTP 422：Reference does not exist")),
-        ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / *.githubusercontent.com）")),
+        ("apiredirected", ApiRedirected("repos/rustin-beep/Vitro/actions/jobs/1/logs", "去向 github.com 不在跟随白名单（api.github.com / codeload.github.com / *.githubusercontent.com）")),
+        ("apibinarytty", ApiBinaryNeedsOutput("repos/rustin-beep/Sluice/tarball/HEAD", 200, "application/x-gzip")),
+        ("apidownloadinterrupted", ApiDownloadInterrupted("repos/rustin-beep/Sluice/tarball/HEAD", 123456, "连接被重置")),
         ("pushdone", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false)),
         ("pushdonewb", PushDone("rustin-beep/Sluice", "feat/x", "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9a0b1c2", false,
             refsNote: PushRefsWritten("feat/x", "9f3c2a1b"))), // v2.33：回写成功态
@@ -953,6 +1002,7 @@ internal static class Messages
         ("statusother", StatusOther("workflow_dispatch", "rustin-beep/Vitro ci.yml@x", "not_found", "http_404")),
         ("statusorphan", StatusOrphan("a1b2c3d4e5f60718", "push", "rustin-beep/vivarium v3-libc", 180)), // v2.31：孤儿 pending 点名（终态不会再来）
         ("statushttpfailed", StatusHttpFailed("push", "v3-libc", "连接被重置")), // v2.31：http_failed 收割入族（同 live 的 20/retry_ok）
+        ("statushttpfailedtls", StatusHttpFailed("push", "v3-libc", "证书颁发者校验失败——检测到 Steam++/Watt Toolkit 的本地 MITM 证书")), // v2.41：确定性环境错误不引导重试
         ("statusabandoned", StatusAbandoned("push", "v3-libc")), // v2.32：入闸后早退的水位兜底行（10/after_fix——同早退现场）
         ("statusmergetail", StatusMergeTail("pr_merge", "rustin-beep/Vitro#452", "executed", headDeleted: true)), // v2.32：--delete-head 收尾行（0/——）
         ("statusmergetailfail", StatusMergeTail("pr_merge", "rustin-beep/Vitro#452", "http_403", headDeleted: false)), // v2.32：收尾失败不动摇已生效的合并

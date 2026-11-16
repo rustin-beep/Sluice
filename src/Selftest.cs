@@ -1,3 +1,6 @@
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
 using System.Text.Json.Nodes;
 
 namespace Sluice;
@@ -20,6 +23,7 @@ internal static class Selftest
         ("credexp",   ExitCodes.CredentialExpired,"wait_user"),
         ("badreq",    ExitCodes.BadRequest,       "after_fix"),
         ("httpfail",  ExitCodes.HttpFailed,       "retry_ok"),
+        ("httpfailtls", ExitCodes.EnvBlocked,     "wait_user"), // v2.41：证书/本地 MITM 是确定性错误，独立 24 档
         ("unknown",   ExitCodes.Unknown,          "wait_user"),
         ("internal1", ExitCodes.Internal,         "wait_user"),
         ("internal2", ExitCodes.Internal,         "wait_user"),
@@ -53,6 +57,8 @@ internal static class Selftest
         ("dispatchnotfound",  ExitCodes.BadRequest, "after_fix"), // v2.7：workflow 不存在或 on: 未声明 dispatch
         ("dispatchrejected",  ExitCodes.BadRequest, "after_fix"), // v2.7：ref/inputs 校验拒
         ("apiredirected",     ExitCodes.BadRequest, "after_fix"), // v2.7：域外重定向不跟随，明说去向
+        ("apibinarytty",      ExitCodes.BadRequest, "after_fix"), // v2.41：二进制+终端拒绝直出，提示 --output/--binary
+        ("apidownloadinterrupted", ExitCodes.HttpFailed, "retry_ok"), // v2.42：流式下载半截中断（GET 远端无副作用）
         ("pushdone",        ExitCodes.Success,      "—"),          // v2.10：push 成功附本地引用状态说明
         ("pushdonewb",      ExitCodes.Success,      "—"),          // v2.33：回写成功态（refs 行=已回写）
         ("pushdonediv",     ExitCodes.Success,      "—"),          // v2.33：平行重打哨兵态（分叉提示+用户 fetch 指引）
@@ -76,6 +82,7 @@ internal static class Selftest
         ("serverstale",     ExitCodes.Internal,      "wait_user"),  // v2.26：僵尸 server 自曝——重启会话后重发（与 internal 族同档：技术失败，交回用户）
         ("statusorphan",     ExitCodes.Unknown,      "wait_user"),  // v2.31：孤儿 pending 点名——终态不会再来，查证后重发（不再无限"尚未决"）
         ("statushttpfailed", ExitCodes.HttpFailed,   "retry_ok"),   // v2.31：http_failed 收割入族（同 live 20/retry_ok，消解两路径指引相反）
+        ("statushttpfailedtls", ExitCodes.EnvBlocked, "wait_user"),  // v2.41：证书确定性错误与 live 同判，独立 24 档
         ("statusabandoned",  ExitCodes.BadRequest,   "after_fix"),  // v2.32：入闸后早退的水位兜底行（审阅 P1 对偶面——同早退现场 after_fix）
         ("statusmergetail",     ExitCodes.Success,   "—"),          // v2.32：--delete-head 收尾行（合并已生效，删除成功）
         ("statusmergetailfail", ExitCodes.Success,   "—"),          // v2.32：收尾删除失败不动摇已生效的合并（审阅 P3.4）
@@ -125,10 +132,11 @@ internal static class Selftest
             if (name == "internal2" && !sample.Text.Contains("可能已完成"))
             { fail++; Console.WriteLine("!! internal(后) 缺\"可能已完成\""); }
             if (name is "badreq" or "nonff" or "remotemoved" or "hasmerge" or "prmergechanged" or "prmergeverify"
-                    or "apiredirected" or "pushbasemissing" or "pushtoolarge" or "pushsteprejected"
+                    or "apiredirected" or "apibinarytty" or "pushbasemissing" or "pushtoolarge" or "pushsteprejected"
                 && !sample.Text.Contains("本次未产生任何副作用"))
             { fail++; Console.WriteLine("!! bad_request 家族缺\"未产生副作用\"句"); }
-            if (name is "httpfail" or "pushblobmismatch" or "statushttpfailed" && !sample.Text.Contains("无任何副作用"))
+            if (name is "httpfail" or "httpfailtls" or "pushblobmismatch" or "statushttpfailed" or "statushttpfailedtls"
+                && !sample.Text.Contains("无任何副作用"))
             { fail++; Console.WriteLine("!! http_failed 缺\"无任何副作用\"句"); }
             if (name == "dedupblockedcli" && !sample.Text.Contains("本次操作未执行"))
             { fail++; Console.WriteLine("!! dedup CLI 版缺事实前置句\"本次操作未执行\""); }
@@ -140,6 +148,8 @@ internal static class Selftest
             { fail++; Console.WriteLine("!! 收尾失败版缺\"不影响合并结果\"事实句"); }
             if (name == "dedupblocked" && !sample.Text.Contains("同目标"))
             { fail++; Console.WriteLine("!! dedup 措辞应为\"同目标\"（target 级键是设计裁定，不得声称\"同操作\"）"); }
+            if (name == "apidownloadinterrupted" && !sample.Text.Contains("远端无副作用"))
+            { fail++; Console.WriteLine("!! 下载中断缺\"远端无副作用\"（GET 幂等）事实句"); }
             // v2.33：push 成功三态的本地引用状态句——回写成功/分叉哨兵/未回写各有专属措辞，
             // 缺句即"引用状态不可判"（Bug 2 事故形态：agent 下次推送仍以为要 fetch）
             if (name == "pushdonewb" && !sample.Text.Contains("已回写"))
@@ -169,6 +179,7 @@ internal static class Selftest
         fail += DenyVisibilityChecks();
         fail += IssueListChecks();
         fail += AnonFallbackChecks();
+        fail += ReadChannelChecks();
         fail += PendingDedupChecks();
         fail += ReviewFix232Checks();
         fail += DiscoveryTimingChecks();
@@ -602,6 +613,240 @@ internal static class Selftest
         return fail;
     }
 
+    /// <summary>v2.41 读通道锁：代理默认直连 / 自动重定向关闭 / DoH 与重定向白名单拆分 /
+    /// content-type 文本判定 / 确定性失败判定 / 字节读不做 UTF-8 往返（本地 HTTP 探针）。</summary>
+    private static int ReadChannelChecks()
+    {
+        Console.WriteLine("--- v2.41 读通道锁（代理默认直连 / 重定向白名单 / 字节保真）---");
+        int fail = 0;
+        void Eq<T>(string what, T actual, T expected)
+        {
+            if (!Equals(actual, expected)) { fail++; Console.WriteLine($"!! {what}：{actual} ≠ 期望 {expected}"); }
+        }
+
+        // (1) 自动重定向必须关闭（否则白名单/≤3 跳全部失效）
+        using (var h = GitHubApi.CreateHandler())
+            Eq("CreateHandler.AllowAutoRedirect", h.AllowAutoRedirect, false);
+
+        // (1b) MITM 例外只认 Steam++/Watt Toolkit；MITM handler 仍关闭自动重定向
+        Eq("MITM issuer SteamTools", GitHubApi.IsLocalMitmIssuer(
+            "C=CN, O=BeyondDimension, CN=SteamTools Certificate"), true);
+        Eq("MITM issuer BeyondDimension", GitHubApi.IsLocalMitmIssuer("O=BeyondDimension"), true);
+        Eq("MITM issuer DigiCert 拒绝", GitHubApi.IsLocalMitmIssuer("C=US, O=DigiCert Inc"), false);
+        using (var h = GitHubApi.CreateHandler(allowLocalMitm: true))
+            Eq("MITM handler AllowAutoRedirect", h.AllowAutoRedirect, false);
+
+        // (2) DoH 与可跟随重定向白名单拆分：api 必须 DoH；codeload 只可跟随、保留 hosts 加速
+        Eq("DoH api.github.com", GitHubApi.IsDohHost("api.github.com"), true);
+        Eq("DoH codeload.github.com（保留 hosts 加速）", GitHubApi.IsDohHost("codeload.github.com"), false);
+        Eq("DoH objects.githubusercontent.com", GitHubApi.IsDohHost("objects.githubusercontent.com"), true);
+        Eq("重定向 codeload", GitHubApi.IsRedirectAllowed("codeload.github.com"), true);
+        Eq("重定向 evil.example", GitHubApi.IsRedirectAllowed("evil.example"), false);
+
+        // (3) 代理策略：默认直连；显式 config/SLUICE_PROXY 优先；use_env_proxy 才交回系统
+        Eq("代理默认直连", GitHubApi.ResolveProxyChoice(null, null, false), (false, (string?)null));
+        Eq("代理 config", GitHubApi.ResolveProxyChoice("http://127.0.0.1:7890", null, false),
+            (true, (string?)"http://127.0.0.1:7890"));
+        Eq("代理 SLUICE_PROXY", GitHubApi.ResolveProxyChoice(null, "socks5://127.0.0.1:1080", false),
+            (true, (string?)"socks5://127.0.0.1:1080"));
+        Eq("代理 config 优先于 SLUICE_PROXY", GitHubApi.ResolveProxyChoice("http://a:1", "http://b:2", true),
+            (true, (string?)"http://a:1"));
+        Eq("代理 use_env_proxy", GitHubApi.ResolveProxyChoice(null, null, true), (true, (string?)null));
+
+        // (4) content-type 文本判定
+        Eq("json 文本", GitHubApi.IsTextContentType("application/json; charset=utf-8"), true);
+        Eq("text/plain 文本", GitHubApi.IsTextContentType("text/plain"), true);
+        Eq("x-gzip 二进制", GitHubApi.IsTextContentType("application/x-gzip"), false);
+        Eq("octet-stream 二进制", GitHubApi.IsTextContentType("application/octet-stream"), false);
+        Eq("github.raw 二进制", GitHubApi.IsTextContentType("application/vnd.github.raw"), false);
+        Eq("无 content-type 默认文本", GitHubApi.IsTextContentType(null), true);
+
+        // (5) 确定性失败判定：证书 → wait_user；代理 502/超时仍为抖动
+        Eq("证书确定性", GitHubApi.IsDeterministicNetFailure(
+            "证书颁发者校验失败——检测到 Steam++/Watt Toolkit 的本地 MITM 证书"), true);
+        Eq("callback 确定性", GitHubApi.IsDeterministicNetFailure(
+            "The remote certificate was rejected by the provided RemoteCertificateValidationCallback."), true);
+        Eq("代理 502 非确定性", GitHubApi.IsDeterministicNetFailure(
+            "The proxy tunnel request to proxy 'http://127.0.0.1:57307/' failed with status code '502'"), false);
+        Eq("超时非确定性", GitHubApi.IsDeterministicNetFailure("超时"), false);
+        Eq("MCP exit 24 retry", McpServer.RetryOf(ExitCodes.EnvBlocked), "wait_user");
+
+        // (5b) Steam++ 证书描述：识别产品、明确不把本地 MITM CA 加白名单
+        var oldIssuer = GitHubApi.LastRejectedIssuer;
+        var oldAt = GitHubApi.LastRejectedAt;
+        try
+        {
+            GitHubApi.LastRejectedIssuer = "C=CN, O=BeyondDimension, OU=Technical Department, CN=SteamTools Certificate";
+            GitHubApi.LastRejectedAt = DateTime.Now;
+            var d = GitHubApi.Describe(new System.Security.Authentication.AuthenticationException(
+                "The remote certificate was rejected by the provided RemoteCertificateValidationCallback."));
+            Eq("Steam++ 识别", d.Contains("Steam++", StringComparison.Ordinal), true);
+            Eq("Steam++ 不引导加白", d.Contains("不要把 SteamTools/BeyondDimension 加入 AllowedIssuers", StringComparison.Ordinal), true);
+            Eq("证书描述→确定性", GitHubApi.IsDeterministicNetFailure(d), true);
+        }
+        finally
+        {
+            GitHubApi.LastRejectedIssuer = oldIssuer;
+            GitHubApi.LastRejectedAt = oldAt;
+        }
+
+        // (6) 本地 HTTP 探针：二进制字节原样 / content-type / 302 不越白名单
+        fail += LocalHttpProbe();
+
+        Console.WriteLine(fail == 0 ? "v2.41 读通道锁通过。" : "v2.41 读通道锁有不符项（见上）。");
+        return fail;
+    }
+
+    /// <summary>v2.41 本地 HTTP 探针：不碰 GitHub；验证 ApiGetRawAsync 的字节保真与
+    /// AllowAutoRedirect=false 的实际效果（302 命中白名单拒绝，而不是被自动跟走）。</summary>
+    private static int LocalHttpProbe()
+    {
+        int fail = 0;
+        void Ok(bool cond, string what)
+        {
+            if (!cond) { fail++; Console.WriteLine($"!! {what}"); }
+        }
+
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var baseUrl = $"http://127.0.0.1:{port}/";
+        using var cts = new CancellationTokenSource();
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                while (!cts.IsCancellationRequested)
+                {
+                    using var client = await listener.AcceptTcpClientAsync(cts.Token);
+                    using var stream = client.GetStream();
+                    using var reader = new StreamReader(stream, Encoding.ASCII, false, 1024, leaveOpen: true);
+                    var requestLine = await reader.ReadLineAsync(cts.Token);
+                    while (!string.IsNullOrEmpty(await reader.ReadLineAsync(cts.Token))) { }
+                    var reqPath = requestLine?.Split(' ')[1] ?? "/";
+                    byte[] body;
+                    string head;
+                    if (reqPath == "/bin")
+                    {
+                        // 故意含非法 UTF-8（0x8B）——若走 ReadAsStringAsync 会被替换成 EF BF BD
+                        body = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xFF];
+                        head = $"HTTP/1.1 200 OK\r\nContent-Type: application/x-gzip\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/json")
+                    {
+                        body = Encoding.UTF8.GetBytes("{\"ok\":true}");
+                        head = $"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/redirect")
+                    {
+                        body = [];
+                        head = "HTTP/1.1 302 Found\r\nLocation: https://evil.example/bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/downgrade")
+                    {
+                        body = [];
+                        head = "HTTP/1.1 302 Found\r\nLocation: http://api.github.com/bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/big")
+                    {
+                        body = new byte[256 * 1024];
+                        Array.Fill(body, (byte)0xAB);
+                        head = $"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/notfound")
+                    {
+                        body = Encoding.UTF8.GetBytes("{\"message\":\"Not Found\"}");
+                        head = $"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n";
+                    }
+                    else if (reqPath == "/truncated")
+                    {
+                        body = new byte[100];
+                        Array.Fill(body, (byte)0xCD);
+                        // Content-Length 大于实际正文，连接关闭 → 客户端应报下载中断而不是 200。
+                        head = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n";
+                    }
+                    else
+                    {
+                        body = [];
+                        head = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    }
+                    await stream.WriteAsync(Encoding.ASCII.GetBytes(head), cts.Token);
+                    if (body.Length > 0) await stream.WriteAsync(body, cts.Token);
+                    await stream.FlushAsync(cts.Token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+        });
+        try
+        {
+            var bin = GitHubApi.ApiGetRawAsync(null, "bin", baseUrl: baseUrl, ignoreProxy: true).GetAwaiter().GetResult();
+            Ok(bin.Status == 200, "本地 /bin 状态 200");
+            Ok(bin.Body.Length == 10 && bin.Body[0] == 0x1F && bin.Body[1] == 0x8B,
+                "本地 /bin 字节未被 UTF-8 替换");
+            Ok(bin.ContentType == "application/x-gzip", "本地 /bin content-type");
+            Ok(!GitHubApi.IsTextContentType(bin.ContentType), "本地 /bin 判定为二进制");
+
+            var json = GitHubApi.ApiGetRawAsync(null, "json", baseUrl: baseUrl, ignoreProxy: true).GetAwaiter().GetResult();
+            Ok(json.Status == 200 && GitHubApi.DecodeText(json.Body) == "{\"ok\":true}", "本地 /json 文本解码");
+
+            var red = GitHubApi.ApiGetRawAsync(null, "redirect", baseUrl: baseUrl, ignoreProxy: true).GetAwaiter().GetResult();
+            Ok(red.Status == 302, "本地 /redirect 保留 302（未被自动跟随）");
+            Ok((red.Reason ?? "").Contains("不在跟随白名单", StringComparison.Ordinal), "本地 /redirect 命中白名单拒绝");
+
+            var down = GitHubApi.ApiGetRawAsync(null, "downgrade", baseUrl: baseUrl, ignoreProxy: true).GetAwaiter().GetResult();
+            Ok(down.Status == 302, "本地 /downgrade 保留 302");
+            Ok((down.Reason ?? "").Contains("HTTPS", StringComparison.Ordinal), "本地 /downgrade 拒绝 HTTPS→HTTP 降级");
+
+            // 流式下载：2xx 字节原样写入目标；非 2xx 不写目标、保留错误体；302 拒绝不写目标。
+            using (var bigDest = new MemoryStream())
+            {
+                var big = GitHubApi.ApiDownloadAsync(null, "big", GitHubApi.JsonAccept, bigDest,
+                    TimeSpan.FromSeconds(10), ignoreProxy: true, baseUrl: baseUrl).GetAwaiter().GetResult();
+                Ok(big.Status == 200, "本地 /big 流式状态 200");
+                Ok(big.Bytes == 256 * 1024 && bigDest.Length == 256 * 1024, "本地 /big 流式字节数一致");
+                Ok(bigDest.ToArray()[0] == 0xAB && bigDest.ToArray()[^1] == 0xAB, "本地 /big 流式内容保真");
+                Ok(big.ContentType == "application/octet-stream", "本地 /big 流式 content-type");
+            }
+            using (var nfDest = new MemoryStream())
+            {
+                var nf = GitHubApi.ApiDownloadAsync(null, "notfound", GitHubApi.JsonAccept, nfDest,
+                    TimeSpan.FromSeconds(10), ignoreProxy: true, baseUrl: baseUrl).GetAwaiter().GetResult();
+                Ok(nf.Status == 404 && nf.ErrorBody.Length > 0, "本地 /notfound 流式错误体保留");
+                Ok(nfDest.Length == 0, "本地 /notfound 非 2xx 不写目标");
+            }
+            using (var redDest = new MemoryStream())
+            {
+                var redStream = GitHubApi.ApiDownloadAsync(null, "redirect", GitHubApi.JsonAccept, redDest,
+                    TimeSpan.FromSeconds(10), ignoreProxy: true, baseUrl: baseUrl).GetAwaiter().GetResult();
+                Ok(redStream.Status == 302 && redDest.Length == 0, "本地 /redirect 流式不跟随/不写目标");
+                Ok((redStream.Reason ?? "").Contains("不在跟随白名单", StringComparison.Ordinal),
+                    "本地 /redirect 流式命中白名单拒绝");
+            }
+            using (var truncDest = new MemoryStream())
+            {
+                var trunc = GitHubApi.ApiDownloadAsync(null, "truncated", GitHubApi.JsonAccept, truncDest,
+                    TimeSpan.FromSeconds(10), ignoreProxy: true, baseUrl: baseUrl).GetAwaiter().GetResult();
+                Ok(trunc.Status == 0 && !trunc.NotSent && trunc.Bytes > 0,
+                    "本地 /truncated 归下载中断（非 not_sent）");
+                Ok((trunc.Reason ?? "").Contains("下载中断", StringComparison.Ordinal),
+                    "本地 /truncated 中断原因");
+            }
+        }
+        catch (Exception ex)
+        {
+            fail++;
+            Console.WriteLine($"!! 本地 HTTP 探针异常：{ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            cts.Cancel();
+            listener.Stop();
+            try { server.Wait(TimeSpan.FromSeconds(3)); } catch { }
+        }
+        return fail;
+    }
+
     /// <summary>v2.29 issue list 锁（读侧清单面）：查询拼装（清单/搜索两形态、标签逐名编码、
     /// state 限定符映射、含空格标签引号短语）与渲染（PR 隐去计数、--with-prs 标记、state_reason
     /// 附加、标题 120 截断不切代理对、标签 join、搜索 total_count 透传）。与网络解耦——
@@ -853,7 +1098,8 @@ internal static class Selftest
         foreach (var code in new[]
                  {
                      ExitCodes.Internal, ExitCodes.SealViolation, ExitCodes.NotInitialized,
-                     ExitCodes.CredentialExpired, ExitCodes.BadRequest, ExitCodes.HttpFailed, ExitCodes.Unknown,
+                     ExitCodes.CredentialExpired, ExitCodes.BadRequest, ExitCodes.HttpFailed, ExitCodes.EnvBlocked,
+                     ExitCodes.Unknown,
                  })
             if (!McpServer.IsErrorOf(code))
             { fail++; Console.WriteLine($"!! exit {code} 属技术失败族，应标 isError"); }

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -10,15 +11,19 @@ namespace Sluice;
 
 /// <summary>
 /// GitHub API 叶。双防线：
-/// ① 解析层——api.github.com 一律经 IP 直连 DoH（阿里/腾讯公共 DNS）解析真实 IP 后直连，
+/// ① 解析层——api.github.com 经 IP 直连 DoH（阿里/腾讯公共 DNS）解析真实 IP 后直连，
 ///    系统 hosts 对 sluice 失效（Watt Toolkit 的 hosts+本地443 MITM 加速与其共存互不干扰，
-///    恶意改 hosts 劫持 token 的攻击面在解析层消灭）；
-/// ② 证书层——leaf issuer 必须是 GitHub 官方 CA（DigiCert/Sectigo），本地 MITM 签发的链拒发 token。
-/// 可选 config.json 的 "proxy"（如 http://127.0.0.1:7890）显式走非 MITM 代理隧道。
+///    恶意改 hosts 劫持 token 的攻击面在解析层消灭）；codeload 等公共下载域保留系统解析，
+///    让国内 hosts 加速 IP 继续可用，TLS issuer 校验兜底。
+/// ② 证书层——leaf issuer 必须是 GitHub 官方 CA（DigiCert/Sectigo/Microsoft TLS），
+///    本地 MITM 签发的链拒发 token。
+/// 代理策略：默认不使用系统/环境代理（避免 HTTPS_PROXY/系统代理把 sluice 带进 Steam++ 的
+/// TLS 终结）；仅 config.json 的 "proxy" 或 SLUICE_PROXY 显式指定非 MITM 隧道代理。
 /// </summary>
 internal static class GitHubApi
 {
     private const string BaseUrl = "https://api.github.com/";
+    internal const string JsonAccept = "application/vnd.github+json";
 
     /// <summary>
     /// GitHub 官方在用的签发 CA。Sectigo 为 2026-10-29/30 两次实测主流 issuer（*.github.com，
@@ -53,12 +58,21 @@ internal static class GitHubApi
     // CDN 域（*.githubusercontent.com——api 读通道跟随 logs 等端点的 302 签名 URL 时到达）：冷路径，小并发字典够用
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DnsCache> _cdnDnsCache = new();
 
-    /// <summary>DoH 直连 + 重定向跟随共同的主机集合（v2.7）：api.github.com 与 GitHub CDN
-    /// （*.githubusercontent.com）。logs 等 actions 端点 302 到 CDN 签名 URL——不跟随则永远
-    /// 拿不到日志体（2026-10-30 实战：actions/jobs/{id}/logs http_failed ×8，agent 空转重试）。</summary>
-    internal static bool IsGithubApiOrCdnHost(string host) =>
+    /// <summary>DoH 直连主机集合（v2.41 拆分）：api.github.com 带 token，必须绕过系统 hosts；
+    /// *.githubusercontent.com 是 logs/release 的 302 签名 CDN，仍走 DoH（签名 URL 无凭据）。
+    /// codeload 不在此列——国内 hosts 常把它指向可用的真实加速 IP，强制 DoH 会绕掉这条路；
+    /// 它只在重定向白名单里，走系统解析，TLS issuer 校验兜底。</summary>
+    internal static bool IsDohHost(string host) =>
         host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase) ||
         host.EndsWith(".githubusercontent.com", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>受控重定向白名单（v2.7/v2.41）：api.github.com、GitHub CDN、codeload。
+    /// codeload 是 tarball/zipball 的 302 目标；它不带 Authorization（跨主机时 token 已剥离），
+    /// 所以允许它走系统解析不破坏 token 防线。其余主机一律不跟随——这不是开放代理。</summary>
+    internal static bool IsRedirectAllowed(string host) =>
+        IsDohHost(host) ||
+        host.Equals("codeload.github.com", StringComparison.OrdinalIgnoreCase);
+
 
     /// <summary>解析 GitHub 域名的真实 IP（绕过系统 hosts）；全失败返回 null（调用方退回系统解析，由 issuer 校验兜底）。</summary>
     internal static async Task<string[]?> ResolveViaDoHAsync(string host, CancellationToken ct)
@@ -75,7 +89,10 @@ internal static class GitHubApi
         {
             try
             {
-                using var doh = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+                // DoH 自身不走系统/环境代理：否则 HTTPS_PROXY 指向 Steam++ 时，连 DNS 解析器
+                // 都会被本地 MITM（解析结果可被篡改；主 TLS 校验仍拦 token，但没必要多这一层）。
+                using var doh = new HttpClient(new SocketsHttpHandler { UseProxy = false })
+                { Timeout = TimeSpan.FromSeconds(5) };
                 using var resp = await doh.GetAsync($"https://{ip}/resolve?name={Uri.EscapeDataString(host)}&type=A", ct);
                 if (!resp.IsSuccessStatusCode) continue;
                 using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
@@ -97,10 +114,19 @@ internal static class GitHubApi
         return null;
     }
 
-    private static SocketsHttpHandler CreateHandler()
+    /// <param name="ignoreProxy">仅供 selftest 本地探针隔离用户 config/env 代理；生产路径不传。</param>
+    /// <param name="allowLocalMitm">仅 --allow-mitm-read 匿名读：额外信任 Steam++/Watt Toolkit
+    /// 本地 MITM 证书，并跳过 DoH（让 hosts/系统代理解析到本地 MITM）。绝不用于写/--auth。</param>
+    /// <param name="mitmIssuer">命中本地 MITM 时写入产品标签（审计用）；未命中保持 null。</param>
+    internal static SocketsHttpHandler CreateHandler(
+        bool ignoreProxy = false, bool allowLocalMitm = false, StrongBox<string?>? mitmIssuer = null)
     {
         var h = new SocketsHttpHandler
         {
+            // v2.41：必须显式关掉 .NET 的自动重定向。默认 AllowAutoRedirect=true 会让下面
+            // IsRedirectAllowed 的白名单与 ≤3 跳全部失效（tarball 的 302→codeload 就是被
+            // 自动跟走的；同时它也让“不是开放代理”的承诺不成立）。
+            AllowAutoRedirect = false,
             SslOptions = new SslClientAuthenticationOptions
             {
                 RemoteCertificateValidationCallback = (msg, cert, chain, errors) =>
@@ -111,14 +137,22 @@ internal static class GitHubApi
                     // 本地 MITM（SteamTools 等）签发的链在这里被拒。
                     var issuer = cert?.Issuer ?? "";
                     var ok = AllowedIssuers.Any(k => issuer.Contains(k, StringComparison.OrdinalIgnoreCase));
+                    if (!ok && allowLocalMitm && IsLocalMitmIssuer(issuer))
+                    {
+                        // 双钥匙 opt-in 的窄口：只接受 Steam++/Watt Toolkit，不是放宽到任意本地 CA。
+                        ok = true;
+                        if (mitmIssuer is not null) mitmIssuer.Value = "Steam++";
+                    }
                     if (!ok) { LastRejectedIssuer = issuer; LastRejectedAt = DateTime.Now; }
                     return ok;
                 },
             },
             ConnectCallback = async (ctx, ct) =>
             {
-                // 只对 api.github.com 与 GitHub CDN 域启用 DoH 直连；DoH 失败退回系统解析（hosts 若被劫持由 issuer 校验拦截并报清晰错误）
-                if (IsGithubApiOrCdnHost(ctx.DnsEndPoint.Host) &&
+                // v2.41：只有 IsDohHost 走 DoH；codeload 走系统解析（国内 hosts 加速 IP 优先），
+                // TLS issuer 校验仍在证书层兜底（hosts 指到 MITM 会被拒，而不是被静默信任）。
+                // --allow-mitm-read 下必须跳过 DoH：否则绕过 hosts/本地 443 的 MITM，例外无意义。
+                if (!allowLocalMitm && IsDohHost(ctx.DnsEndPoint.Host) &&
                     await ResolveViaDoHAsync(ctx.DnsEndPoint.Host, ct) is { Length: > 0 } ips)
                 {
                     Exception? last = null;
@@ -141,16 +175,68 @@ internal static class GitHubApi
             },
         };
 
-        // 可选显式代理（config.json: {"proxy":"http://127.0.0.1:7890"}）——非 MITM 隧道形态，
-        // TLS 端到端，issuer 校验照常生效。
-        var proxy = ReadConfiguredProxy();
-        if (proxy is not null)
-            h.Proxy = new WebProxy(proxy);
+        if (ignoreProxy)
+        {
+            h.UseProxy = false;
+            return h;
+        }
+
+        // v2.41 代理策略：默认直连（UseProxy=false）。环境里的 HTTPS_PROXY/HTTP_PROXY/系统代理
+        // 常指向 Steam++ 这类 TLS 终结者——sluice 不应默认继承它。只有显式 config.json.proxy
+        // 或 SLUICE_PROXY 才启用代理；use_env_proxy:true 作为显式逃生门恢复旧行为。
+        var (useProxy, proxyUrl) = ResolveProxyChoice(
+            ReadConfiguredProxy(), Environment.GetEnvironmentVariable("SLUICE_PROXY"), ReadUseEnvProxy());
+        // MITM 例外面要兼容 Steam++ 的两种入口：hosts→127.0.0.1（系统 DNS）与系统/环境代理。
+        // 未显式配置代理时把默认代理打开；没有系统代理则仍走系统 DNS 直连（hosts 生效）。
+        if (allowLocalMitm && proxyUrl is null) useProxy = true;
+        if (proxyUrl is not null)
+        {
+            // 显式代理值无效时 fail-closed 到直连：绝不能悄悄退回环境代理（那正是事故形态）。
+            if (Uri.TryCreate(proxyUrl, UriKind.Absolute, out var proxyUri))
+            {
+                h.UseProxy = true;
+                h.Proxy = new WebProxy(proxyUri);
+            }
+            else
+            {
+                h.UseProxy = false;
+            }
+        }
+        else
+        {
+            h.UseProxy = useProxy;
+        }
 
         return h;
     }
 
-    private static string? ReadConfiguredProxy()
+    /// <summary>v2.41 纯函数（selftest 锁）：config.proxy > SLUICE_PROXY > use_env_proxy 的系统默认。
+    /// use_env_proxy 为 true 时才把选择权交回 .NET 默认代理；否则直连。</summary>
+    internal static (bool UseProxy, string? ProxyUrl) ResolveProxyChoice(
+        string? configProxy, string? sluiceProxy, bool useEnvProxy)
+    {
+        var explicitProxy = FirstNonEmpty(configProxy, sluiceProxy);
+        if (explicitProxy is not null) return (true, explicitProxy);
+        return (useEnvProxy, null);
+    }
+
+    private static string? FirstNonEmpty(params string?[] values) =>
+        values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
+
+    private static string? ReadConfiguredProxy() => ReadConfigString("proxy");
+
+    private static bool ReadUseEnvProxy() => ReadConfigBool("use_env_proxy");
+
+    /// <summary>v2.42 纯函数（selftest 锁）：本地 MITM 只认 Steam++/Watt Toolkit 两个 issuer 关键词；
+    /// 不是“信任任意本地 CA”。</summary>
+    internal static bool IsLocalMitmIssuer(string issuer) =>
+        issuer.Contains("SteamTools", StringComparison.OrdinalIgnoreCase) ||
+        issuer.Contains("BeyondDimension", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>v2.42：--allow-mitm-read 的第二把钥匙（config.json "allow_mitm_read": true）。</summary>
+    internal static bool AllowMitmReadConfigured() => ReadConfigBool("allow_mitm_read");
+
+    private static string? ReadConfigString(string key)
     {
         try
         {
@@ -158,21 +244,38 @@ internal static class GitHubApi
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "config.json");
             if (!File.Exists(cfg)) return null;
             using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
-            return doc.RootElement.TryGetProperty("proxy", out var p) ? p.GetString() : null;
+            return doc.RootElement.TryGetProperty(key, out var p) ? p.GetString() : null;
         }
         catch { return null; }
     }
 
-    private static HttpClient CreateClient() => new(CreateHandler(), disposeHandler: true)
+    private static bool ReadConfigBool(string key)
     {
-        Timeout = TimeSpan.FromSeconds(30),
+        try
+        {
+            var cfg = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Sluice", "config.json");
+            if (!File.Exists(cfg)) return false;
+            using var doc = JsonDocument.Parse(File.ReadAllText(cfg));
+            return doc.RootElement.TryGetProperty(key, out var p) && p.ValueKind == JsonValueKind.True;
+        }
+        catch { return false; }
+    }
+
+    private static HttpClient CreateClient(TimeSpan? timeout = null, bool ignoreProxy = false,
+        bool allowLocalMitm = false, StrongBox<string?>? mitmIssuer = null) =>
+        new(CreateHandler(ignoreProxy, allowLocalMitm, mitmIssuer), disposeHandler: true)
+    {
+        // 默认 30s；sluice api 的下载面传更长值（tarball/release asset 的正文读取也受
+        // HttpClient.Timeout 约束——默认档只适合 JSON 小响应）。
+        Timeout = timeout ?? TimeSpan.FromSeconds(30),
     };
 
     private static HttpRequestMessage Req(HttpMethod m, string path, string token) => new(m, BaseUrl + path)
     {
         Headers =
         {
-            { "Accept", "application/vnd.github+json" },
+            { "Accept", JsonAccept },
             { "X-GitHub-Api-Version", "2022-11-28" },
             { "Authorization", "Bearer " + token },
             { "User-Agent", "sluice/0.1" },
@@ -368,63 +471,224 @@ internal static class GitHubApi
     internal static string RefPath(string branch) =>
         string.Join("/", branch.Split('/').Select(Uri.EscapeDataString));
 
-    /// <summary>
-    /// api 读通道（§9 v2.2）：GET-only。token=null 走匿名（公开数据零摩擦）；
-    /// 认证读由调用方先过 Hello 解 vault。NotSent=true 表示请求未发出（无副作用）。
-    /// v2.7：3xx 受控跟随（≤3 跳，仅 api.github.com / *.githubusercontent.com 域内）——
-    /// logs 等 actions 端点 302 到 CDN 签名 URL，不跟随则永远拿不到日志体；跳出域内或超跳数
-    /// → 原样返回 3xx 与去向（Reason），由调用方明说——这不是开放代理。后续跳不再带
-    /// Authorization（CDN 签名 URL 自带授权，多余的 Authorization 头反而可能被拒）。
-    /// </summary>
+    /// <summary>v2.41 读通道原始结果：Body 保持字节，二进制不再经过 UTF-8 解码。
+    /// ContentType/FinalUrl 供输出选择与审计（最终 host 可能是 codeload/CDN）。
+    /// v2.42：MitmIssuer 仅在 --allow-mitm-read 命中本地 MITM 证书时非空。</summary>
+    internal sealed record ApiReadResult(
+        int Status, byte[] Body, string? ContentType, string? FinalUrl, bool NotSent, string? Reason,
+        string? MitmIssuer = null);
+
+    /// <summary>v2.42 流式下载结果：Bytes 为实际写入目标的字节数；ErrorBody 仅非 2xx
+    /// （有界读取，供错误分类/透传），2xx 时为空。</summary>
+    internal sealed record ApiStreamResult(
+        int Status, long Bytes, string? ContentType, string? FinalUrl,
+        bool NotSent, string? Reason, byte[] ErrorBody, string? MitmIssuer = null);
+
+    /// <summary>文本包装：供 JSON 消费者（issue list / meta 预读等）沿用原签名。</summary>
     public static async Task<(int Status, string Body, bool NotSent, string? Reason)> ApiGetAsync(
         string? token, string path)
     {
-        using var http = CreateClient();
-        var url = BaseUrl + path;
+        var r = await ApiGetRawAsync(token, path).ConfigureAwait(false);
+        return (r.Status, DecodeText(r.Body), r.NotSent, r.Reason);
+    }
+
+    /// <summary>v2.41/v2.42 重定向决策单源（字节读与流式下载共用）：返回是否跟随、
+    /// 下一跳 URL、拒绝原因。只允许 HTTPS + GitHub 白名单 + ≤3 跳。</summary>
+    private static (bool Follow, string? NextUrl, string? Refusal) RedirectDecision(
+        int st, HttpResponseMessage resp, string currentUrl, int hop)
+    {
+        if (st is < 300 or >= 400) return (false, null, null);
+        if (resp.Headers.Location is not { } loc || hop >= 3)
+            return (false, null, "重定向超过 3 跳或缺少 Location，停止跟随");
+        string next;
+        try { next = loc.IsAbsoluteUri ? loc.ToString() : new Uri(new Uri(currentUrl), loc).ToString(); }
+        catch (UriFormatException) { return (false, null, "重定向 Location 非法，停止跟随"); }
+        // 保持 .NET 自动重定向的既有安全性质：绝不从 HTTPS 降级到 HTTP。
+        if (!Uri.TryCreate(next, UriKind.Absolute, out var nextUri)
+            || !nextUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+            return (false, null, "重定向目标不是 HTTPS，停止跟随");
+        var host = nextUri.Host;
+        if (!IsRedirectAllowed(host))
+            return (false, null,
+                $"去向 {host} 不在跟随白名单（api.github.com / codeload.github.com / *.githubusercontent.com）");
+        return (true, nextUri.ToString(), null);
+    }
+
+    /// <summary>
+    /// api 读通道（§9 v2.2）：GET-only。token=null 走匿名（公开数据零摩擦）；
+    /// 认证读由调用方先过 Hello 解 vault。NotSent=true 表示请求未发出（无副作用）。
+    /// v2.7/v2.41：3xx 受控跟随（≤3 跳，仅 api.github.com / codeload / *.githubusercontent.com）——
+    /// logs/tarball 等端点 302 到 CDN/归档域，不跟随则永远拿不到正文；跳出白名单或超跳数
+    /// → 原样返回 3xx 与去向（Reason），由调用方明说——这不是开放代理。跨域跳不带
+    /// Authorization（CDN 签名 URL 自带授权，多余的 Authorization 反而可能被拒）。
+    /// v2.41：Body 按字节读；accept 参数供 release asset（application/octet-stream）等媒体类型。
+    /// v2.42：allowLocalMitm 供 --allow-mitm-read 匿名读（跳过 DoH、额外信任 Steam++ 证书）。
+    /// </summary>
+    internal static async Task<ApiReadResult> ApiGetRawAsync(
+        string? token, string path, string accept = JsonAccept, string? baseUrl = null,
+        TimeSpan? timeout = null, bool ignoreProxy = false, bool allowLocalMitm = false)
+    {
+        var mitm = new StrongBox<string?>();
+        using var http = CreateClient(timeout, ignoreProxy, allowLocalMitm, mitm);
+        var url = (baseUrl ?? BaseUrl) + path;
         try
         {
             for (var hop = 0; ; hop++)
             {
                 using var req = new HttpRequestMessage(HttpMethod.Get, url);
-                req.Headers.Add("Accept", "application/vnd.github+json");
+                req.Headers.TryAddWithoutValidation("Accept", accept);
                 req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
                 req.Headers.Add("User-Agent", "sluice/0.1");
                 if (token is not null)
                     req.Headers.Add("Authorization", "Bearer " + token);
                 using var resp = await http.SendAsync(req);
-                if ((int)resp.StatusCode is >= 300 and < 400 && resp.Headers.Location is { } loc && hop < 3)
+                var st = (int)resp.StatusCode;
+                var (follow, next, refusal) = RedirectDecision(st, resp, url, hop);
+                if (follow)
                 {
-                    var next = loc.IsAbsoluteUri ? loc.ToString() : new Uri(new Uri(url), loc).ToString();
-                    var host = new Uri(next).Host;
-                    if (IsGithubApiOrCdnHost(host))
-                    {
-                        url = next;
-                        // CDN 签名 URL 自带授权，多余的 Authorization 反而可能被拒；但同域 api.github.com
-                        // 跳转保留 token——否则下一跳变匿名 401/404（2026-10-31 评审 D；GitHub 现网
-                        // 这组端点不做同域 302，属正确性兜底而非实测行为）
-                        if (host != "api.github.com") token = null;
-                        continue;
-                    }
-                    return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false,
-                        $"去向 {host} 不在跟随白名单（api.github.com / *.githubusercontent.com）");
+                    url = next!;
+                    // 同域 api.github.com 跳转保留 token；跨域（codeload/CDN）剥掉。
+                    if (!new Uri(url).Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase))
+                        token = null;
+                    continue;
                 }
-                if ((int)resp.StatusCode is >= 300 and < 400)
-                    return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false,
-                        "重定向超过 3 跳或缺少 Location，停止跟随");
-                return ((int)resp.StatusCode, await resp.Content.ReadAsStringAsync(), false, null);
+                return new ApiReadResult(st, await resp.Content.ReadAsByteArrayAsync(),
+                    resp.Content.Headers.ContentType?.MediaType, url, false, refusal, mitm.Value);
             }
         }
         catch (HttpRequestException ex)
         {
-            return (0, "", true, Describe(ex));
+            return new ApiReadResult(0, [], null, url, true, Describe(ex), mitm.Value);
         }
         catch (TaskCanceledException)
         {
-            return (0, "", false, "超时"); // 请求可能已送达，但 GET 无副作用，可安全重试
+            return new ApiReadResult(0, [], null, url, false, "超时", mitm.Value); // 请求可能已送达，但 GET 无副作用，可安全重试
         }
     }
 
-    /// <summary>根因中文化；issuer 校验拒绝时打印实际 issuer（区分官方新 CA 与本地 MITM）。</summary>
+    /// <summary>v2.42：--output/--binary 流式下载。2xx 直接 Copy 到 destination（不占内存），
+    /// 非 2xx 只读有界错误体（≤1MB）交给调用方；重定向/HTTPS/白名单与 ApiGetRawAsync 同源。</summary>
+    internal static async Task<ApiStreamResult> ApiDownloadAsync(
+        string? token, string path, string accept, Stream destination, TimeSpan timeout,
+        bool ignoreProxy = false, bool allowLocalMitm = false, string? baseUrl = null)
+    {
+        var mitm = new StrongBox<string?>();
+        using var http = CreateClient(timeout, ignoreProxy, allowLocalMitm, mitm);
+        using var cts = new CancellationTokenSource(timeout);
+        var url = (baseUrl ?? BaseUrl) + path;
+        long total = 0;
+        var headersReceived = false;
+        try
+        {
+            for (var hop = 0; ; hop++)
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                req.Headers.TryAddWithoutValidation("Accept", accept);
+                req.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+                req.Headers.Add("User-Agent", "sluice/0.1");
+                if (token is not null)
+                    req.Headers.Add("Authorization", "Bearer " + token);
+                using var resp = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+                headersReceived = true;
+                var st = (int)resp.StatusCode;
+                var (follow, next, refusal) = RedirectDecision(st, resp, url, hop);
+                if (follow)
+                {
+                    url = next!;
+                    if (!new Uri(url).Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase))
+                        token = null;
+                    continue;
+                }
+                var ct = resp.Content.Headers.ContentType?.MediaType;
+                if (refusal is not null || st is < 200 or >= 300)
+                {
+                    var err = await ReadBoundedAsync(resp, refusal is not null ? 64 * 1024 : 1024 * 1024, cts.Token);
+                    return new ApiStreamResult(st, 0, ct, url, false, refusal, err, mitm.Value);
+                }
+                await using var src = await resp.Content.ReadAsStreamAsync(cts.Token);
+                var buffer = new byte[81920];
+                while (true)
+                {
+                    int n;
+                    try { n = await src.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token); }
+                    catch (IOException ex)
+                    {
+                        // 源读断链 = 下载中断（目标写入的 IOException 不在这里吞，交给调用方
+                        // 按“本地写入失败”处理——两者都叫 IOException，语义不同）。
+                        return new ApiStreamResult(0, total, ct, url, false,
+                            $"下载中断：{ex.Message}", [], mitm.Value);
+                    }
+                    if (n <= 0) break;
+                    await destination.WriteAsync(buffer.AsMemory(0, n), cts.Token);
+                    total += n;
+                }
+                await destination.FlushAsync(cts.Token);
+                return new ApiStreamResult(st, total, ct, url, false, null, [], mitm.Value);
+            }
+        }
+        catch (HttpRequestException ex)
+        {
+            return new ApiStreamResult(0, total, null, url, !headersReceived,
+                headersReceived ? $"下载中断：{Describe(ex)}" : Describe(ex), [], mitm.Value);
+        }
+        catch (TaskCanceledException)
+        {
+            return new ApiStreamResult(0, total, null, url, false,
+                headersReceived ? "下载中断/超时" : "超时", [], mitm.Value);
+        }
+    }
+
+    /// <summary>v2.42：有界读取非 2xx 响应体（错误分类/透传用），不把错误页无界吃进内存。</summary>
+    private static async Task<byte[]> ReadBoundedAsync(HttpResponseMessage resp, int max, CancellationToken ct)
+    {
+        using var ms = new MemoryStream();
+        try
+        {
+            await using var s = await resp.Content.ReadAsStreamAsync(ct);
+            var buf = new byte[81920];
+            while (ms.Length < max)
+            {
+                var want = (int)Math.Min(buf.Length, max - ms.Length);
+                var n = await s.ReadAsync(buf.AsMemory(0, want), ct);
+                if (n <= 0) break;
+                ms.Write(buf, 0, n);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or HttpRequestException or OperationCanceledException)
+        {
+            // 错误体不是主数据面：读不全就返回已有部分，保留原 non-2xx 状态。
+        }
+        return ms.ToArray();
+    }
+
+    /// <summary>读通道字节 → 文本（JSON/日志等）；GitHub 响应是 UTF-8，不做 charset 猜测。</summary>
+    internal static string DecodeText(byte[] body) => Encoding.UTF8.GetString(body);
+
+    /// <summary>v2.41 纯函数（selftest 锁）：content-type 是否可按文本输出。
+    /// 未知 application/*（含 application/vnd.github.raw）按二进制处理——宁可让调用方
+    /// 显式 --output/--binary，也不做 UTF-8 替换式损坏。</summary>
+    internal static bool IsTextContentType(string? contentType)
+    {
+        if (string.IsNullOrWhiteSpace(contentType)) return true;
+        var ct = contentType.Split(';', 2)[0].Trim();
+        if (ct.StartsWith("text/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (ct.EndsWith("+json", StringComparison.OrdinalIgnoreCase) ||
+            ct.EndsWith("+xml", StringComparison.OrdinalIgnoreCase)) return true;
+        return ct.Equals("application/json", StringComparison.OrdinalIgnoreCase)
+            || ct.Equals("application/xml", StringComparison.OrdinalIgnoreCase)
+            || ct.Equals("application/javascript", StringComparison.OrdinalIgnoreCase)
+            || ct.Equals("application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>v2.41 纯函数（selftest 锁）：证书校验失败是确定性环境问题，重试不会改变结果。
+    /// 代理 502/连接拒绝不在此列（可能是瞬时上游抖动）。</summary>
+    internal static bool IsDeterministicNetFailure(string? reason) =>
+        !string.IsNullOrEmpty(reason) &&
+        (reason.StartsWith("证书颁发者校验失败", StringComparison.Ordinal) ||
+         reason.Contains("RemoteCertificateValidationCallback", StringComparison.Ordinal));
+
+    /// <summary>根因中文化；issuer 校验拒绝时打印实际 issuer（区分官方新 CA 与本地 MITM）。
+    /// v2.41：Steam++/Watt Toolkit 单列——不引导用户把本地 MITM CA 加进白名单。</summary>
     internal static string Describe(Exception ex)
     {
         var root = ex;
@@ -433,9 +697,17 @@ internal static class GitHubApi
             root.Message.Contains("RemoteCertificateValidationCallback", StringComparison.Ordinal))
         {
             var when = LastRejectedAt is { } t ? $"，最近拒绝于 {t:yyyy-MM-dd HH:mm:ss}" : "";
-            return $"证书颁发者校验失败——实际 issuer：{LastRejectedIssuer ?? "(未记录)"}{when}；允许：{string.Join("/", AllowedIssuers)}。"
-                 + "实际 issuer 若是 SteamTools/Fiddler/Clash 等本地代理证书，请关闭其对 GitHub 的劫持；"
-                 + "若是 GitHub 官方新换的 CA，请将 issuer 关键词加入白名单后重编译";
+            var issuer = LastRejectedIssuer ?? "(未记录)";
+            var mitm = IsLocalMitmIssuer(issuer);
+            if (mitm)
+                return $"证书颁发者校验失败——检测到 Steam++/Watt Toolkit 的本地 MITM 证书（实际 issuer：{issuer}{when}）。"
+                     + "Sluice 不会信任本地 MITM：写操作和 --auth 读的 token 会被代理读到。"
+                     + "处理：让 sluice 直连（DoH）或改用非 MITM 的隧道代理（Clash/v2ray 的 HTTP CONNECT，"
+                     + "配置 config.json.proxy 或 SLUICE_PROXY）；Steam++ 可继续给 git/浏览器使用。"
+                     + "不要把 SteamTools/BeyondDimension 加入 AllowedIssuers。";
+            return $"证书颁发者校验失败——实际 issuer：{issuer}{when}；允许：{string.Join("/", AllowedIssuers)}。"
+                 + "若为本地代理证书，请关闭其对 GitHub 的 TLS 劫持，或改用非 MITM 代理；"
+                 + "若确认是 GitHub 官方新换的 CA，再将 issuer 关键词加入白名单后重编译（不要加入本地 MITM CA）。";
         }
         return root.Message;
     }

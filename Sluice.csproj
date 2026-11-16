@@ -13,7 +13,7 @@
     <InvariantGlobalization>false</InvariantGlobalization>
     <!-- 探针定稿：NativeAOT（启动 ~100ms，exe 19MB）；AOT 隐含 trimming -->
     <PublishAot>true</PublishAot>
-    <Version>0.8.2</Version>
+    <Version>0.8.4</Version>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0-windows10.0.26100'">

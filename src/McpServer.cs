@@ -31,6 +31,7 @@ internal static class McpServer
         ExitCodes.CredentialExpired => "wait_user",
         ExitCodes.BadRequest        => "after_fix",
         ExitCodes.HttpFailed        => "retry_ok",
+        ExitCodes.EnvBlocked        => "wait_user",
         ExitCodes.Unknown           => "wait_user",
         ExitCodes.RateLimitWait     => "wait_until",
         ExitCodes.PendingGate       => "wait_until",

@@ -288,9 +288,12 @@ internal static class Program
                 // v2.31：http_failed 收割入族（同 live 20/retry_ok——请求未发出、无任何副作用，
                 // 间隔 30s 可重试）。此前落 StatusOther/21/wait_user"勿重发"，同一决策两条路径
                 // 指引相反（E0-20261108 实弹回执 14fb4b0f）。网络层描述自 v2.31 起随审计 result
-                //（"not_sent:{describe}"），旧行无描述渲染为空
-                Messages.Write(Messages.StatusHttpFailed(l.Op, l.Target ?? "?", NotSentDetailOf(l.Result)));
-                return ExitCodes.HttpFailed;
+                //（"not_sent:{describe}"），旧行无描述渲染为空。
+                // v2.41：证书确定性失败由 StatusHttpFailed 内部分支返回 24/wait_user——回传
+                // 消息自身 exit，避免收割路径把 24 重新压回 20。
+                var httpFailMsg = Messages.StatusHttpFailed(l.Op, l.Target ?? "?", NotSentDetailOf(l.Result));
+                Messages.Write(httpFailMsg);
+                return httpFailMsg.ExitCode;
             case ExitCodes.BadRequest when l.Decision == "abandoned":
                 // v2.32（审阅 P1 对偶面）：入闸后早退的水位兜底行——未开窗、未执行、无副作用，
                 // after_fix 同早退现场（按调用现场输出的修正指引处理后重发）
@@ -418,11 +421,17 @@ internal static class Program
                                                         需 PAT Actions:Read and write，缺则 403 有专属指引）
               sluice branch delete --repo O/R --branch B
                                                         删除远端分支 ref（commits 保留，可用 sha 重建）
-              sluice api <api-path> [--auth]           REST GET 读（默认匿名；--auth 直接带 token 读私有库；
+              sluice api <api-path> [--auth] [--accept <media-type>] [--output <文件> | --binary] [--allow-mitm-read]
+                                                        REST GET 读（默认匿名；--auth 直接带 token 读私有库；
                                                         匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读
                                                         一次（独立配额，公开库几乎总能读通）；
                                                         路径如 repos/owner/repo/pulls/9，可含 ?query，每次调用入读审计；
-                                                        logs 等端点 302→CDN 签名 URL 自动跟随，仅限 GitHub 域 ≤3 跳）
+                                                        logs/tarball 等 302→CDN/codeload 自动跟随，仅限 GitHub 域 ≤3 跳；
+                                                        --output/--binary 走流式（大文件不攒内存；--output 原子替换），
+                                                        终端遇二进制默认拒绝；release asset 加
+                                                        --accept application/octet-stream；
+                                                        --allow-mitm-read 仅匿名读、需 config allow_mitm_read:true，
+                                                        信任 Steam++ 本地证书，永不用于写）
               sluice status <receipt>                  查 MCP pending 请求的终态（github_write 返回
                                                         code=23 时附 receipt；拒绝理由原文在此，无副作用可重查）
               sluice selftest                           消息表与 exit code 自检
@@ -1325,18 +1334,52 @@ internal static class Program
 
     private static int RunApi(string[] args)
     {
-        string? path = null;
+        string? path = null, output = null;
         var auth = false;
-        foreach (var a in args)
+        var binary = false;
+        var mitmRead = false;
+        var accept = GitHubApi.JsonAccept;
+        for (var i = 0; i < args.Length; i++)
         {
-            if (a == "--auth") { auth = true; continue; }
-            if (a.StartsWith("--")) return ErrUnknownArg(a);
-            if (path is not null)
+            var a = args[i];
+            switch (a)
             {
-                Messages.Write(Messages.BadRequest("api 只接受一个 <api-path>（GET 单路径，示例：sluice api repos/owner/repo/pulls/9）"));
-                return ExitCodes.BadRequest;
+                case "--auth":
+                    auth = true;
+                    break;
+                case "--binary":
+                    binary = true;
+                    break;
+                case "--allow-mitm-read":
+                    mitmRead = true;
+                    break;
+                case "--output":
+                    output = i + 1 < args.Length ? args[++i] : null;
+                    if (string.IsNullOrWhiteSpace(output)) return ErrMissing("api", "--output");
+                    break;
+                case "--accept":
+                    var v = i + 1 < args.Length ? args[++i] : null;
+                    if (string.IsNullOrWhiteSpace(v)) return ErrMissing("api", "--accept");
+                    // 只收单一 media type（无参数/CRLF）：release asset 用 application/octet-stream，
+                    // contents raw 用 application/vnd.github.raw。
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(v, @"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+\-/]*$"))
+                    {
+                        var shown = v.Length > 80 ? v[..80] + "…" : v;
+                        return ErrBad("--accept 只接受单一 media type（示例：application/octet-stream），收到："
+                            + shown.Replace("\r", "\\r").Replace("\n", "\\n"));
+                    }
+                    accept = v;
+                    break;
+                default:
+                    if (a.StartsWith("--")) return ErrUnknownArg(a);
+                    if (path is not null)
+                    {
+                        Messages.Write(Messages.BadRequest("api 只接受一个 <api-path>（GET 单路径，示例：sluice api repos/owner/repo/pulls/9）"));
+                        return ExitCodes.BadRequest;
+                    }
+                    path = a;
+                    break;
             }
-            path = a;
         }
         if (path is null)
         {
@@ -1344,6 +1387,12 @@ internal static class Program
                 "api 缺少 <api-path>（示例：sluice api repos/owner/repo/pulls/9；私有资源加 --auth 直接带凭据读）"));
             return ExitCodes.BadRequest;
         }
+        if (binary && output is not null)
+            return ErrBad("--binary 与 --output 不能同时使用（--binary 写 stdout，--output 写文件）");
+        if (mitmRead && auth)
+            return ErrBad("--allow-mitm-read 只用于匿名读，不能与 --auth 同用（该模式不发送任何 token）");
+        if (mitmRead && !GitHubApi.AllowMitmReadConfigured())
+            return ErrBad("--allow-mitm-read 需要在 config.json 显式设置 \"allow_mitm_read\": true（双钥匙；仅匿名读、永不用于写）");
         // GET-only + 路径白名单（拒 scheme/主机/.. 逃逸——这不是开放代理，只收 api.github.com 的相对路径）。
         // ?&: 支持分页/过滤（?page=2、?head=owner:branch——`://` 已单拒，裸 `:` 无 scheme 危害）；
         // + 是分页 cursor（after=/before=）base64 的合法字符（2026-10-30 实战补——缺它翻页即拒），
@@ -1359,11 +1408,153 @@ internal static class Program
         string? token = null;
         if (auth && !TryAcquireReadToken("api", path, out token, out var authExit))
             return authExit;
+        if (mitmRead)
+            Console.Error.WriteLine("[Sluice] 警告：--allow-mitm-read 仅匿名读，已信任 Steam++/Watt Toolkit 本地 MITM 证书；响应完整性由本地代理决定。");
 
-        // v2.30：匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读（TryReadMeta 模式推广）
-        var (st, body, notSent, reason, usedToken, fallback) = ApiGetWithAnonFallback(path, token);
-        Console.Out.Write(body);
-        return ClassifyApiReadResult(path, usedToken, st, body, notSent, reason, fallback);
+        // v2.42：--output/--binary 走流式（不在内存里攒大文件）；默认面仍按字节整体读以判定 TTY 内容类型。
+        if (output is not null || binary)
+            return RunApiStreaming(path, token, accept, output, mitmRead);
+
+        GitHubApi.ApiReadResult read;
+        string? usedToken = null;
+        var fallback = false;
+        if (mitmRead)
+        {
+            read = GitHubApi.ApiGetRawAsync(null, path, accept, timeout: TimeSpan.FromMinutes(5), allowLocalMitm: true)
+                .GetAwaiter().GetResult();
+        }
+        else
+        {
+            // v2.30：匿名撞 401/403/404/429 且静默 vault 时自动带凭据复读（TryReadMeta 模式推广）
+            var r = ApiGetRawWithAnonFallback(path, token, accept, TimeSpan.FromMinutes(5));
+            read = r.Read;
+            usedToken = r.Token;
+            fallback = r.Fallback;
+        }
+        var success = read.Status is >= 200 and < 300;
+
+        if (success && !GitHubApi.IsTextContentType(read.ContentType) && !Console.IsOutputRedirected)
+        {
+            // v2.41：二进制响应 + stdout 是终端——拒绝把控制字符喷到终端；不写文件、不污染 stdout。
+            Audit.Append("api_read", "api.github.com", path, null, $"http_{read.Status}",
+                reasonPreset: mitmRead ? "mitm_read" : null,
+                result: $"{read.Body.Length}B binary_tty_refused{FinalHostNote(read)}{MitmNote(mitmRead, read.MitmIssuer)}");
+            Messages.Write(Messages.ApiBinaryNeedsOutput(path, read.Status, read.ContentType ?? "未知"));
+            return ExitCodes.BadRequest;
+        }
+
+        // 2xx 文本/二进制、重定向/错误体的诊断输出：一律走原始字节流。
+        // 绝对不能用 Console.Out.Write(string)——那会做 UTF-8 解码/换行翻译，二进制必坏。
+        WriteStdoutBytes(read.Body);
+        return ClassifyApiReadResult(path, usedToken, read, fallback,
+            mitmRead: mitmRead, mitmIssuer: read.MitmIssuer);
+    }
+
+    /// <summary>v2.42：--output/--binary 流式路径。2xx 直接落到临时文件/stdout；
+    /// 非 2xx 不碰目标文件，错误体走 stdout；半截下载清理并给 ApiDownloadInterrupted。</summary>
+    private static int RunApiStreaming(string path, string? token, string accept, string? output, bool mitmRead)
+    {
+        string? fullOutput = null, tempPath = null;
+        FileStream? file = null;
+        if (output is not null)
+        {
+            fullOutput = Path.GetFullPath(output);
+            var dir = Path.GetDirectoryName(fullOutput);
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                return ErrBad($"写入 {output} 失败：目录不存在：{dir}");
+            tempPath = fullOutput + $".tmp-{Environment.ProcessId}-{Guid.NewGuid():N}";
+            try { file = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None); }
+            catch (Exception ex)
+            {
+                if (tempPath is not null) { try { File.Delete(tempPath); } catch { } }
+                return ErrBad($"写入 {output} 失败：{ex.Message}");
+            }
+        }
+        Stream dest = file ?? Console.OpenStandardOutput();
+        try
+        {
+            GitHubApi.ApiStreamResult stream;
+            string? usedToken = token;
+            var fallback = false;
+            if (mitmRead)
+            {
+                stream = GitHubApi.ApiDownloadAsync(null, path, accept, dest, TimeSpan.FromMinutes(5),
+                    allowLocalMitm: true).GetAwaiter().GetResult();
+                usedToken = null;
+            }
+            else
+            {
+                var r = ApiDownloadWithAnonFallback(path, token, accept, dest, TimeSpan.FromMinutes(5));
+                stream = r.Stream;
+                usedToken = r.Token;
+                fallback = r.Fallback;
+            }
+
+            if (stream.Status is >= 200 and < 300)
+            {
+                if (file is not null)
+                {
+                    file.Flush();
+                    file.Dispose();
+                    file = null;
+                    File.Move(tempPath!, fullOutput!, overwrite: true);
+                    tempPath = null;
+                }
+                else
+                {
+                    dest.Flush();
+                }
+                Audit.Append("api_read", "api.github.com", path, null, $"http_{stream.Status}",
+                    reasonPreset: mitmRead ? "mitm_read" : null,
+                    result: $"{stream.Bytes}B{(usedToken is null ? " anon" : fallback ? " auth(fallback)" : " auth")}"
+                        + $"{FinalHostNote(stream.FinalUrl)}{MitmNote(mitmRead, stream.MitmIssuer)}");
+                return ExitCodes.Success;
+            }
+
+            // 非 2xx：目标文件不落地；stdout 尚未写入（只在 2xx 流式写）。
+            if (file is not null)
+            {
+                file.Dispose();
+                file = null;
+                if (tempPath is not null)
+                {
+                    try { File.Delete(tempPath); tempPath = null; }
+                    catch { /* finally 再试一次 */ }
+                }
+            }
+            if (stream.Status == 0 && !stream.NotSent && stream.Bytes > 0)
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "download_interrupted",
+                    reasonPreset: mitmRead ? "mitm_read" : null,
+                    result: $"{stream.Bytes}B partial{FinalHostNote(stream.FinalUrl)}{MitmNote(mitmRead, stream.MitmIssuer)}");
+                Messages.Write(Messages.ApiDownloadInterrupted(path, stream.Bytes, stream.Reason ?? "下载中断"));
+                return ExitCodes.HttpFailed;
+            }
+            WriteStdoutBytes(stream.ErrorBody);
+            return ClassifyApiReadResult(path, usedToken,
+                new GitHubApi.ApiReadResult(stream.Status, stream.ErrorBody, stream.ContentType,
+                    stream.FinalUrl, stream.NotSent, stream.Reason, stream.MitmIssuer),
+                fallbackAuth: fallback, mitmRead: mitmRead, mitmIssuer: stream.MitmIssuer);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Messages.Write(Messages.BadRequest($"写入 {output ?? "stdout"} 失败：{ex.Message}"));
+            return ExitCodes.BadRequest;
+        }
+        finally
+        {
+            file?.Dispose();
+            if (tempPath is not null && File.Exists(tempPath)) { try { File.Delete(tempPath); } catch { } }
+        }
+    }
+
+    /// <summary>v2.41：stdout 原始字节输出（绕过 Console 文本编码/换行翻译）。
+    /// 不 Dispose 标准输出流——进程随后还要写 stderr/退出，关闭句柄没有收益。</summary>
+    private static void WriteStdoutBytes(byte[] bytes)
+    {
+        var stdout = Console.OpenStandardOutput();
+        stdout.Write(bytes);
+        stdout.Flush();
     }
 
     /// <summary>v2.29：读通道 --auth 凭据获取单源（RunApi 与 issue list 共用；原 RunApi 内联段
@@ -1418,45 +1609,56 @@ internal static class Program
 
     /// <summary>v2.29：api 读通道结果分类单源（RunApi 与 issue list 共用；原 RunApi 尾段提出，
     /// 行为不变）：落读审计行 + 写终态消息 + 返回 exit code。2xx 只落审计不写消息——数据体的
-    /// 输出形态（api 原样透传 / issue list 紧凑渲染）由调用方决定。</summary>
-    private static int ClassifyApiReadResult(string path, string? token, int st, string body, bool notSent, string? reason,
-        bool fallbackAuth = false)
+    /// 输出形态（api 原样透传 / issue list 紧凑渲染）由调用方决定。
+    /// v2.41：入参改为字节结果——审计 B 数按真实字节；限流嗅探才解码文本。
+    /// v2.42：mitmRead 标记 --allow-mitm-read 尝试；mitmIssuer 非空表示实际命中本地 MITM。</summary>
+    private static int ClassifyApiReadResult(string path, string? token, GitHubApi.ApiReadResult r,
+        bool fallbackAuth = false, bool mitmRead = false, string? mitmIssuer = null)
     {
-        if (notSent)
+        var mitmNote = MitmNote(mitmRead, mitmIssuer ?? r.MitmIssuer);
+        if (r.NotSent)
         {
-            Audit.Append("api_read", "api.github.com", path, null, "http_failed", result: "not_sent");
-            Messages.Write(Messages.HttpFailed(reason ?? "连接失败"));
+            Audit.Append("api_read", "api.github.com", path, null, "http_failed",
+                reasonPreset: mitmRead ? "mitm_read" : null,
+                result: mitmRead ? $"not_sent{mitmNote}" : "not_sent");
+            Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
             return ExitCodes.HttpFailed;
         }
-        if (st == 0)
+        if (r.Status == 0)
         {
             // GET 超时：请求可能已送达但幂等无副作用——20/retry_ok（§8.2：21 是非幂等 POST 专属档）
-            Audit.Append("api_read", "api.github.com", path, null, "timeout", result: "retry_safe_get");
+            Audit.Append("api_read", "api.github.com", path, null, "timeout",
+                reasonPreset: mitmRead ? "mitm_read" : null,
+                result: mitmRead ? $"retry_safe_get{mitmNote}" : "retry_safe_get");
             Messages.Write(Messages.ApiTimeout(path));
             return ExitCodes.HttpFailed;
         }
 
+        var text = r.Status is 401 or 403 or 429 ? GitHubApi.DecodeText(r.Body) : "";
         // v2.32（审阅 P3.6）：auth(fallback) 单列——匿名撞 401/403/404/429 后的静默复读与显式
         // --auth 在审计里不可区分，"这次读是谁点的"回答不了；fallbackAuth 只影响本行措辞
-        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}",
-            result: $"{body.Length}B{(token is null ? " anon" : fallbackAuth ? " auth(fallback)" : " auth")}");
-        switch (st)
+        // v2.41：final host 随行——tarball 的正文来自 codeload，审计不能只记 api.github.com。
+        // v2.42：mitm:Steam++ / reason_preset=mitm_read 让“这次读信任了本地 MITM”可审计。
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{r.Status}",
+            reasonPreset: mitmRead ? "mitm_read" : null,
+            result: $"{r.Body.Length}B{(token is null ? " anon" : fallbackAuth ? " auth(fallback)" : " auth")}{FinalHostNote(r)}{mitmNote}");
+        switch (r.Status)
         {
             case >= 200 and < 300:
                 return ExitCodes.Success;
             case >= 300 and < 400:
                 // v2.7：域外/超跳重定向不跟随——去向在 Reason 里明说，不装开放代理
-                Messages.Write(Messages.ApiRedirected(path, reason ?? "域外重定向"));
+                Messages.Write(Messages.ApiRedirected(path, r.Reason ?? "域外重定向"));
                 return ExitCodes.BadRequest;
             case 401 or 403:
                 // 403 限流嗅探（v2.10，2026-10-31 实战）：GitHub 对匿名配额耗尽与 secondary/abuse
                 // 拦截都回 403——与"私有/凭据失效"混流会开死方子（匿名限流被报成"仓库私有"、
                 // secondary 的等待分钟数就在 body 里却被开成"重新 setup"）
-                if (st == 403 && GitHubApi.ParseRateLimit(body) is { } rl)
+                if (r.Status == 403 && GitHubApi.ParseRateLimit(text) is { } rl)
                 {
                     if (token is null && rl.Primary)
                     {
-                        Messages.Write(Messages.ApiRateLimitedAnon(path, st));
+                        Messages.Write(Messages.ApiRateLimitedAnon(path, r.Status));
                         return ExitCodes.BadRequest;
                     }
                     var what = rl.Primary
@@ -1464,28 +1666,41 @@ internal static class Program
                         : rl.WaitMinutes is int m
                             ? $"secondary rate limit，服务端要求等待约 {m} 分钟"
                             : "secondary rate limit / 滥用检测拦截，等待数分钟";
-                    Messages.Write(Messages.ApiRateLimitedWait(path, st, what));
+                    Messages.Write(Messages.ApiRateLimitedWait(path, r.Status, what));
                     return ExitCodes.RateLimitWait;
                 }
                 // 匿名：资源需要认证，加 --auth 是 agent 可自行完成的修正（after_fix）；
                 // 带 token：凭据真的失效/越权，才归 credential_expired（wait_user，交还用户）
                 if (token is null)
                 {
-                    Messages.Write(Messages.ApiAuthRequired(path, st));
+                    Messages.Write(Messages.ApiAuthRequired(path, r.Status));
                     return ExitCodes.BadRequest;
                 }
-                Messages.Write(Messages.CredentialExpired($"HTTP {st}（api GET {path}）"));
+                Messages.Write(Messages.CredentialExpired($"HTTP {r.Status}（api GET {path}）"));
                 return ExitCodes.CredentialExpired;
             case 429:
                 // v2.16：429 本身即限流（原落 default 报"其余非 2xx"——读通道的分类对偶补面）
-                Messages.Write(Messages.ApiRateLimitedWait(path, st,
-                    GitHubApi.RateLimitWhat(st, body) ?? "服务端限流（HTTP 429）"));
+                Messages.Write(Messages.ApiRateLimitedWait(path, r.Status,
+                    GitHubApi.RateLimitWhat(r.Status, text) ?? "服务端限流（HTTP 429）"));
                 return ExitCodes.RateLimitWait;
             default:
-                Messages.Write(Messages.ApiHttpError(path, st, body.Length));
+                Messages.Write(Messages.ApiHttpError(path, r.Status, r.Body.Length));
                 return ExitCodes.BadRequest;
         }
     }
+
+    /// <summary>v2.41：审计最终 host 后缀（api.github.com 省略；codeload/CDN 明记）。</summary>
+    private static string FinalHostNote(GitHubApi.ApiReadResult r) => FinalHostNote(r.FinalUrl);
+
+    private static string FinalHostNote(string? finalUrl)
+    {
+        if (finalUrl is null || !Uri.TryCreate(finalUrl, UriKind.Absolute, out var u)) return "";
+        return u.Host.Equals("api.github.com", StringComparison.OrdinalIgnoreCase) ? "" : $" final:{u.Host}";
+    }
+
+    /// <summary>v2.42：审计的 MITM 标记——mitmRead=true 时即使未命中证书也记 attempt。</summary>
+    private static string MitmNote(bool mitmRead, string? issuer) =>
+        mitmRead ? $" mitm:{issuer ?? "attempt"}" : "";
 
     /// <summary>v2.30：匿名读回退判定（纯函数，selftest 锁）：401/403/404/429 = 认证可见性/限流族
     /// ——匿名撞这四档时带凭据复读可能翻盘（匿名 primary 配额耗尽 / actions 端点对匿名收紧 /
@@ -1500,24 +1715,47 @@ internal static class Program
     /// （SLCV2，同 --auth 零交互姿态——读无破坏力，不弹批准窗）→ 以 token 复读一次，复读结果
     /// 即最终结果（分类/审计同 --auth：双失败时"token 无权/私有库"的归因诚实）。Hello vault
     /// 不复读（门控前多一道生物事件 = 弹窗疲劳，TryReadMeta 同纪律）；vault 异常退回匿名结果
-    /// 不阻塞。匿名尝试照常落读审计（fallback 时 audit 两行：anon + auth）。</summary>
-    private static (int St, string Body, bool NotSent, string? Reason, string? Token, bool Fallback)
-        ApiGetWithAnonFallback(string path, string? token)
+    /// 不阻塞。匿名尝试照常落读审计（fallback 时 audit 两行：anon + auth）。
+    /// v2.41：原始字节版——二进制/Content-Type 不再提前丢失；文本由调用方自行解码。</summary>
+    private static (GitHubApi.ApiReadResult Read, string? Token, bool Fallback)
+        ApiGetRawWithAnonFallback(string path, string? token, string accept, TimeSpan? timeout = null)
     {
-        var (st, body, notSent, reason) = GitHubApi.ApiGetAsync(token, path).GetAwaiter().GetResult();
-        if (token is not null || notSent || st == 0 || !AnonReadShouldFallback(st)
+        var read = GitHubApi.ApiGetRawAsync(token, path, accept, timeout: timeout).GetAwaiter().GetResult();
+        if (token is not null || read.NotSent || read.Status == 0 || !AnonReadShouldFallback(read.Status)
             || !TokenStore.Exists || !TokenStore.IsSilentVault)
-            return (st, body, notSent, reason, token, Fallback: false);
-        Audit.Append("api_read", "api.github.com", path, null, $"http_{st}", result: $"{body.Length}B anon");
-        Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {st}），静默 vault 带凭据复读一次（走独立配额）");
+            return (read, token, Fallback: false);
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{read.Status}",
+            result: $"{read.Body.Length}B anon{FinalHostNote(read)}");
+        Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {read.Status}），静默 vault 带凭据复读一次（走独立配额）");
         try
         {
             var tok = TokenStore.LoadApproved(null);
-            var (st2, body2, notSent2, reason2) = GitHubApi.ApiGetAsync(tok, path).GetAwaiter().GetResult();
+            var retry = GitHubApi.ApiGetRawAsync(tok, path, accept, timeout: timeout).GetAwaiter().GetResult();
             // v2.32（审阅 P3.6）：fallback 标记上浮——审计终行写 auth(fallback)，与显式 --auth 可区分
-            return (st2, body2, notSent2, reason2, tok, Fallback: true);
+            return (retry, tok, Fallback: true);
         }
-        catch { return (st, body, notSent, reason, token, Fallback: false); } // vault 异常退回匿名结果（TryReadMeta 同纪律）
+        catch { return (read, token, Fallback: false); } // vault 异常退回匿名结果（TryReadMeta 同纪律）
+    }
+
+    /// <summary>v2.42：流式下载的匿名回退——非 2xx 不向目标写入任何字节，静默 vault 可安全
+    /// 带凭据复读一次；复读结果即最终结果（与字节读版同纪律）。MITM 例外不经过本函数。</summary>
+    private static (GitHubApi.ApiStreamResult Stream, string? Token, bool Fallback)
+        ApiDownloadWithAnonFallback(string path, string? token, string accept, Stream dest, TimeSpan timeout)
+    {
+        var stream = GitHubApi.ApiDownloadAsync(token, path, accept, dest, timeout).GetAwaiter().GetResult();
+        if (token is not null || stream.NotSent || stream.Status == 0 || !AnonReadShouldFallback(stream.Status)
+            || !TokenStore.Exists || !TokenStore.IsSilentVault)
+            return (stream, token, false);
+        Audit.Append("api_read", "api.github.com", path, null, $"http_{stream.Status}",
+            result: $"{stream.ErrorBody.Length}B anon{FinalHostNote(stream.FinalUrl)}");
+        Console.Error.WriteLine($"[Sluice] 匿名读被拒（HTTP {stream.Status}），静默 vault 带凭据复读一次（走独立配额）");
+        try
+        {
+            var tok = TokenStore.LoadApproved(null);
+            var retry = GitHubApi.ApiDownloadAsync(tok, path, accept, dest, timeout).GetAwaiter().GetResult();
+            return (retry, tok, Fallback: true);
+        }
+        catch { return (stream, token, Fallback: false); }
     }
 
     // ---------- sluice issue list（§9 v2.29 读侧清单面：agent 实弹反馈"issue 只能逐个查看、
@@ -1601,15 +1839,17 @@ internal static class Program
             return authExit;
 
         // v2.30：匿名回退同 api 通道（读通道单源——issue list 是同一读通道的紧凑渲染面）
-        var (st, body, notSent, reason, usedToken, fallback) = ApiGetWithAnonFallback(path, token);
-        var cls = ClassifyApiReadResult(path, usedToken, st, body, notSent, reason, fallback);
+        // v2.41：读通道改为字节结果；issue list 仍是 JSON 面，成功路径再解码文本渲染。
+        var (read, usedToken, fallback) = ApiGetRawWithAnonFallback(path, token, GitHubApi.JsonAccept);
+        var cls = ClassifyApiReadResult(path, usedToken, read, fallback);
         if (cls != ExitCodes.Success)
         {
             // 非 2xx 原样透传响应体到 stdout（同 api 通道纪律——错误族的共享消息声称"响应体已输出
             // 到 stdout"，服务端 message 字段就在里面；成功路径才走紧凑渲染不透传）
-            Console.Out.Write(body);
+            WriteStdoutBytes(read.Body);
             return cls;
         }
+        var body = GitHubApi.DecodeText(read.Body);
 
         try
         {
