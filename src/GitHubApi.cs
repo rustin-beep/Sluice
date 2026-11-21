@@ -31,9 +31,14 @@ internal static class GitHubApi
     /// 2026-10-30 真机间歇撞见 Microsoft TLS G2 RSA CA OCSP 02——GitHub（微软旗下）向自家
     /// PKI（Microsoft TLS RSA Root G2）灰度迁移的边缘节点已上线，命中即拒，故加白 "Microsoft TLS"
     /// （微软中间 CA 私钥不外流，本地 MITM 拿不到其签名，加白不破防）。
+    /// 2026-11-21 实弹撞见 Let's Encrypt（CN=YR1）——GitHub Pages/CDN 边缘（*.github.io /
+    /// *.githubusercontent.com 系，185.199.x.x）证书已由官方交给 Let's Encrypt 自动管理，命中即拒，
+    /// logs 302→CDN 整条读路断（openssl 实测真实边缘 issuer 与拒绝消息逐字吻合，非本地 MITM），
+    /// 故加白 "Let's Encrypt"。链信任（公开根）+ SNI 主机名校验仍由 .NET 前置，加白只放"公开可信
+    /// 且确为该主机名签发"的 LE 链——本地 MITM 拿不到这种签名，加白不破防。
     /// GitHub 若再换 CA，拒绝消息会打印实际 issuer，加白即可。
     /// </summary>
-    private static readonly string[] AllowedIssuers = ["DigiCert", "Sectigo", "Microsoft TLS"];
+    internal static readonly string[] AllowedIssuers = ["DigiCert", "Sectigo", "Microsoft TLS", "Let's Encrypt"];
 
     /// <summary>最近一次被 issuer 校验拒绝的实际颁发者与时刻（诊断用， Describe 输出）。
     /// 静态值可能滞留自上一次发作——间歇性故障靠时间戳对上时间窗，而非误读为"刚刚"。</summary>
@@ -560,9 +565,12 @@ internal static class GitHubApi
         {
             return new ApiReadResult(0, [], null, url, true, Describe(ex), mitm.Value);
         }
-        catch (TaskCanceledException)
+        catch (TaskCanceledException ex)
         {
-            return new ApiReadResult(0, [], null, url, false, "超时", mitm.Value); // 请求可能已送达，但 GET 无副作用，可安全重试
+            // v2.43：握手失败以 TCE 包裹 AuthenticationException 冒出时归因到证书文案，
+            // 不落"超时/retry_ok"（StreamTimeoutReason 单源；真超时仍是"超时"，GET 无副作用可重试）。
+            return new ApiReadResult(0, [], null, url, false,
+                StreamTimeoutReason(ex, headersReceived: false), mitm.Value);
         }
     }
 
@@ -628,13 +636,17 @@ internal static class GitHubApi
         }
         catch (HttpRequestException ex)
         {
+            // v2.43：确定性证书失败不套"下载中断："前缀——hop1 连接失败本就不是正文中断，
+            // 且分类单源按证书文案开头 sniff（IsDeterministicNetFailure），前缀会挡住归因。
+            var why = Describe(ex);
+            var interrupted = headersReceived && !IsDeterministicNetFailure(why);
             return new ApiStreamResult(0, total, null, url, !headersReceived,
-                headersReceived ? $"下载中断：{Describe(ex)}" : Describe(ex), [], mitm.Value);
+                interrupted ? $"下载中断：{why}" : why, [], mitm.Value);
         }
-        catch (TaskCanceledException)
+        catch (TaskCanceledException ex)
         {
             return new ApiStreamResult(0, total, null, url, false,
-                headersReceived ? "下载中断/超时" : "超时", [], mitm.Value);
+                StreamTimeoutReason(ex, headersReceived), [], mitm.Value);
         }
     }
 
@@ -686,6 +698,17 @@ internal static class GitHubApi
         !string.IsNullOrEmpty(reason) &&
         (reason.StartsWith("证书颁发者校验失败", StringComparison.Ordinal) ||
          reason.Contains("RemoteCertificateValidationCallback", StringComparison.Ordinal));
+
+    /// <summary>v2.43 纯函数（selftest 锁）：SendAsync 抛 TaskCanceledException 时的归因单源。
+    /// 握手失败在流式面（ResponseHeadersRead + ConnectCallback）会以 TCE 包裹
+    /// AuthenticationException 的形态冒出，而 JSON 面同因走 HttpRequestException——两个面同病
+    /// 不同形；若流式面把 TCE 一律归"超时"，确定性证书失败就被喂进 retry_ok 重试死循环
+    /// （2026-11-21 实弹：logs 302→CDN LE 证书被拒，--output 三次假超时，JSON 路径同因却是
+    /// 终态）。真·超时（CTS/HttpClient.Timeout 触发）内层是 TimeoutException 或 null。</summary>
+    internal static string StreamTimeoutReason(TaskCanceledException ex, bool headersReceived) =>
+        ex.InnerException is System.Security.Authentication.AuthenticationException
+            ? Describe(ex)
+            : headersReceived ? "下载中断/超时" : "超时";
 
     /// <summary>根因中文化；issuer 校验拒绝时打印实际 issuer（区分官方新 CA 与本地 MITM）。
     /// v2.41：Steam++/Watt Toolkit 单列——不引导用户把本地 MITM CA 加进白名单。</summary>

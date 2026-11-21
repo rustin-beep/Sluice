@@ -690,6 +690,36 @@ internal static class Selftest
             GitHubApi.LastRejectedAt = oldAt;
         }
 
+        // (5c) v2.43：GitHub CDN 边缘迁 Let's Encrypt（2026-11-21 实弹：logs 302→CDN LE CN=YR1
+        //      被拒整条读路断）→ 加白；流式面 TCE 内层解包——证书失败不得伪装"超时/retry_ok"
+        Eq("AllowedIssuers 含 LE", GitHubApi.AllowedIssuers.Contains("Let's Encrypt"), true);
+        Eq("TCE 内层=证书 → 文案", GitHubApi.StreamTimeoutReason(
+            new TaskCanceledException("The operation was canceled.",
+                new System.Security.Authentication.AuthenticationException(
+                    "The remote certificate was rejected by the provided RemoteCertificateValidationCallback.")),
+            headersReceived: false).StartsWith("证书颁发者校验失败", StringComparison.Ordinal), true);
+        Eq("TCE 内层=null → 超时", GitHubApi.StreamTimeoutReason(
+            new TaskCanceledException(), headersReceived: false), "超时");
+        Eq("TCE 内层=Timeout → 超时", GitHubApi.StreamTimeoutReason(
+            new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout.",
+                new TimeoutException()), headersReceived: false), "超时");
+        Eq("TCE 已收头 → 下载中断/超时", GitHubApi.StreamTimeoutReason(
+            new TaskCanceledException(), headersReceived: true), "下载中断/超时");
+        try
+        {
+            GitHubApi.LastRejectedIssuer = "C=US, O=Let's Encrypt, CN=YR1";
+            GitHubApi.LastRejectedAt = DateTime.Now;
+            var dle = GitHubApi.Describe(new System.Security.Authentication.AuthenticationException(
+                "The remote certificate was rejected by the provided RemoteCertificateValidationCallback."));
+            Eq("LE 识别为官方 CA（非 MITM 引导）", dle.Contains("Let's Encrypt", StringComparison.Ordinal), true);
+            Eq("LE 文案 → 确定性", GitHubApi.IsDeterministicNetFailure(dle), true);
+        }
+        finally
+        {
+            GitHubApi.LastRejectedIssuer = oldIssuer;
+            GitHubApi.LastRejectedAt = oldAt;
+        }
+
         // (6) 本地 HTTP 探针：二进制字节原样 / content-type / 302 不越白名单
         fail += LocalHttpProbe();
 
@@ -957,8 +987,9 @@ internal static class Selftest
 
         // (1) 哨兵 /TR：-File 路径恒带内层引号，schtasks 参数串里转义为 \"（v2.20 缺的正是这层——
         //     含空格路径下 powershell 把 "C:\Users\John" 当脚本名，任务每 5 分钟静默失败且无日志）
+        //     v2.39：前缀 conhost.exe --headless——默认终端为 WT 时 -WindowStyle Hidden 失效会弹窗
         Eq("SentinelTr 含空格路径", SetupCommand.SentinelTr("C:/Users/John Doe/AppData/Local/Sluice/sentinel.ps1"),
-           "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:/Users/John Doe/AppData/Local/Sluice/sentinel.ps1\"");
+           "conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:/Users/John Doe/AppData/Local/Sluice/sentinel.ps1\"");
         Eq("schtasks 参数串内层转义", SetupCommand.SchtasksCreateArgs("powershell.exe -File \"C:/a b/s.ps1\""),
            "/Create /F /SC MINUTE /MO 5 /TN \"Sluice Sentinel\" /TR \"powershell.exe -File \\\"C:/a b/s.ps1\\\"\"");
 

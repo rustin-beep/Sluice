@@ -1626,6 +1626,18 @@ internal static class Program
         }
         if (r.Status == 0)
         {
+            // v2.43：确定性网络失败（证书拒绝）先于超时归档——流式/多跳面 hop1 失败恒
+            // NotSent=false（hop0 已收过头），Status=0 连 Reason 一起进本分支；原实现一律报
+            // "超时可重试"，确定性证书失败被喂进重试死循环（2026-11-21 实弹：logs 302→CDN
+            // LE 证书被拒，agent 三次假超时后误报"读不了 CI 信息"）。
+            if (GitHubApi.IsDeterministicNetFailure(r.Reason))
+            {
+                Audit.Append("api_read", "api.github.com", path, null, "http_failed",
+                    reasonPreset: mitmRead ? "mitm_read" : null,
+                    result: $"cert_rejected{FinalHostNote(r)}{mitmNote}");
+                Messages.Write(Messages.HttpFailed(r.Reason ?? "连接失败"));
+                return ExitCodes.HttpFailed;
+            }
             // GET 超时：请求可能已送达但幂等无副作用——20/retry_ok（§8.2：21 是非幂等 POST 专属档）
             Audit.Append("api_read", "api.github.com", path, null, "timeout",
                 reasonPreset: mitmRead ? "mitm_read" : null,

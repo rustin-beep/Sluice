@@ -87,7 +87,7 @@ sluice selftest / --version           # 消息表自检 / 构建戳（时间 + s
 | `pr create` / `pr reopen` / `pr close` / `pr edit` / `review` | **Pull requests: Read and write** |
 | `pr merge` | **Pull requests: Read and write** + **Contents: Read and write**（merge 端点要向 base 写 commit；`--delete-head` 删 ref 同走 Contents——按上行最小开权的 PAT 会在 merge 上 403） |
 | `workflow dispatch` | **Actions: Read and write** |
-| `api --auth` 读 CI（runs/jobs/logs） | **Actions: Read**（actions 端点对匿名一律 403） |
+| `api --auth` 读 CI（runs/jobs/logs） | **Actions: Read**（2026-11-21 实测：公开库 runs/jobs/check-runs 匿名可读，`/logs` 下载对匿名 403 需 --auth） |
 | `issue list --auth`（私有库） | **Issues: Read**（只读清单面；开过上面 Issues:RW 写动词的 PAT 已覆盖。公开库连白名单外的都可直接读——Metadata: Read 实测即覆盖 issues/actions 端点） |
 | 所有 | Metadata: Read（强制自带） |
 
@@ -173,7 +173,7 @@ sluice selftest / --version           # 消息表自检 / 构建戳（时间 + s
 | `"use_env_proxy"` | `false` | 显式选择是否继承系统/环境代理（`HTTPS_PROXY`/`HTTP_PROXY`/系统代理）。默认 `false`：避免 Steam++ 这类本地 TLS 终结者被默认带入 |
 | `"allow_mitm_read"` | `false` | **最后手段**：与 CLI `--allow-mitm-read` 组成双钥匙，只允许 `sluice api` 匿名读信任 Steam++/Watt Toolkit 本地证书；禁 `--auth`、禁静默 vault 回退、永不用于写。响应完整性由本地代理决定，审计记 `mitm_read` / `mitm:Steam++`（未命中时为 `mitm:attempt`） |
 
-网络防线内置：`api.github.com` 走 DoH 直连（系统 hosts 失效）；`codeload`/CDN 保留系统解析（国内 hosts 加速 IP 可用），证书 issuer 白名单（DigiCert/Sectigo/Microsoft TLS）在 TLS 层兜底。
+网络防线内置：`api.github.com` 走 DoH 直连（系统 hosts 失效）；`codeload`/CDN 保留系统解析（国内 hosts 加速 IP 可用），证书 issuer 白名单（DigiCert/Sectigo/Microsoft TLS/Let's Encrypt——2026-11-21 GitHub CDN 边缘迁 LE 后加白）在 TLS 层兜底。
 
 **国内代理共存**：Steam++/Watt Toolkit 是本地 TLS MITM，Sluice 默认不信任其证书——写操作和 `--auth` 读的 token 会被代理读到。推荐让 Steam++ 继续服务 git/浏览器，Sluice 走 DoH 直连；若 API 直连被墙，给 Sluice 显式配置 Clash/v2ray 的 HTTP CONNECT（TLS 端到端），不要指向 Steam++ 的 `57307/443`。直连失败且代理是确定性证书问题时，消息为 exit 24 / `wait_user`：不要重试，按 issuer 指引处理后重跑。
 

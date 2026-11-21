@@ -965,9 +965,13 @@ internal static class SetupCommand
 #endif
 
     /// <summary>哨兵 /TR 值：-File 路径恒带引号（LOCALAPPDATA 常含空格——Windows 用户名含空格即中招）。
-    /// 形态入 selftest 锁（v2.23：v2.20 缺的正是这层引号，含空格机器上任务静默失败）。</summary>
+    /// 形态入 selftest 锁（v2.23：v2.20 缺的正是这层引号，含空格机器上任务静默失败）。
+    /// v2.39：前缀 conhost.exe --headless ——Windows 11 默认终端为 Windows Terminal 时，控制台创建被
+    /// 委托给 WT，WT 自己建 XAML 窗口且不读 STARTUPINFO 的 SW_HIDE，于是 -WindowStyle Hidden 失效、
+    /// 每 5 分钟弹一个窗口抢焦点。conhost --headless 让控制台无窗口存在，副作用是仍留在交互会话
+    /// （toast 照常），故不用 S4U/session 0 规避。</summary>
     internal static string SentinelTr(string ps1) =>
-        $"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{ps1}\"";
+        $"conhost.exe --headless powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{ps1}\"";
 
     /// <summary>schtasks /Create 参数串：/TR 的内层引号以 \" 转义（schtasks 按 argv 规则解析后
     /// 存为 Command/Arguments 两个字段，实弹验证见 SentinelInstall 注释）。转义入 selftest 锁。</summary>
