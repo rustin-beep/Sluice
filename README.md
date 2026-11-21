@@ -55,7 +55,10 @@ sluice seal --fix                         # ② 封堵侧门：凭据存储 / gh
                                              + 置 GCM 无 UI 封堵键（credential.https://github.com.interactive=never——错门毫秒级死不弹登录窗）
 sluice setup --install                    # ③ 装 notice helper + 默认写规则片段进工作区 AGENTS.md（--no-snippet 跳过）
 sluice sentinel-install                   # ④ 哨兵：每 5 分钟 seal 预检，违规弹通知（Windows 计划任务+toast / Linux systemd 定时器+notify-send；
-                                             封 device flow"当场成功"窗）
+                                             封 device flow"当场成功"窗）。v0.8.4+ 的 Windows /TR 带 conhost.exe --headless 前缀
+                                             （WT 默认终端下 -WindowStyle Hidden 失效会每 5 分钟弹窗）——已装机器旧任务不自动迁移，
+                                             重跑本命令即换新形态（schtasks /Create /F 覆盖）；哨兵判定不 gate 在退出码上，
+                                             conhost 包装改变退出码归属无影响
 sluice setup --install-hook [all]         # ⑤ 宿主 PreToolUse hook（ZCode/Claude Code）：agent 直推 git/gh 在执行前被 deny，
                                              秒回指路文案——首错代价从"登录窗+挂起"降为"一条消息"；幂等，exe 路径漂移自动刷新
 sluice doctor                             # 验证：八项只读健康检查（版本戳/vault/config/seal 预检/notice/GCM 封堵键/哨兵/AGENTS 片段）全绿即就绪
